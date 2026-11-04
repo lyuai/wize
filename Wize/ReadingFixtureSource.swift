@@ -4,6 +4,7 @@ import Foundation
 // Explicitly enabled only for development builds with WIZE_VISUAL_FIXTURE=1.
 @MainActor
 final class ReadingFixtureSource: ReadingSource {
+    private var votes: [String: AnswerVote] = [:]
     private let question = ReadingItem(id: "sample-question", kind: .question, title: "排版样本｜从一座城市里的旧书店，能读到什么？", excerpt: "", author: "", questionID: nil)
     private var samples: [ReadingItem] {
         let long = """
@@ -33,7 +34,7 @@ final class ReadingFixtureSource: ReadingSource {
             title: "排版样本｜你最近读到了什么？", excerpt: "关于阅读的一点闲谈。", author: "", questionID: nil)
         return Page(items: hot ? [question, longerQuestion, shortQuestion] : [samples[0], question], next: nil)
     }
-    func currentUser() async throws -> (name: String, avatar: URL?) { ("阅读者", nil) }
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?) { ("阅读者", nil, "在阅读里发现更多") }
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
         let ordered = sort == "updated" ? Array(samples.reversed()) : samples
         // Split the time ordering so the last answer is outside its first page.
@@ -45,8 +46,15 @@ final class ReadingFixtureSource: ReadingSource {
         }
         return Page(items: offset == 0 ? ordered : [], next: nil)
     }
-    func detail(_ item: ReadingItem, prefetch: Bool) async throws -> ReadingItem { samples.first(where: { $0.id == item.id }) ?? item }
-    func setVote(answerID: String, vote: AnswerVote) async throws { }
+    func detail(_ item: ReadingItem, prefetch: Bool) async throws -> ReadingItem {
+        var result = samples.first(where: { $0.id == item.id }) ?? item
+        result.vote = votes[item.id] ?? .neutral
+        return result
+    }
+    func setVote(answerID: String, vote: AnswerVote) async throws -> AnswerVoteResult {
+        votes[answerID] = vote
+        return AnswerVoteResult(vote: vote, upCount: nil, downCount: nil)
+    }
     func comments(_ item: ReadingItem, next: URL?) async throws -> Page<ReadingComment> {
         var comment = ReadingComment(id: "sample-comment", author: "一位读者", html: "<p>很喜欢这段话，读完想再慢慢想一会儿。</p>", likes: 12)
         comment.replyCount = 2

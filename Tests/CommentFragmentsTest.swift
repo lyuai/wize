@@ -21,6 +21,12 @@ struct CommentFragmentsTest {
         precondition(comments[1].parentID == "1", "Nested replies must retain their parent ID")
         precondition(commentTreeRows(comments, collapsed: []).map(\.depth) == [0, 1], "Tree must indent replies")
         precondition(commentTreeRows(comments, collapsed: ["1"]).map(\.id) == ["1"], "Collapsed branches must hide descendants")
+        var grandchild = ReadingComment(id: "3", author: "丙", html: "回复", likes: 0)
+        grandchild.parentID = "2"
+        let branch = comments + [grandchild]
+        precondition(commentTreeRows(branch, collapsed: []).map(\.depth) == [0, 1, 2], "Replies to replies must keep their depth")
+        precondition(commentTreeRows(branch, collapsed: ["1"]).map(\.id) == ["1"], "Collapsing a branch must hide all descendants")
+        precondition(commentTreeRows(branch, collapsed: ["2"]).map(\.id) == ["1", "2"], "A nested collapse must preserve its parent")
         var orphan = comments[1]; orphan.parentID = "missing"
         precondition(commentTreeRows([orphan], collapsed: []).map(\.id) == ["2"], "An unavailable parent must not hide a comment")
         precondition(htmlImageSources(#"<img src="//pic.zhimg.com/example.jpg">"#) == ["https://pic.zhimg.com/example.jpg"], "Protocol-relative images should use HTTPS")

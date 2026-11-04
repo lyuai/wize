@@ -23,6 +23,12 @@ struct ReadingItem: Identifiable, Hashable {
 
 enum AnswerVote: String { case up, down, neutral }
 
+struct AnswerVoteResult {
+    let vote: AnswerVote
+    let upCount: Int?
+    let downCount: Int?
+}
+
 struct ReadingComment: Identifiable {
     let id: String
     let author: String
@@ -47,13 +53,14 @@ struct ReadingCollection: Identifiable {
 }
 
 enum SourceError: LocalizedError {
-    case response(Int), malformed, unsupported
+    case response(Int), malformed, unsupported, voteUnconfirmed
     var errorDescription: String? {
         switch self {
         case .response(401), .response(403): return "知乎要求登录或安全验证，请先登录后重试。"
         case .response(let code): return "知乎返回错误（\(code)），请稍后重试。"
         case .malformed: return "无法读取知乎返回的数据。"
         case .unsupported: return "暂不支持此类型的内容。"
+        case .voteUnconfirmed: return "无法确认知乎的赞同状态，请稍后重试。"
         }
     }
 }
@@ -62,10 +69,10 @@ enum SourceError: LocalizedError {
 @MainActor
 protocol ReadingSource {
     func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem>
-    func currentUser() async throws -> (name: String, avatar: URL?)
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?)
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem>
     func detail(_ item: ReadingItem, prefetch: Bool) async throws -> ReadingItem
-    func setVote(answerID: String, vote: AnswerVote) async throws
+    func setVote(answerID: String, vote: AnswerVote) async throws -> AnswerVoteResult
     func comments(_ item: ReadingItem, next: URL?) async throws -> Page<ReadingComment>
     func replies(to comment: ReadingComment, next: URL?) async throws -> Page<ReadingComment>
 }
@@ -152,15 +159,15 @@ final class ZhihuSource: ReadingSource {
         return Page(items: objects(json).compactMap { parseFeed($0) }, next: nextURL(json))
     }
 
-    func currentUser() async throws -> (name: String, avatar: URL?) {
-        let json = try await request(url("/api/v4/me", [.init(name: "include", value: "avatar_url,name")]))
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?) {
+        let json = try await request(url("/api/v4/me", [.init(name: "include", value: "avatar_url,name,headline")]))
         guard let name = json["name"] as? String, !name.isEmpty else { throw SourceError.malformed }
-        return (name, mediaURL(json["avatar_url"]))
+        return (name, mediaURL(json["avatar_url"]), json["headline"] as? String)
     }
 
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
         let json = try await request(url("/api/v4/questions/\(questionID)/answers", [
-            .init(name: "include", value: "data[*].content,voteup_count,votedown_count,comment_count,voting,author,question"),
+            .init(name: "include", value: "data[*].content,voteup_count,votedown_count,comment_count,voting,relationship.voting,author,question"),
             .init(name: "sort_by", value: sort), .init(name: "offset", value: String(offset)), .init(name: "limit", value: "20")
         ]))
         return Page(items: objects(json).compactMap { parseObject($0, fallbackQuestionID: questionID) }, next: nextURL(json))
@@ -168,7 +175,7 @@ final class ZhihuSource: ReadingSource {
 
     func detail(_ item: ReadingItem, prefetch: Bool = false) async throws -> ReadingItem {
         let path = item.kind == .article ? "/api/v4/articles/\(item.id)" : "/api/v4/answers/\(item.id)"
-        let json = try await request(url(path, [.init(name: "include", value: "content,author,question,voteup_count,votedown_count,comment_count,voting")]), prefetch: prefetch)
+        let json = try await request(url(path, [.init(name: "include", value: "content,author,question,voteup_count,votedown_count,comment_count,voting,relationship.voting")]), prefetch: prefetch)
         guard let content = json["content"] as? String, !content.isEmpty else { throw SourceError.malformed }
         var updated = item
         updated.contentHTML = content
@@ -180,12 +187,25 @@ final class ZhihuSource: ReadingSource {
         updated.upCount = json["voteup_count"] as? Int ?? item.upCount
         updated.downCount = json["votedown_count"] as? Int ?? item.downCount
         updated.commentCount = json["comment_count"] as? Int ?? item.commentCount
-        updated.vote = parseVote(json["voting"]) ?? item.vote
+        updated.vote = answerVote(from: json)
+        if updated.vote == nil, item.kind == .answer {
+            updated.vote = try? await answerRelationshipVote(answerID: item.id, prefetch: prefetch)
+        }
         return updated
     }
 
-    func setVote(answerID: String, vote: AnswerVote) async throws {
-        _ = try await request(url("/api/v4/answers/\(answerID)/voters"), method: "POST", body: ["type": vote.rawValue])
+    private func answerRelationshipVote(answerID: String, prefetch: Bool = false) async throws -> AnswerVote {
+        let json = try await request(url("/api/v4/answers/\(answerID)/relationship", [.init(name: "desktop", value: "true")]), prefetch: prefetch)
+        guard let vote = answerVote(from: json) else { throw SourceError.voteUnconfirmed }
+        return vote
+    }
+
+    func setVote(answerID: String, vote: AnswerVote) async throws -> AnswerVoteResult {
+        let json = try await request(url("/api/v4/answers/\(answerID)/voters"), method: "POST", body: ["type": vote.rawValue])
+        let confirmed: AnswerVote
+        if let value = answerVote(from: json) { confirmed = value }
+        else { confirmed = try await answerRelationshipVote(answerID: answerID) }
+        return AnswerVoteResult(vote: confirmed, upCount: json["voteup_count"] as? Int, downCount: json["votedown_count"] as? Int)
     }
 
     func collections(for item: ReadingItem) async throws -> [ReadingCollection] {
@@ -249,7 +269,7 @@ final class ZhihuSource: ReadingSource {
         item.upCount = object["voteup_count"] as? Int
         item.downCount = object["votedown_count"] as? Int
         item.commentCount = object["comment_count"] as? Int
-        item.vote = parseVote(object["voting"])
+        item.vote = answerVote(from: object)
         item.imageURL = mediaURL(object["thumbnail"]) ?? mediaURL(object["image_url"]) ?? firstHTMLImage(object["content"] as? String ?? "")
         return item
     }
@@ -320,8 +340,14 @@ func commentTreeRows(_ comments: [ReadingComment], collapsed: Set<String>) -> [C
     return result
 }
 
+func answerVote(from object: [String: Any]) -> AnswerVote? {
+    parseVote(object["voting"]) ?? parseVote((object["relationship"] as? [String: Any])?["voting"])
+}
+
 private func parseVote(_ value: Any?) -> AnswerVote? {
-    if let number = value as? Int { return number == 1 ? .up : number == -1 ? .down : .neutral }
+    if let number = value as? Int {
+        switch number { case 1: return .up; case -1: return .down; case 0: return .neutral; default: return nil }
+    }
     if let string = value as? String {
         switch string { case "up", "1": return .up; case "down", "-1": return .down; case "neutral", "0": return .neutral; default: return nil }
     }

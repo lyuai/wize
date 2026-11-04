@@ -8,6 +8,8 @@ struct ReaderView: View {
     @State private var availableWidth: CGFloat = 0
     @State private var showsPinnedTitle = false
     @State private var showsReadingSettings = false
+    @State private var showsAccountMenu = false
+    @State private var accountDestination: AccountDestination?
     @State private var profileItem: ReadingItem?
     @State private var collectionItem: ReadingItem?
     @State private var collectedKeys: Set<String> = []
@@ -15,6 +17,7 @@ struct ReaderView: View {
     private let collectionSource = ZhihuSource()
     @AppStorage("reading.theme") private var readingTheme = "system"
     enum PhonePage: Hashable { case question, answer }
+    private enum AccountDestination { case settings, login }
 
     private var usesWideLayout: Bool {
         UIDevice.current.userInterfaceIdiom == .pad && sizeClass == .regular && availableWidth >= 760
@@ -173,15 +176,45 @@ struct ReaderView: View {
     }
 
     private var accountMenu: some View {
-        Menu {
-            if let name = model.accountName { Text(name) }
-            Button { showsReadingSettings = true } label: { Label("阅读设置", systemImage: "textformat.size") }
-            Button { model.showsLogin = true } label: { Label("知乎账号", systemImage: "person.crop.circle") }
-        } label: {
+        Button { showsAccountMenu = true } label: {
             AvatarView(url: model.accountAvatarURL, size: 32)
                 .overlay(Circle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(width: 44, height: 44).contentShape(Rectangle())
         }
         .accessibilityLabel("账号与阅读设置")
+        .popover(isPresented: $showsAccountMenu, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .top, spacing: 12) {
+                    AvatarView(url: model.accountAvatarURL, size: 48)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(model.accountName ?? "知乎账号").font(.headline).lineLimit(2)
+                        if let headline = model.accountHeadline, !headline.isEmpty {
+                            Text(headline).font(.subheadline).foregroundStyle(.secondary).lineLimit(3)
+                        } else if model.accountName == nil {
+                            Text("查看或登录知乎账号").font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }.padding(16)
+                Divider().padding(.horizontal, 16)
+                Button { accountDestination = .settings; showsAccountMenu = false } label: {
+                    Label("阅读设置", systemImage: "textformat.size").frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 12)
+                }
+                Button { accountDestination = .login; showsAccountMenu = false } label: {
+                    Label("知乎账号", systemImage: "person.crop.circle").frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 12)
+                }
+            }
+            .frame(width: 290)
+            .buttonStyle(.plain)
+            .presentationCompactAdaptation(.popover)
+            .onDisappear {
+                switch accountDestination {
+                case .settings: showsReadingSettings = true
+                case .login: model.showsLogin = true
+                case nil: break
+                }
+                accountDestination = nil
+            }
+        }
     }
 
     private var phoneLayout: some View {
@@ -220,7 +253,7 @@ struct ReaderView: View {
             HStack(spacing: 14) {
                 channelPicker.frame(width: 160)
                 Spacer(minLength: 0)
-                accountMenu.frame(width: 44, height: 44).readerGlassCapsule()
+                accountMenu.frame(width: 44, height: 44).contentShape(Rectangle())
             }
             .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 10)
             .background(ReaderPalette.directory)
@@ -233,7 +266,7 @@ struct ReaderView: View {
 
     private func feedList(for channel: ReaderModel.Channel) -> some View {
         List {
-            ForEach(Array((model.feeds[channel] ?? []).enumerated()), id: \.element.key) { index, item in
+            ForEach(Array((channel == model.channel && model.refreshingFeed ? [] : (model.feeds[channel] ?? [])).enumerated()), id: \.element.key) { index, item in
                 Button {
                     model.open(item)
                     if !usesWideLayout { phonePath.append(item.kind == .question ? .question : .answer) }
@@ -244,15 +277,21 @@ struct ReaderView: View {
                 .listRowBackground(usesWideLayout && (model.selected?.key == item.key || model.question?.key == item.key) ? ReaderPalette.selection : Color.clear)
                 .task {
                     guard channel == model.channel else { return }
-                    await model.prefetchDetail(item)
+                    async let avatars: Void = AvatarCache.shared.prefetch(Array((model.feeds[channel] ?? []).dropFirst(index).prefix(6)).compactMap(\.avatarURL))
+                    async let detail: Void = model.prefetchDetail(item)
                     if index >= max((model.feeds[channel]?.count ?? 0) - 4, 0) { await model.loadFeed() }
+                    await detail
+                    await avatars
                 }
             }
             if channel == model.channel, let error = model.feedError { retryRow(error) { await model.loadFeed() }.listRowBackground(Color.clear) }
             else if channel == model.channel, model.loadingFeed, !model.refreshingFeed,
                     !(model.feeds[channel] ?? []).isEmpty {
-                loadingFooter("正在加载更多")
+                LoadingSkeleton(kind: .feed, label: "正在加载更多")
                     .listRowSeparator(.hidden).listRowBackground(Color.clear)
+            }
+            else if channel == model.channel, model.loadingFeed, model.refreshingFeed || (model.feeds[channel] ?? []).isEmpty {
+                ForEach(0..<5, id: \.self) { _ in LoadingSkeleton(kind: .feed, label: "正在加载内容").listRowSeparator(.hidden).listRowBackground(Color.clear) }
             }
             else if channel == model.channel, !model.loadingFeed, model.feeds[channel]?.isEmpty == true {
                 ContentUnavailableView("暂无内容", systemImage: "text.book.closed", description: Text("下拉刷新，看看有没有新的内容。"))
@@ -262,11 +301,6 @@ struct ReaderView: View {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(ReaderPalette.directory.ignoresSafeArea(edges: .bottom))
-        .overlay {
-            if channel == model.channel, model.loadingFeed, (model.feeds[channel] ?? []).isEmpty {
-                loadingFooter("正在加载内容")
-            }
-        }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(usesWideLayout ? .hidden : .automatic, for: .navigationBar)
@@ -276,7 +310,7 @@ struct ReaderView: View {
     private var answerList: some View {
         List {
             if let question = model.question {
-                Text(question.title).font(.title3.bold()).padding(.vertical, 8)
+                Text(question.title).font(.headline.weight(.semibold)).padding(.vertical, 8)
             }
             Picker("回答排序", selection: $model.answerSort) {
                 Text("热度").tag("default"); Text("时间").tag("updated")
@@ -288,14 +322,19 @@ struct ReaderView: View {
                     .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
                     .listRowBackground(usesWideLayout && model.selected?.key == item.key ? ReaderPalette.selection : Color.clear)
                     .task {
-                        await model.prefetchDetail(item)
+                        async let avatars: Void = AvatarCache.shared.prefetch(Array(model.answers.dropFirst(index).prefix(6)).compactMap(\.avatarURL))
+                        async let detail: Void = model.prefetchDetail(item)
                         if index >= max(model.answers.count - 4, 0), model.hasMoreAnswers { await model.loadAnswers(more: true) }
+                        await detail
+                        await avatars
                     }
             }
             if let error = model.answerError { retryRow(error) { await model.loadAnswers(more: !model.answers.isEmpty && model.hasMoreAnswers) }.listRowBackground(Color.clear) }
             else if model.loadingAnswers {
-                loadingFooter(model.answers.isEmpty ? "正在加载回答" : "正在加载更多")
-                    .listRowSeparator(.hidden).listRowBackground(Color.clear)
+                ForEach(0..<(model.answers.isEmpty ? 4 : 1), id: \.self) { _ in
+                    LoadingSkeleton(kind: .answer, label: model.answers.isEmpty ? "正在加载回答" : "正在加载更多")
+                        .listRowSeparator(.hidden).listRowBackground(Color.clear)
+                }
             }
             else if model.answers.isEmpty {
                 ContentUnavailableView("暂无回答", systemImage: "text.bubble", description: Text("这个问题还没有可显示的回答。"))
@@ -332,13 +371,21 @@ struct ReaderView: View {
                         paperCards: usesWideLayout,
                         onTitleHidden: { if usesWideLayout { showsPinnedTitle = $0 } },
                         scrollRequest: model.scrollRequest,
-                        onVisibleAnswer: { model.setVisibleAnswer($0) },
+                        onVisibleAnswer: { id in
+                            model.setVisibleAnswer(id)
+                            if let index = model.streamItems.firstIndex(where: { $0.id == id }) {
+                                let urls = Array(model.streamItems.dropFirst(max(0, index - 1)).prefix(6)).compactMap(\.avatarURL)
+                                Task { await AvatarCache.shared.prefetch(urls) }
+                            }
+                        },
                         onNearEnd: { Task { await model.loadMoreStream() } }
-                    ).id(model.streamAnchor?.key ?? item.key)
+                    )
+                    .id(model.streamAnchor?.key ?? item.key)
+                    .ignoresSafeArea(.container, edges: usesWideLayout ? [] : .bottom)
                 }
                 else if let error = model.bodyError {
                     VStack(spacing: 12) { Text(error); Button("重试") { model.selectAnswer(item) } }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else { ProgressView("正在加载正文").frame(maxWidth: .infinity, maxHeight: .infinity) }
+                } else { LoadingSkeleton(kind: .body, label: "正在加载正文").frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top) }
                 if let error = model.streamError {
                     HStack {
                         Text(error).font(.footnote).foregroundStyle(.secondary)
@@ -349,6 +396,9 @@ struct ReaderView: View {
                     }.padding(8)
                         .padding(.bottom, usesWideLayout ? 0 : 64)
                 }
+            }
+            .task(id: model.streamAnchor?.key) {
+                await AvatarCache.shared.prefetch(Array(model.streamItems.prefix(6)).compactMap(\.avatarURL))
             }
             .background(readingBackground.ignoresSafeArea(edges: .bottom))
             .overlay(alignment: .trailing) {
@@ -361,6 +411,7 @@ struct ReaderView: View {
             .overlay(alignment: .bottom) {
                 if !usesWideLayout, model.bodyHTML != nil {
                     HStack(spacing: 0) { answerActions(item) }
+                        .frame(maxWidth: 260)
                         .readerGlassCapsule()
                         .padding(.horizontal, 16)
                         .padding(.bottom, 8)
@@ -378,14 +429,6 @@ struct ReaderView: View {
                             .lineLimit(1).truncationMode(.tail)
                     }
                 }
-                if !usesWideLayout, model.question == nil, let qid = item.questionID {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button("全部回答") {
-                            model.open(ReadingItem(id: qid, kind: .question, title: item.title, excerpt: "", author: "", questionID: nil))
-                            if !usesWideLayout { phonePath = [.question] }
-                        }
-                    }
-                }
             }
         } else {
             VStack(spacing: 12) {
@@ -399,8 +442,7 @@ struct ReaderView: View {
         if item.kind == .answer {
             Button { profileItem = item } label: {
                 AvatarView(url: item.avatarURL, size: 36)
-                    .frame(maxWidth: usesWideLayout ? nil : .infinity)
-                    .frame(width: usesWideLayout ? 56 : nil, height: 52)
+                    .frame(width: usesWideLayout ? 56 : 52, height: 52)
             }.accessibilityLabel("查看作者：\(item.author.isEmpty ? "匿名用户" : item.author)")
             Button { Task { await model.toggleVote(.up) } } label: {
                 actionLabel(item.vote == .up ? "hand.thumbsup.fill" : "hand.thumbsup", item.upCount)
@@ -413,8 +455,7 @@ struct ReaderView: View {
             Button { collectionItem = item } label: {
                 Image(systemName: collectedKeys.contains(item.key) ? "star.fill" : "star")
                     .font(.system(size: 18, weight: .medium))
-                    .frame(maxWidth: usesWideLayout ? nil : .infinity)
-                    .frame(width: usesWideLayout ? 52 : nil, height: 52)
+                    .frame(width: 52, height: 52)
             }.accessibilityLabel(collectedKeys.contains(item.key) ? "管理收藏，已收藏" : "收藏")
         }
     }
@@ -444,11 +485,11 @@ struct ReaderView: View {
                     if row.hasChildren {
                         Button(collapsedComments.contains(comment.id) ? "展开讨论" : "收起讨论") {
                             if !collapsedComments.insert(comment.id).inserted { collapsedComments.remove(comment.id) }
-                        }.font(.caption).foregroundStyle(ReaderPalette.accent)
+                        }.font(.caption).foregroundStyle(ReaderPalette.accent).padding(.leading, 32)
                     }
                 }
                 .padding(.leading, CGFloat(min(row.depth, 3)) * 16)
-                .padding(.top, row.depth == 0 && index > 0 ? 12 : 0)
+                .padding(.top, row.depth == 0 && index > 0 ? 4 : 0)
                 .overlay(alignment: .leading) {
                     if row.depth > 0 {
                         Rectangle().fill(ReaderPalette.accent.opacity(0.25)).frame(width: 1)
@@ -456,11 +497,13 @@ struct ReaderView: View {
                     }
                 }
                 .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
+                .task { await AvatarCache.shared.prefetch(Array(rows.dropFirst(index).prefix(6)).compactMap { $0.comment.avatarURL }) }
                 let isEndOfBranch = index + 1 == rows.count || rows[index + 1].depth == 0
                 let root = rows[...index].last(where: { $0.depth == 0 })?.comment
                 if isEndOfBranch, let root, !collapsedComments.contains(root.id), (root.replyCount > 0 || model.replyNext[root.id] != nil) {
                     if model.loadingReplies.contains(root.id) {
-                        ProgressView().padding(.leading, 18).listRowSeparator(.hidden)
+                        LoadingSkeleton(kind: .comment, label: "正在加载回复").padding(.leading, 18).listRowSeparator(.hidden)
                     } else if let error = model.replyErrors[root.id] {
                         Button("回复加载失败，点击重试：\(error)") { Task { await model.loadReplies(to: root) } }
                             .font(.caption).foregroundStyle(.secondary).padding(.leading, 18).listRowSeparator(.hidden)
@@ -472,7 +515,11 @@ struct ReaderView: View {
                 }
             }
             if let error = model.commentError { retryRow(error) { await model.loadComments(reset: true) }.listRowSeparator(.hidden) }
-            else if model.loadingComments { ProgressView().frame(maxWidth: .infinity).listRowSeparator(.hidden) }
+            else if model.loadingComments {
+                ForEach(0..<(model.comments.isEmpty ? 4 : 1), id: \.self) { _ in
+                    LoadingSkeleton(kind: .comment, label: "正在加载评论").listRowSeparator(.hidden)
+                }
+            }
             else if model.canLoadMoreComments { Button("加载更多") { Task { await model.loadComments() } }.listRowSeparator(.hidden) }
         }.listStyle(.plain)
             .navigationTitle(model.commentTarget?.author.isEmpty == false ? "评论 · \(model.commentTarget?.author ?? "")" : "评论")
@@ -503,21 +550,22 @@ struct ReaderView: View {
     }
 
     private func commentRow(_ comment: ReadingComment) -> some View {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        AvatarView(url: comment.avatarURL, size: 30)
-                        Text(comment.author).font(.subheadline.weight(.semibold))
+        HStack(alignment: .top, spacing: 8) {
+            AvatarView(url: comment.avatarURL, size: 24)
+            VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(comment.author).font(.subheadline.weight(.semibold)).lineLimit(1)
                         if let replyTo = comment.replyTo {
-                            Text("回复").foregroundStyle(.secondary)
-                            Text(replyTo).fontWeight(.medium).lineLimit(1)
+                            Text("回复").font(.subheadline).foregroundStyle(.secondary)
+                            Text(replyTo).font(.subheadline.weight(.medium)).lineLimit(1)
                         }
-                        Spacer()
+                        Spacer(minLength: 4)
                         if comment.likes > 0 {
                             compactCount("hand.thumbsup", count: comment.likes)
                                 .font(.caption).foregroundStyle(.secondary)
                                 .accessibilityLabel("\(displayCount(comment.likes)) 次赞同")
                         }
-                    }
+                    }.frame(minHeight: 24)
                     ForEach(Array(commentHTMLFragments(comment.html).enumerated()), id: \.offset) { _, fragment in
                         switch fragment {
                         case .text(let html):
@@ -531,20 +579,66 @@ struct ReaderView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
-                }.padding(.vertical, 7)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }.padding(.vertical, 2)
     }
 
     private func retryRow(_ message: String, action: @escaping () async -> Void) -> some View {
         VStack(alignment: .leading, spacing: 8) { Text(message).foregroundStyle(.secondary); Button("重试") { Task { await action() } } }.padding(.vertical, 8)
     }
 
-    private func loadingFooter(_ title: String) -> some View {
-        HStack(spacing: 8) {
-            ProgressView().controlSize(.small).tint(ReaderPalette.accent)
-            Text(title).font(.footnote).foregroundStyle(.secondary)
+}
+
+private struct LoadingSkeleton: View {
+    enum Kind { case feed, answer, comment, body, collection }
+    let kind: Kind
+    let label: String
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var dimmed = false
+
+    private func line(_ trailing: CGFloat = 0, height: CGFloat = 10) -> some View {
+        HStack(spacing: 0) {
+            RoundedRectangle(cornerRadius: height / 2).fill(Color.primary.opacity(0.10)).frame(height: height)
+            if trailing > 0 { Spacer(minLength: trailing).frame(width: trailing) }
         }
-        .frame(maxWidth: .infinity).padding(.vertical, 14)
-        .accessibilityElement(children: .combine)
+    }
+
+    private var avatar: some View { Circle().fill(Color.primary.opacity(0.10)).frame(width: 24, height: 24) }
+
+    var body: some View {
+        Group {
+            switch kind {
+            case .feed, .answer:
+                VStack(alignment: .leading, spacing: 11) {
+                    if kind == .feed { line(45, height: 14); line(110, height: 14) }
+                    HStack(spacing: 8) { avatar; line(130, height: 9) }
+                    line(20); line(80)
+                }.padding(.vertical, 14)
+            case .comment:
+                HStack(alignment: .top, spacing: 8) {
+                    avatar
+                    VStack(alignment: .leading, spacing: 9) { line(150); line(28); line(100) }
+                }.padding(.vertical, 8)
+            case .body:
+                VStack(alignment: .leading, spacing: 13) {
+                    line(40, height: 18); line(110, height: 18)
+                    HStack(spacing: 9) { avatar; line(150) }.padding(.vertical, 10)
+                    ForEach(0..<3, id: \.self) { _ in
+                        VStack(spacing: 12) { line(); line(10); line(65) }.padding(.bottom, 16)
+                    }
+                }.frame(maxWidth: 680).padding(.horizontal, 24).padding(.top, 28)
+            case .collection:
+                line(100, height: 13).padding(.vertical, 12)
+            }
+        }
+        .opacity(dimmed && !reduceMotion ? 0.55 : 1)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) { dimmed = true }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
     }
 }
 
@@ -621,7 +715,9 @@ private struct CollectionPickerView: View {
     var body: some View {
         NavigationStack {
             List {
-                if loading { ProgressView().frame(maxWidth: .infinity) }
+                if loading {
+                    ForEach(0..<4, id: \.self) { _ in LoadingSkeleton(kind: .collection, label: "正在加载收藏夹").listRowSeparator(.hidden) }
+                }
                 else if let error {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(error).foregroundStyle(.secondary)
@@ -637,7 +733,7 @@ private struct CollectionPickerView: View {
                             HStack {
                                 Text(collection.title).foregroundStyle(.primary)
                                 Spacer()
-                                if savingID == collection.id { ProgressView() }
+                                if savingID == collection.id { Text("正在保存").font(.caption).foregroundStyle(.secondary) }
                                 else if collection.isFavorited { Image(systemName: "checkmark").foregroundStyle(ReaderPalette.accent) }
                             }.contentShape(Rectangle())
                         }.buttonStyle(.plain).disabled(savingID != nil)
@@ -732,15 +828,55 @@ private struct ItemRow: View {
     }
 }
 
+@MainActor
+private final class AvatarCache {
+    static let shared = AvatarCache()
+    private let images = NSCache<NSURL, UIImage>()
+    private var pending: [URL: Task<UIImage?, Never>] = [:]
+
+    private init() { images.countLimit = 200; images.totalCostLimit = 20 * 1024 * 1024 }
+
+    func image(for url: URL) async -> UIImage? {
+        if let image = images.object(forKey: url as NSURL) { return image }
+        if let task = pending[url] { return await task.value }
+        let task = Task<UIImage?, Never> {
+            var request = URLRequest(url: url)
+            request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+            return UIImage(data: data)
+        }
+        pending[url] = task
+        let image = await task.value
+        pending[url] = nil
+        if let image { images.setObject(image, forKey: url as NSURL, cost: Int(image.size.width * image.size.height * image.scale * image.scale * 4)) }
+        return image
+    }
+
+    func prefetch(_ urls: [URL]) async {
+        await withTaskGroup(of: Void.self) { group in
+            for url in Set(urls) { group.addTask { _ = await self.image(for: url) } }
+        }
+    }
+}
+
 private struct AvatarView: View {
     let url: URL?
     let size: CGFloat
+    @State private var image: UIImage?
     var body: some View {
-        AsyncImage(url: url) { image in image.resizable().scaledToFill() } placeholder: {
-            Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.secondary.opacity(0.5))
+        Group {
+            if let image { Image(uiImage: image).resizable().scaledToFill() }
+            else { Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.secondary.opacity(0.5)) }
         }
         .frame(width: size, height: size).clipShape(Circle())
         .accessibilityHidden(true)
+        .task(id: url) {
+            image = nil
+            guard let url else { return }
+            let loaded = await AvatarCache.shared.image(for: url)
+            if !Task.isCancelled { image = loaded }
+        }
     }
 }
 
@@ -884,7 +1020,7 @@ private struct HTMLReader: UIViewRepresentable {
         default: phoneGapColor = "light-dark(#e9ece7, #111513)"
         }
         let phoneAnswerCSS = paperCards || isPreview ? "" : """
-        body { margin: 0 auto; padding: 0 0 76px; background: \(colors.0); }
+        body { margin: 0 auto; padding: 0 0 100px; background: \(colors.0); }
         header { background: \(colors.0); padding: 36px clamp(20px, 5vw, 28px) 0; }
         header h1 { margin-bottom: 0; }
         .answer { background: \(colors.0); padding: 26px clamp(20px, 5vw, 28px) 32px; box-shadow: 0 3px 6px -4px rgba(0,0,0,.22); }
@@ -913,7 +1049,7 @@ private struct HTMLReader: UIViewRepresentable {
         let sections = sectionList.joined()
         let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(fontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
         let style = """
-        :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: 'Songti SC', 'STSong', Georgia, serif; font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
+        :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: 'Songti SC', 'STSong', Georgia, serif; font-size: clamp(21px, 5.5vw, 24px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
         .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:16px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
         main blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid rgba(128,128,128,.35); color: inherit; opacity: .82; }
         main p:last-child { margin-bottom: 0; }
@@ -1268,7 +1404,7 @@ private struct LoginView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button { session.verify() } label: {
-                        if session.checking { ProgressView() } else { Text("完成登录") }
+                        Text(session.checking ? "正在验证" : "完成登录")
                     }.disabled(session.checking || session.pageError != nil)
                 }
                 if session.canGoBack {

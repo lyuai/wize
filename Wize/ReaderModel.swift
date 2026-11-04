@@ -44,6 +44,7 @@ final class ReaderModel: ObservableObject {
     @Published var showsLogin = false
     @Published var accountName: String?
     @Published var accountAvatarURL: URL?
+    @Published var accountHeadline: String?
     private let source: any ReadingSource
     init() { self.source = ZhihuSource() }
     init(source: any ReadingSource) { self.source = source }
@@ -61,6 +62,7 @@ final class ReaderModel: ObservableObject {
     private var detailTasks: [String: (id: UUID, task: Task<ReadingItem, Error>)] = [:]
     private var prefetchingKeys: Set<String> = []
     private var detailCacheGeneration = 0
+    private var voteRevisions: [String: Int] = [:]
     private struct CachedComments { let page: Page<ReadingComment>; let date: Date }
     private var commentCache: [String: CachedComments] = [:]
     private var commentTasks: [String: (id: UUID, task: Task<Page<ReadingComment>, Error>)] = [:]
@@ -100,8 +102,8 @@ final class ReaderModel: ObservableObject {
         detailTasks[item.key] = (taskID, task)
         do {
             let result = try await task.value
-            if generation == detailCacheGeneration {
-                if detailTasks[item.key]?.id == taskID { detailTasks[item.key] = nil }
+            if generation == detailCacheGeneration, detailTasks[item.key]?.id == taskID {
+                detailTasks[item.key] = nil
                 if (result.contentHTML?.utf8.count ?? 0) <= 1_000_000 {
                     detailCache[item.key] = CachedDetail(item: result, date: Date())
                     if detailCache.count > 8, let oldest = detailCache.min(by: { $0.value.date < $1.value.date })?.key {
@@ -121,6 +123,7 @@ final class ReaderModel: ObservableObject {
         detailTasks.values.forEach { $0.task.cancel() }
         detailTasks.removeAll()
         detailCache.removeAll()
+        voteRevisions.removeAll()
         prefetchingKeys.removeAll()
         commentTasks.values.forEach { $0.task.cancel() }
         commentTasks.removeAll()
@@ -215,10 +218,14 @@ final class ReaderModel: ObservableObject {
         voteError = nil; voting = false
         bodyGeneration += 1
         let generation = bodyGeneration
+        let voteRevision = voteRevisions[item.key, default: 0]
         Task {
             do {
-                let detail = try await detail(for: item)
+                var detail = try await detail(for: item)
                 if generation == bodyGeneration {
+                    if voteRevisions[item.key, default: 0] != voteRevision, let current = selected, current.key == item.key {
+                        detail.vote = current.vote; detail.upCount = current.upCount; detail.downCount = current.downCount
+                    }
                     selected = detail
                     streamItems = [detail]
                     bodyHTML = detail.contentHTML
@@ -285,10 +292,9 @@ final class ReaderModel: ObservableObject {
                     streamItems += readable.filter { !seen.contains($0.key) }
                 }
             } while streamSeekingAnchor && streamHasMore && pagesSearched < 5
-            streamError = streamSeekingAnchor ? (streamHasMore ? "暂未找到当前回答的位置" : "无法在当前排序中找到此回答") : nil
+            streamError = nil
             streamSearchExhausted = streamSeekingAnchor && !streamHasMore
             if streamSearchExhausted { streamLeadingItems = [] }
-            if streamSeekingAnchor { streamHasMore = false }
         } catch {
             if generation == streamGeneration { streamHasMore = false; streamError = error.localizedDescription }
         }
@@ -304,26 +310,45 @@ final class ReaderModel: ObservableObject {
         guard let item = streamItems.first(where: { $0.id == id }), item.key != selected?.key else { return }
         selected = item; voting = false; voteError = nil
         let key = item.key
+        let revision = voteRevisions[key, default: 0]
         Task {
-            if let detail = try? await source.detail(item, prefetch: false), selected?.key == key, !voting { selected = detail }
+            if let detail = try? await source.detail(item, prefetch: false), selected?.key == key, !voting,
+               voteRevisions[key, default: 0] == revision { selected = detail }
         }
     }
 
     func toggleVote(_ direction: AnswerVote) async {
-        guard let item = selected, item.kind == .answer, !voting else { return }
-        let target: AnswerVote = item.vote == direction ? .neutral : direction
+        guard var item = selected, item.kind == .answer, !voting else { return }
         voting = true
+        voteError = nil
         defer { if selected?.key == item.key { voting = false } }
         do {
-            try await source.setVote(answerID: item.id, vote: target)
-            detailCache.removeValue(forKey: item.key)
-            if selected?.key == item.key {
-                var updated = item
-                if let count = updated.upCount { updated.upCount = max(0, count + (target == .up ? 1 : 0) - (item.vote == .up ? 1 : 0)) }
-                if let count = updated.downCount { updated.downCount = max(0, count + (target == .down ? 1 : 0) - (item.vote == .down ? 1 : 0)) }
-                updated.vote = target
-                selected = updated
+            if item.vote == nil {
+                item = try await source.detail(item, prefetch: false)
+                guard selected?.key == item.key else { return }
+                guard item.vote != nil else { throw SourceError.voteUnconfirmed }
+                selected = item
             }
+            let target: AnswerVote = item.vote == direction ? .neutral : direction
+            let result = try await source.setVote(answerID: item.id, vote: target)
+            voteRevisions[item.key, default: 0] += 1
+            detailCache.removeValue(forKey: item.key)
+            detailTasks.removeValue(forKey: item.key)?.task.cancel()
+            func updated(_ original: ReadingItem) -> ReadingItem {
+                guard original.key == item.key else { return original }
+                var value = original
+                let up = item.upCount.map { max(0, $0 + (result.vote == .up ? 1 : 0) - (item.vote == .up ? 1 : 0)) }
+                let down = item.downCount.map { max(0, $0 + (result.vote == .down ? 1 : 0) - (item.vote == .down ? 1 : 0)) }
+                value.upCount = result.upCount ?? up ?? original.upCount
+                value.downCount = result.downCount ?? down ?? original.downCount
+                value.vote = result.vote
+                return value
+            }
+            streamItems = streamItems.map(updated)
+            answers = answers.map(updated)
+            for channel in Channel.allCases { if let items = feeds[channel] { feeds[channel] = items.map(updated) } }
+            if let current = selected, current.key == item.key { selected = updated(current) }
+            if result.vote != target, selected?.key == item.key { voteError = "知乎未确认该操作，请稍后重试。" }
         } catch {
             if selected?.key == item.key { voteError = error.localizedDescription }
         }
@@ -404,9 +429,11 @@ final class ReaderModel: ObservableObject {
             let account = try await source.currentUser()
             accountName = account.name
             accountAvatarURL = account.avatar
+            accountHeadline = account.headline?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
             accountName = nil
             accountAvatarURL = nil
+            accountHeadline = nil
         }
     }
 

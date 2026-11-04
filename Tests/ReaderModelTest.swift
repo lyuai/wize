@@ -11,6 +11,9 @@ final class FixtureSource: ReadingSource {
     var paged = false
     var commentRequests = 0
     var commentDelay: UInt64 = 0
+    var votes: [String: AnswerVote] = [:]
+    var detailDelay: UInt64 = 0
+    var anchorPage: Int?
     init() {
         func item(_ id: String) -> ReadingItem {
             ReadingItem(id: id, kind: .answer, title: "问题", excerpt: "", author: id, questionID: "q", contentHTML: "<p>\(id)</p>")
@@ -18,8 +21,12 @@ final class FixtureSource: ReadingSource {
         first = item("first"); middle = item("middle"); last = item("last")
     }
     func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem> { Page(items: [], next: nil) }
-    func currentUser() async throws -> (name: String, avatar: URL?) { ("读者", nil) }
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?) { ("读者", nil, "爱阅读") }
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
+        if let anchorPage {
+            let item = offset == anchorPage ? middle : ReadingItem(id: "page-\(offset)", kind: .answer, title: "问题", excerpt: "", author: "", questionID: "q", contentHTML: "<p>回答</p>")
+            return Page(items: [item], next: offset < anchorPage ? URL(string: "https://example.invalid/next") : nil)
+        }
         if let delay = delays[sort] { try await Task.sleep(nanoseconds: delay) }
         if failingSort == sort { throw SourceError.response(503) }
         let ordered = sort == "updated" ? [last, middle, first] : [first, middle, last]
@@ -30,8 +37,16 @@ final class FixtureSource: ReadingSource {
         }
         return Page(items: available, next: nil)
     }
-    func detail(_ item: ReadingItem, prefetch: Bool) async throws -> ReadingItem { item }
-    func setVote(answerID: String, vote: AnswerVote) async throws { }
+    func detail(_ item: ReadingItem, prefetch: Bool) async throws -> ReadingItem {
+        var result = item
+        result.vote = votes[item.id] ?? .neutral
+        if detailDelay > 0 { try await Task.sleep(nanoseconds: detailDelay) }
+        return result
+    }
+    func setVote(answerID: String, vote: AnswerVote) async throws -> AnswerVoteResult {
+        votes[answerID] = vote
+        return AnswerVoteResult(vote: vote, upCount: nil, downCount: nil)
+    }
     func comments(_ item: ReadingItem, next: URL?) async throws -> Page<ReadingComment> {
         commentRequests += 1
         if commentDelay > 0 { try await Task.sleep(nanoseconds: commentDelay) }
@@ -54,6 +69,40 @@ struct ReaderModelTest {
         fatalError("Timed out waiting for reader state")
     }
     @MainActor static func main() async {
+        let seekingSource = FixtureSource()
+        seekingSource.anchorPage = 7
+        let seekingModel = ReaderModel(source: seekingSource)
+        seekingModel.selectAnswer(seekingSource.middle)
+        await waitFor { !seekingModel.streamLoading && seekingModel.streamHasMore }
+        precondition(seekingModel.streamError == nil, "A normal search past the first batch must not display an error")
+        await seekingModel.loadMoreStream()
+        precondition(seekingModel.streamError == nil && seekingModel.streamItems.contains(where: { $0.id == "page-0" }), "A later batch must continue locating the answer")
+        precondition(answerVote(from: ["voting": 1]) == .up)
+        precondition(answerVote(from: ["relationship": ["voting": 1]]) == .up)
+        precondition(answerVote(from: ["relationship": ["voting": 0]]) == .neutral)
+        precondition(answerVote(from: ["voting": 99]) == nil)
+        let voteSource = FixtureSource()
+        voteSource.votes["middle"] = .up
+        let voteModel = ReaderModel(source: voteSource)
+        voteModel.question = ReadingItem(id: "q", kind: .question, title: "问题", excerpt: "", author: "", questionID: nil)
+        await voteModel.loadAnswers()
+        voteModel.selectAnswer(voteSource.middle)
+        await waitFor { voteModel.streamItems.count == 3 && voteModel.selected?.vote == .up }
+        await voteModel.toggleVote(.up)
+        precondition(voteSource.votes["middle"] == .neutral && voteModel.selected?.vote == .neutral)
+        precondition(voteModel.answers.first(where: { $0.id == "middle" })?.vote == .neutral)
+        await voteModel.toggleVote(.up)
+        precondition(voteModel.streamItems.first(where: { $0.id == "middle" })?.vote == .up)
+        voteModel.leaveReading()
+        voteModel.selectAnswer(voteSource.middle)
+        await waitFor { voteModel.selected?.vote == .up }
+        voteModel.setVisibleAnswer("first")
+        voteSource.detailDelay = 100_000_000
+        voteModel.setVisibleAnswer("middle")
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        await voteModel.toggleVote(.up)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        precondition(voteModel.selected?.vote == .neutral, "An older detail response must not undo a confirmed vote")
         let source = FixtureSource()
         let model = ReaderModel(source: source)
         model.question = ReadingItem(id: "q", kind: .question, title: "问题", excerpt: "", author: "", questionID: nil)
