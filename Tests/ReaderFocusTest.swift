@@ -36,4 +36,20 @@ _ = evaluate("window.scrollTo(0, 440)")
 precondition(current() == "old2", "A small remnant at the top should not own actions when the reading focus is in the next answer")
 _ = evaluate("window.scrollTo(0, 320)")
 precondition(current() == "old", "Scrolling back should restore the previous answer")
+
+if let initStart = source.range(of: "let initialPositionScript = WKUserScript("),
+   let firstTripleQuote = source.range(of: "\"\"\"\n", range: initStart.upperBound..<source.endIndex),
+   let secondTripleQuote = source.range(of: "\n            \"\"\"", range: firstTripleQuote.upperBound..<source.endIndex) {
+    let initScript = String(source[firstTripleQuote.upperBound..<secondTripleQuote.lowerBound])
+    _ = evaluate("window.scrollTo(0, 0); document.body.setAttribute('data-wize-anchor', 'old2'); document.body.setAttribute('data-wize-pending', '1'); document.querySelectorAll('img').forEach(i => i.loading = 'lazy');")
+    _ = evaluate(initScript)
+    let pendingRemoved = evaluate("!document.body.hasAttribute('data-wize-pending')") as? Bool
+    precondition(pendingRemoved == true, "Initial position script must clear data-wize-pending before first paint")
+    precondition(current() == "old2", "Initial position script must scroll directly to the anchor answer before revealing body")
+    let activeID = evaluate("document.querySelector('section.current')?.getAttribute('data-wize-answer')") as? String
+    precondition(activeID == "old2", "Initial position script must mark the anchor answer as current")
+} else {
+    fatalError("Missing initialPositionScript in ReaderView.swift")
+}
+
 print("PASS: action target follows the reading focus across answer boundaries")

@@ -14,6 +14,6 @@
 
 ## 许可与来源
 
-Wize 的代码采用 [MIT License](LICENSE)。当前书法图标的来源和再使用限制见 [图标来源](Design/README.md)。知乎接口的路径和参数参考了 [BAIGUANGMEI/zhihu-cli](https://github.com/BAIGUANGMEI/zhihu-cli)（Apache-2.0）；本项目未包含该项目代码。知乎与其商标属于相应权利人，本项目与知乎无关联或授权关系。
+Wize 的代码采用 [MIT License](LICENSE)。当前书法图标的来源和再使用限制见 [图标来源](Design/README.md)。阅读设置中可按需下载的开源字体（[霞鹜新致宋](https://github.com/lxgw/LxgwNeoZhiSong)、[思源宋体](https://github.com/adobe-fonts/source-han-serif)、[霞鹜文楷](https://github.com/lxgw/LxgwWenKai-Lite)、[霞鹜新晰黑](https://github.com/lxgw/LxgwNeoXiHei)、[思源黑体](https://github.com/adobe-fonts/source-han-sans)）均采用 [SIL Open Font License 1.1](https://openfontlicense.org/) 许可，仓库不预置字体文件，由应用在用户选择时按需下载至本地。知乎接口的路径和参数参考了 [BAIGUANGMEI/zhihu-cli](https://github.com/BAIGUANGMEI/zhihu-cli)（Apache-2.0）；本项目未包含该项目代码。知乎与其商标属于相应权利人，本项目与知乎无关联或授权关系。
 
 欢迎通过 [贡献指南](CONTRIBUTING.md) 参与；开发与测试方法也在其中。请遵守 [行为准则](CODE_OF_CONDUCT.md)，安全问题请按 [安全说明](SECURITY.md) 私下报告。

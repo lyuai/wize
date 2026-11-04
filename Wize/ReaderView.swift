@@ -330,7 +330,7 @@ struct ReaderView: View {
                         stream: model.streamItems,
                         activeItem: item,
                         paperCards: usesWideLayout,
-                        onTitleHidden: { if usesWideLayout { showsPinnedTitle = $0 } },
+                        onTitleHidden: { if usesWideLayout && showsPinnedTitle != $0 { showsPinnedTitle = $0 } },
                         scrollRequest: model.scrollRequest,
                         onVisibleAnswer: { model.setVisibleAnswer($0) },
                         onNearEnd: { Task { await model.loadMoreStream() } }
@@ -442,9 +442,17 @@ struct ReaderView: View {
                 VStack(alignment: .leading, spacing: 7) {
                     commentRow(comment)
                     if row.hasChildren {
-                        Button(collapsedComments.contains(comment.id) ? "展开讨论" : "收起讨论") {
+                        let isCollapsed = collapsedComments.contains(comment.id)
+                        let count = max(comment.replyCount, model.commentReplies[comment.id]?.count ?? 1)
+                        Button {
                             if !collapsedComments.insert(comment.id).inserted { collapsedComments.remove(comment.id) }
-                        }.font(.caption).foregroundStyle(ReaderPalette.accent)
+                        } label: {
+                            compactCount(isCollapsed ? "chevron.down" : "chevron.up", count: count)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(ReaderPalette.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(isCollapsed ? "展开 \(count) 条回复" : "收起 \(count) 条回复")
                     }
                 }
                 .padding(.leading, CGFloat(min(row.depth, 3)) * 16)
@@ -456,50 +464,106 @@ struct ReaderView: View {
                     }
                 }
                 .listRowSeparator(.hidden)
+                .task {
+                    if index == rows.count - 1, model.canLoadMoreComments {
+                        await model.loadComments()
+                    }
+                }
                 let isEndOfBranch = index + 1 == rows.count || rows[index + 1].depth == 0
                 let root = rows[...index].last(where: { $0.depth == 0 })?.comment
                 if isEndOfBranch, let root, !collapsedComments.contains(root.id), (root.replyCount > 0 || model.replyNext[root.id] != nil) {
                     if model.loadingReplies.contains(root.id) {
                         ProgressView().padding(.leading, 18).listRowSeparator(.hidden)
-                    } else if let error = model.replyErrors[root.id] {
-                        Button("回复加载失败，点击重试：\(error)") { Task { await model.loadReplies(to: root) } }
-                            .font(.caption).foregroundStyle(.secondary).padding(.leading, 18).listRowSeparator(.hidden)
+                    } else if model.replyErrors[root.id] != nil {
+                        Button { Task { await model.loadReplies(to: root) } } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.leading, 18)
+                        .listRowSeparator(.hidden)
+                        .accessibilityLabel("重试加载回复")
                     } else if model.commentReplies[root.id] == nil || model.replyNext[root.id] != nil {
-                        Button(model.commentReplies[root.id] == nil ? "查看 \(root.replyCount) 条回复" : "加载更多回复") {
+                        let loaded = model.commentReplies[root.id]?.count ?? 0
+                        let remaining = model.commentReplies[root.id] == nil ? max(root.replyCount, 1) : max(root.replyCount - loaded, 0)
+                        Button {
                             Task { await model.loadReplies(to: root) }
-                        }.font(.caption).padding(.leading, 18).listRowSeparator(.hidden)
+                        } label: {
+                            if remaining > 0 {
+                                compactCount("bubble.right", count: remaining)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(ReaderPalette.accent)
+                            } else {
+                                Image(systemName: "ellipsis")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(ReaderPalette.accent)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.leading, 18)
+                        .listRowSeparator(.hidden)
+                        .accessibilityLabel(model.commentReplies[root.id] == nil ? "查看 \(root.replyCount) 条回复" : "加载更多回复")
                     }
                 }
             }
-            if let error = model.commentError { retryRow(error) { await model.loadComments(reset: true) }.listRowSeparator(.hidden) }
-            else if model.loadingComments { ProgressView().frame(maxWidth: .infinity).listRowSeparator(.hidden) }
-            else if model.canLoadMoreComments { Button("加载更多") { Task { await model.loadComments() } }.listRowSeparator(.hidden) }
+            if model.commentError != nil {
+                Button { Task { await model.loadComments(reset: true) } } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.plain)
+                .listRowSeparator(.hidden)
+                .accessibilityLabel("重试加载评论")
+            } else if model.loadingComments {
+                ProgressView().frame(maxWidth: .infinity).listRowSeparator(.hidden)
+            } else if model.canLoadMoreComments {
+                Button { Task { await model.loadComments() } } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .listRowSeparator(.hidden)
+                .accessibilityLabel("加载更多评论")
+            }
         }.listStyle(.plain)
-            .navigationTitle(model.commentTarget?.author.isEmpty == false ? "评论 · \(model.commentTarget?.author ?? "")" : "评论")
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .overlay {
                 if model.comments.isEmpty && !model.loadingComments && model.commentError == nil {
-                    VStack(spacing: 14) {
-                        ZStack {
-                            Circle().fill(ReaderPalette.accent.opacity(0.08)).frame(width: 100, height: 100)
-                            Circle().stroke(ReaderPalette.accent.opacity(0.16), lineWidth: 1).frame(width: 72, height: 72)
-                            Image(systemName: "bubble.left.and.bubble.right")
-                                .font(.system(size: 29, weight: .light)).foregroundStyle(ReaderPalette.accent.opacity(0.8))
-                            Circle().fill(ReaderPalette.accent.opacity(0.35)).frame(width: 5, height: 5).offset(x: 42, y: -29)
-                            Circle().fill(ReaderPalette.accent.opacity(0.20)).frame(width: 4, height: 4).offset(x: -40, y: 30)
-                        }
-                        Text("暂无评论").font(.headline).foregroundStyle(.primary)
-                        Text("这里还没有讨论").font(.subheadline).foregroundStyle(.secondary)
+                    ZStack {
+                        Circle().fill(ReaderPalette.accent.opacity(0.08)).frame(width: 100, height: 100)
+                        Circle().stroke(ReaderPalette.accent.opacity(0.16), lineWidth: 1).frame(width: 72, height: 72)
+                        Image(systemName: "bubble.left.and.bubble.right")
+                            .font(.system(size: 29, weight: .light)).foregroundStyle(ReaderPalette.accent.opacity(0.8))
+                        Circle().fill(ReaderPalette.accent.opacity(0.35)).frame(width: 5, height: 5).offset(x: 42, y: -29)
+                        Circle().fill(ReaderPalette.accent.opacity(0.20)).frame(width: 4, height: 4).offset(x: -40, y: 30)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .accessibilityElement(children: .combine)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("暂无评论")
                     .allowsHitTesting(false)
                 }
             }
-            .toolbar { ToolbarItem(placement: .navigationBarTrailing) {
-                Button { model.showsComments = false } label: { Image(systemName: "xmark") }
-                    .accessibilityLabel("关闭评论")
-            } }
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    let count = model.commentTarget?.commentCount ?? model.comments.count
+                    compactCount("bubble.right", count: count)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("\(displayCount(count)) 条评论")
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { model.showsComments = false } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("关闭评论")
+                }
+            }
     }
 
     private func commentRow(_ comment: ReadingComment) -> some View {
@@ -508,8 +572,11 @@ struct ReaderView: View {
                         AvatarView(url: comment.avatarURL, size: 30)
                         Text(comment.author).font(.subheadline.weight(.semibold))
                         if let replyTo = comment.replyTo {
-                            Text("回复").foregroundStyle(.secondary)
-                            Text(replyTo).fontWeight(.medium).lineLimit(1)
+                            Image(systemName: "arrowtriangle.right.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
+                            Text(replyTo).font(.subheadline.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer()
                         if comment.likes > 0 {
@@ -832,6 +899,7 @@ private struct HTMLReader: UIViewRepresentable {
     var scrollRequest: ReaderModel.ScrollRequest? = nil
     var onVisibleAnswer: (String) -> Void = { _ in }
     var onNearEnd: () -> Void = {}
+    @ObservedObject private var fontManager = ReadingFontManager.shared
     @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
     @AppStorage("reading.lineHeight") private var lineHeight = 1.8
     @AppStorage("reading.width") private var readingWidth = ReadingDefaults.width
@@ -840,8 +908,37 @@ private struct HTMLReader: UIViewRepresentable {
     @AppStorage("reading.theme") private var theme = "system"
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration(); config.defaultWebpagePreferences.allowsContentJavaScript = false
+        let initialPositionScript = WKUserScript(
+            source: """
+            (() => {
+                const body = document.body;
+                if (!body) return;
+                const id = body.getAttribute('data-wize-anchor');
+                const sections = Array.from(document.querySelectorAll('section[data-wize-answer]'));
+                let target = null;
+                if (id && sections.length > 1 && sections[0].getAttribute('data-wize-answer') !== id) {
+                    const el = sections.find(e => e.getAttribute('data-wize-answer') === id);
+                    if (el) {
+                        window.scrollTo(0, Math.max(0, el.getBoundingClientRect().top + window.scrollY));
+                        target = el;
+                    }
+                }
+                const active = target || sections.find(e => e.getAttribute('data-wize-answer') === id) || sections[0];
+                if (active) active.classList.add('current');
+                const index = sections.indexOf(active);
+                if (index >= 0) {
+                    sections.slice(index, index + 2).forEach(s => s.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager'));
+                }
+                body.removeAttribute('data-wize-pending');
+            })()
+            """,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
+        config.userContentController.addUserScript(initialPositionScript)
         let view = WKWebView(frame: .zero, configuration: config)
         view.isOpaque = false; view.backgroundColor = .clear
+        view.scrollView.backgroundColor = .clear
         view.scrollView.alwaysBounceHorizontal = false
         view.scrollView.isDirectionalLockEnabled = true
         view.navigationDelegate = context.coordinator
@@ -863,7 +960,10 @@ private struct HTMLReader: UIViewRepresentable {
         case "dark": colors = ("#1d2023", "#e5e5e3", "dark")
         default: colors = ("light-dark(#fbfaf7, #191c1b)", "light-dark(#282b28, #e4e7e3)", "light dark")
         }
-        let fontFamily = font == "serif" ? "'Songti SC', 'STSong', Georgia, serif" : "-apple-system, sans-serif"
+        let selectedFont = ReadingFontOption.option(for: font)
+        let fontFamily = selectedFont.cssFamily
+        let fontFaceCSS = fontManager.fontFaceCSS[selectedFont.id] ?? ""
+        let fontFaceKey = "\(selectedFont.id):\(fontFaceCSS.count)"
         let paperColor: String
         switch theme {
         case "paper": paperColor = "#fbf7ef"
@@ -902,7 +1002,7 @@ private struct HTMLReader: UIViewRepresentable {
         let parts = stream.isEmpty ? [item] : stream
         let sectionList = parts.enumerated().map { index, answer in
             let author = htmlEscape(answer.author.isEmpty ? "匿名用户" : answer.author)
-            let avatar = answer.avatarURL.map { "<img class=\"avatar\" src=\"\(htmlEscape($0.absoluteString))\" alt=\"\">" } ?? ""
+            let avatar = answer.avatarURL.map { "<img class=\"avatar\" loading=\"lazy\" decoding=\"async\" src=\"\(htmlEscape($0.absoluteString))\" alt=\"\">" } ?? ""
             let content = answer.contentHTML ?? (index == 0 ? html : "")
             let counts = """
             <div class="counts"><span><svg viewBox="0 0 24 24" aria-label="赞同"><path d="M7 10v10H4V10h3zm2 10V10l4-7c.4-.8 1.6-.5 1.6.4V8H19c1.3 0 2.2 1.2 1.9 2.4l-1.6 7.5A2.5 2.5 0 0 1 16.8 20H9z"/></svg><b data-count="up">\(displayCount(answer.upCount))</b></span><span><svg viewBox="0 0 24 24" aria-label="评论"><path d="M4 5.5h16v11H11l-4.5 3v-3H4z"/></svg><b data-count="comments">\(displayCount(answer.commentCount))</b></span></div>
@@ -912,8 +1012,9 @@ private struct HTMLReader: UIViewRepresentable {
         }
         let sections = sectionList.joined()
         let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(fontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
+        let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
-        :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: 'Songti SC', 'STSong', Georgia, serif; font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
+        :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
         .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:16px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
         main blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid rgba(128,128,128,.35); color: inherit; opacity: .82; }
         main p:last-child { margin-bottom: 0; }
@@ -927,7 +1028,7 @@ private struct HTMLReader: UIViewRepresentable {
         \(previewCSS)
         """
         let document = """
-        <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>\(style)</style></head><body><header><h1>\(title)</h1></header>\(sections)</body></html>
+        <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>\(style)</style><style id="wize-font-face"></style></head><body data-wize-anchor="\(htmlEscape(item.id))" data-wize-pending="1"><header><h1>\(title)</h1></header>\(sections)</body></html>
         """
         context.coordinator.onVisibleAnswer = onVisibleAnswer
         context.coordinator.onNearEnd = onNearEnd
@@ -940,6 +1041,7 @@ private struct HTMLReader: UIViewRepresentable {
                coordinator.documentTitle == title, coordinator.presentationKey != presentationKey {
                 coordinator.presentationKey = presentationKey
                 coordinator.lastHTML = document
+                coordinator.updateFontFace(fontFaceCSS, key: fontFaceKey, in: view)
                 coordinator.updateStyle(style, in: view, preservePosition: !isPreview)
                 return
             }
@@ -962,6 +1064,7 @@ private struct HTMLReader: UIViewRepresentable {
             coordinator.documentTitle = title
             coordinator.sections = sectionList
             coordinator.cancelPendingAppends()
+            coordinator.userHasScrolled = false
             if context.coordinator.lastHTML.isEmpty, parts.first?.id != item.id,
                parts.contains(where: { $0.id == item.id }) {
                 context.coordinator.pendingAnchorID = item.id
@@ -982,11 +1085,20 @@ private struct HTMLReader: UIViewRepresentable {
             context.coordinator.previousCount = parts.count
             context.coordinator.previousFirstID = parts.first?.id
             context.coordinator.lastHTML = document
+            coordinator.fontFaceKey = fontFaceKey
             coordinator.loadingDocument = true
-            view.loadHTMLString(document, baseURL: URL(string: "https://www.zhihu.com"))
-        } else if let request = scrollRequest, context.coordinator.lastScrollToken != request.token {
-            context.coordinator.lastScrollToken = request.token
-            context.coordinator.scrollToAnswer(request.id, in: view)
+            let initialHTML = fontFaceCSS.isEmpty
+                ? document
+                : document.replacingOccurrences(of: "<style id=\"wize-font-face\"></style>", with: "<style id=\"wize-font-face\">\(fontFaceCSS)</style>")
+            view.loadHTMLString(initialHTML, baseURL: URL(string: "https://www.zhihu.com"))
+        } else {
+            if context.coordinator.fontFaceKey != fontFaceKey {
+                context.coordinator.updateFontFace(fontFaceCSS, key: fontFaceKey, in: view)
+            }
+            if let request = scrollRequest, context.coordinator.lastScrollToken != request.token {
+                context.coordinator.lastScrollToken = request.token
+                context.coordinator.scrollToAnswer(request.id, in: view)
+            }
         }
         if context.coordinator.lastHTML == document { context.coordinator.updateActive(in: view) }
     }
@@ -1010,6 +1122,9 @@ private struct HTMLReader: UIViewRepresentable {
         var documentTitle = ""
         var sections: [String] = []
         var loadingDocument = false
+        var userHasScrolled = false
+        var fontFaceKey = ""
+        private var pendingFontFaceCSS: String?
         private var pendingStyle: String?
         private var preserveStylePosition = true
         private var applyingStyle = false
@@ -1026,6 +1141,20 @@ private struct HTMLReader: UIViewRepresentable {
             appending = false
             pendingStyle = nil
             applyingStyle = false
+            pendingFontFaceCSS = nil
+        }
+        func updateFontFace(_ css: String, key: String, in webView: WKWebView) {
+            fontFaceKey = key
+            pendingFontFaceCSS = css
+            flushFontFace(in: webView)
+        }
+        private func flushFontFace(in webView: WKWebView) {
+            guard !loadingDocument, let css = pendingFontFaceCSS,
+                  let data = try? JSONEncoder().encode(css),
+                  let encoded = String(data: data, encoding: .utf8) else { return }
+            pendingFontFaceCSS = nil
+            let script = "(() => { const el = document.getElementById('wize-font-face'); if (!el) return false; el.textContent = \(encoded); return true; })()"
+            webView.evaluateJavaScript(script)
         }
         func updateStyle(_ style: String, in webView: WKWebView, preservePosition: Bool) {
             pendingStyle = style
@@ -1053,7 +1182,7 @@ private struct HTMLReader: UIViewRepresentable {
             flushAppends(in: webView)
         }
         private func flushAppends(in webView: WKWebView) {
-            guard !appending, let html = pendingAppends.first,
+            guard !loadingDocument, !appending, let html = pendingAppends.first,
                   let data = try? JSONEncoder().encode(html),
                   let encoded = String(data: data, encoding: .utf8) else { return }
             appending = true
@@ -1074,6 +1203,7 @@ private struct HTMLReader: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             self.webView = webView
             loadingDocument = false
+            flushFontFace(in: webView)
             flushStyle(in: webView)
             flushAppends(in: webView)
             let extent = max(webView.scrollView.contentSize.height - webView.scrollView.bounds.height, 0)
@@ -1081,7 +1211,7 @@ private struct HTMLReader: UIViewRepresentable {
                let encoded = try? String(data: JSONEncoder().encode(id), encoding: .utf8) {
                 pendingAnchorID = nil; pendingOffset = nil
                 restoringAnchor = true
-                let script = "(() => { const id = \(encoded); const el = Array.from(document.querySelectorAll('section[data-wize-answer]')).find(e => e.getAttribute('data-wize-answer') === id); if (el) window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY + \(offset)); })()"
+                let script = "(() => { const id = \(encoded); const el = Array.from(document.querySelectorAll('section[data-wize-answer]')).find(e => e.getAttribute('data-wize-answer') === id); if (el && (\(offset) > 0 || window.scrollY < 1)) window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY + \(offset)); })()"
                 webView.evaluateJavaScript(script) { [weak self, weak webView] _, _ in
                     guard let self, let webView else { return }
                     self.restoringAnchor = false
@@ -1099,11 +1229,15 @@ private struct HTMLReader: UIViewRepresentable {
             updateActive(in: webView)
             inspect(webView)
         }
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            userHasScrolled = true
+        }
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
-            guard streamEnabled, let webView else { return }
+            guard streamEnabled, !loadingDocument, pendingAnchorID == nil, !restoringAnchor,
+                  scrollView.contentSize.height > 0, let webView else { return }
             let remaining = scrollView.contentSize.height - scrollView.bounds.height - scrollView.contentOffset.y
             if remaining < scrollView.bounds.height * 1.3 { onNearEnd() }
-            if Date().timeIntervalSince(lastInspection) > 0.2 { inspect(webView) }
+            if userHasScrolled, Date().timeIntervalSince(lastInspection) > 0.2 { inspect(webView) }
         }
         func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
             if !decelerate, let webView, streamEnabled { inspect(webView) }
@@ -1112,31 +1246,32 @@ private struct HTMLReader: UIViewRepresentable {
             if let webView, streamEnabled { inspect(webView) }
         }
         func inspectAfterLayout(_ webView: WKWebView) {
-            guard streamEnabled else { return }
+            guard streamEnabled, !loadingDocument else { return }
             flushAppends(in: webView)
             inspect(webView)
         }
         func scrollToAnswer(_ id: String, in webView: WKWebView) {
+            userHasScrolled = false
             guard let encoded = try? String(data: JSONEncoder().encode(id), encoding: .utf8) else { return }
             let script = "(() => { const id = \(encoded); const el = Array.from(document.querySelectorAll('section[data-wize-answer]')).find(e => e.getAttribute('data-wize-answer') === id); if (el) el.scrollIntoView({block:'start'}); })()"
             webView.evaluateJavaScript(script)
         }
         func updateActive(in webView: WKWebView) {
-            guard let item = activeItem,
+            guard !loadingDocument, let item = activeItem,
                   let data = try? JSONEncoder().encode([item.id, displayCount(item.upCount), displayCount(item.downCount), displayCount(item.commentCount)]),
                   let values = String(data: data, encoding: .utf8) else { return }
             let script = "(() => { const [id, up, down, comments] = \(values); document.querySelectorAll('section[data-wize-answer]').forEach(e => { const active = e.getAttribute('data-wize-answer') === id; e.classList.toggle('current', active); if (active) { for (const [key, value] of Object.entries({up, down, comments})) { const node = e.querySelector('[data-count=\\\"' + key + '\\\"]'); if (node) node.textContent = value; } } }); })()"
             webView.evaluateJavaScript(script)
         }
         private func inspect(_ webView: WKWebView) {
-            guard streamEnabled, pendingAnchorID == nil, !restoringAnchor else { return }
+            guard streamEnabled, !loadingDocument, pendingAnchorID == nil, !restoringAnchor else { return }
             lastInspection = Date()
             // Tie edge actions to the answer at the reading focus, not a sliver at the top.
             let script = "(() => { const answers = Array.from(document.querySelectorAll('section[data-wize-answer]')); const focus = Math.min(innerHeight * .35, innerHeight - 1); const answer = answers.find(e => e.getBoundingClientRect().bottom > focus) || answers.find(e => e.getBoundingClientRect().bottom > 0); const index = answers.indexOf(answer); if (index >= 0) answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager')); const title = document.querySelector('header h1'); return { id: answer?.getAttribute('data-wize-answer') || null, titleHidden: !!title && title.getBoundingClientRect().bottom <= 0 }; })()"
             webView.evaluateJavaScript(script) { [weak self] result, _ in
-                guard let result = result as? [String: Any] else { return }
-                if let id = result["id"] as? String { self?.onVisibleAnswer(id) }
-                if let hidden = result["titleHidden"] as? Bool { self?.onTitleHidden(hidden) }
+                guard let self, let result = result as? [String: Any] else { return }
+                if self.userHasScrolled, let id = result["id"] as? String { self.onVisibleAnswer(id) }
+                if let hidden = result["titleHidden"] as? Bool { self.onTitleHidden(hidden) }
             }
         }
     }
@@ -1144,6 +1279,7 @@ private struct HTMLReader: UIViewRepresentable {
 
 private struct ReadingSettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var fontManager = ReadingFontManager.shared
     @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
     @AppStorage("reading.lineHeight") private var lineHeight = 1.8
     @AppStorage("reading.width") private var readingWidth = ReadingDefaults.width
@@ -1174,15 +1310,20 @@ private struct ReadingSettingsView: View {
                         Slider(value: $fontSize, in: 15...25, step: 1)
                         Text("\(Int(fontSize))").monospacedDigit().foregroundStyle(.secondary)
                     }
-                    Picker("字体", selection: $font) {
-                        Text("系统").tag("system")
-                        Text("宋体").tag("serif")
-                    }
                     HStack {
                         Text("行距")
                         Slider(value: $lineHeight, in: 1.5...2.1, step: 0.1)
                         Text(lineHeight, format: .number.precision(.fractionLength(1))).monospacedDigit().foregroundStyle(.secondary)
                     }
+                }
+                Section {
+                    ForEach(fontManager.options) { option in
+                        fontRow(option)
+                    }
+                } header: {
+                    Text("字体")
+                } footer: {
+                    Text("可下载字体均采用 SIL Open Font License 1.1 开源许可，无版权限制，按需下载并保存在本机。")
                 }
                 Section("版面") {
                     Picker("行宽", selection: $readingWidth) {
@@ -1217,8 +1358,114 @@ private struct ReadingSettingsView: View {
             .navigationTitle("阅读设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .onAppear { fontManager.prepareFontIfNeeded(id: font) }
         }
         .presentationDetents([.large])
+    }
+
+    @ViewBuilder
+    private func fontRow(_ option: ReadingFontOption) -> some View {
+        let state = fontManager.state(for: option)
+        let isSelected = font == option.id
+        Button {
+            switch state {
+            case .builtIn, .downloaded:
+                fontManager.prepareFontIfNeeded(id: option.id)
+                font = option.id
+            case .notDownloaded, .failed:
+                fontManager.download(option) { selectedID in
+                    font = selectedID
+                }
+            case .downloading:
+                fontManager.cancelDownload(option)
+            }
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(option.title)
+                        .font(titleFont(for: option))
+                        .foregroundStyle(.primary)
+                    if case .failed(let message) = state {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    } else {
+                        Text(option.subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                switch state {
+                case .builtIn:
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(ReaderPalette.accent)
+                    }
+                case .downloaded:
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(ReaderPalette.accent)
+                    } else {
+                        Image(systemName: "checkmark.circle")
+                            .font(.body)
+                            .foregroundStyle(.secondary.opacity(0.6))
+                    }
+                case .notDownloaded:
+                    Image(systemName: "arrow.down.circle")
+                        .font(.title3)
+                        .foregroundStyle(ReaderPalette.accent)
+                case .failed:
+                    Image(systemName: "arrow.clockwise.circle")
+                        .font(.title3)
+                        .foregroundStyle(ReaderPalette.accent)
+                case .downloading(let progress):
+                    HStack(spacing: 6) {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.circular)
+                            .controlSize(.small)
+                        Text("\(Int(progress * 100))%")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if !option.isBuiltIn, state == .downloaded {
+                Button(role: .destructive) {
+                    if font == option.id { font = "system" }
+                    fontManager.removeFont(option)
+                } label: {
+                    Label("删除", systemImage: "trash")
+                }
+            }
+        }
+        .accessibilityLabel("\(option.title)，\(accessibilityStateDescription(for: state, isSelected: isSelected))")
+    }
+
+    private func titleFont(for option: ReadingFontOption) -> Font {
+        if let registered = fontManager.registeredFontNames[option.id] {
+            return .custom(registered, size: 17)
+        }
+        if option.id == "serif" {
+            return .custom("Songti SC", size: 17)
+        }
+        return .body
+    }
+
+    private func accessibilityStateDescription(for state: ReadingFontManager.State, isSelected: Bool) -> String {
+        switch state {
+        case .builtIn: return isSelected ? "已选中" : "内置字体"
+        case .downloaded: return isSelected ? "已下载并选中" : "已下载"
+        case .notDownloaded: return "未下载，点击按需下载"
+        case .downloading(let p): return "正在下载 \(Int(p * 100))%"
+        case .failed(let message): return "下载失败：\(message)"
+        }
     }
 }
 

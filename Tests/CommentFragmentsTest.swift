@@ -33,6 +33,37 @@ struct CommentFragmentsTest {
         guard case .text("谢谢") = emoji[0], case .emoji("[感谢]", _) = emoji[1],
               case .text("，真的") = emoji[2], case .emoji("[捂脸]", _) = emoji[3],
               case .text("[未知]。") = emoji[4] else { fatalError("Emoji and text must preserve their original order") }
-        print("PASS: comment text, original GIFs and repeated images preserve their order")
+
+        let sizedImg = expandedImageHTML(#"<img src="https://pic.zhimg.com/thumb.jpg" data-original="https://pic.zhimg.com/raw.jpg" data-rawwidth="1200" data-rawheight="800">"#)
+        precondition(sizedImg.contains(#"src="https://pic.zhimg.com/raw.jpg""#), "expandedImageHTML should promote data-original to src")
+        precondition(sizedImg.contains(#"width="1200" height="800""#), "expandedImageHTML should preserve raw dimensions to prevent image load layout shifts")
+        precondition(sizedImg.contains(#"loading="lazy" decoding="async""#), "expandedImageHTML should add lazy loading and async decoding")
+
+        if let readerViewSource = try? String(contentsOfFile: "Wize/ReaderView.swift", encoding: .utf8),
+           let commentStart = readerViewSource.range(of: "private var commentList: some View"),
+           let commentEnd = readerViewSource.range(of: "private func retryRow", range: commentStart.lowerBound..<readerViewSource.endIndex) {
+            let visibleCommentLines = readerViewSource[commentStart.lowerBound..<commentEnd.lowerBound]
+                .components(separatedBy: "\n")
+                .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix(".accessibilityLabel(") }
+                .joined(separator: "\n")
+            let forbiddenLabels = [
+                #"Text("回复")"#,
+                "展开讨论",
+                "收起讨论",
+                "条回复",
+                "加载更多回复",
+                "加载更多评论",
+                "暂无评论",
+                "这里还没有讨论",
+                #"navigationTitle("评论"#
+            ]
+            for label in forbiddenLabels {
+                precondition(!visibleCommentLines.contains(label), "Comment view must not contain visible UI text label: \(label)")
+            }
+            precondition(visibleCommentLines.contains(#"compactCount("bubble.right""#), "Comment view should use icon + number for comment and reply counts")
+            precondition(visibleCommentLines.contains(#"Image(systemName: "arrowtriangle.right.fill")"#), "Reply target should use an icon instead of text label")
+        }
+
+        print("PASS: comment text, original GIFs, repeated images, raw image dimensions and pure icon-based comment UI")
     }
 }
