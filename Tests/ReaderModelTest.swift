@@ -14,6 +14,7 @@ final class FixtureSource: ReadingSource {
     var votes: [String: AnswerVote] = [:]
     var detailDelay: UInt64 = 0
     var anchorPage: Int?
+    var answerRequests = 0
     init() {
         func item(_ id: String) -> ReadingItem {
             ReadingItem(id: id, kind: .answer, title: "问题", excerpt: "", author: id, questionID: "q", contentHTML: "<p>\(id)</p>")
@@ -23,6 +24,7 @@ final class FixtureSource: ReadingSource {
     func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem> { Page(items: [], next: nil) }
     func currentUser() async throws -> (name: String, avatar: URL?, headline: String?) { ("读者", nil, "爱阅读") }
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
+        answerRequests += 1
         if let anchorPage {
             let item = offset == anchorPage ? middle : ReadingItem(id: "page-\(offset)", kind: .answer, title: "问题", excerpt: "", author: "", questionID: "q", contentHTML: "<p>回答</p>")
             return Page(items: [item], next: offset < anchorPage ? URL(string: "https://example.invalid/next") : nil)
@@ -73,7 +75,7 @@ struct ReaderModelTest {
         seekingSource.anchorPage = 7
         let seekingModel = ReaderModel(source: seekingSource)
         seekingModel.selectAnswer(seekingSource.middle)
-        await waitFor { !seekingModel.streamLoading && seekingModel.streamHasMore }
+        await waitFor { seekingSource.answerRequests >= 5 && !seekingModel.streamLoading && seekingModel.streamHasMore }
         precondition(seekingModel.streamError == nil, "A normal search past the first batch must not display an error")
         await seekingModel.loadMoreStream()
         precondition(seekingModel.streamError == nil && seekingModel.streamItems.contains(where: { $0.id == "page-0" }), "A later batch must continue locating the answer")
@@ -108,6 +110,9 @@ struct ReaderModelTest {
         model.question = ReadingItem(id: "q", kind: .question, title: "问题", excerpt: "", author: "", questionID: nil)
         await model.loadAnswers()
         model.selectAnswer(source.middle)
+        precondition(model.selected?.id == "middle", "selectAnswer must set selected synchronously")
+        precondition(model.bodyHTML == "<p>middle</p>" && model.streamError == nil, "Selecting an answer with inline contentHTML must never flash bodyHTML = nil")
+        precondition(model.streamItems.map(\.id) == ["first", "middle", "last"], "Selecting an answer from a loaded question must populate streamItems synchronously on the first frame")
         await waitFor { model.streamItems.count == 3 && model.selected?.id == "middle" }
         precondition(model.streamItems.map(\.id) == ["first", "middle", "last"])
 
@@ -178,6 +183,67 @@ struct ReaderModelTest {
         _ = await (directoryPage, readerPage)
         precondition(concurrentModel.answers.map(\.id) == ["first", "middle", "last"], "Concurrent pagination must not duplicate directory entries")
         precondition(concurrentModel.streamItems.map(\.id) == ["first", "middle", "last"], "Concurrent pagination must not duplicate reader entries")
-        print("PASS: sorting, current answer, comment ownership and stale responses")
+
+        // Verify on-demand open-license fonts and ReadingFontManager lifecycle
+        let downloadableOptions = ReadingFontOption.all.filter { !$0.isBuiltIn }
+        precondition(downloadableOptions.count >= 4, "Should offer multiple downloadable fonts")
+        precondition(downloadableOptions.contains(where: { $0.id == "lxgw-neo-zhisong" && $0.title.contains("宋") }), "Should offer LXGW Neo ZhiSong (宋体)")
+        precondition(downloadableOptions.contains(where: { $0.id == "source-han-serif" && $0.title.contains("宋") }), "Should offer Source Han Serif (思源宋体)")
+        for option in downloadableOptions {
+            precondition(option.license == "SIL Open Font License 1.1", "All downloadable fonts must use a copyright-free open license")
+            precondition(!option.urls.isEmpty && !option.fileName.isEmpty, "Downloadable font must specify source URLs and fileName")
+        }
+
+        let tempFontDir = FileManager.default.temporaryDirectory.appendingPathComponent("wize-font-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempFontDir) }
+        var validTTF = Data([0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00])
+        validTTF.append(contentsOf: Array(repeating: UInt8(0x41), count: 64))
+        var observedProgress: [Double] = []
+        let targetFont = ReadingFontOption.option(for: "lxgw-neo-zhisong")
+        let fontManager = ReadingFontManager(directory: tempFontDir) { _, reportProgress in
+            reportProgress(0.35)
+            reportProgress(0.85)
+            try await Task.sleep(nanoseconds: 10_000_000)
+            return validTTF
+        }
+        precondition(fontManager.state(for: ReadingFontOption.option(for: "system")) == .builtIn, "Built-in font must report .builtIn")
+        precondition(fontManager.state(for: targetFont) == .notDownloaded, "Downloadable font must start as .notDownloaded")
+        var selectedCallbackID: String?
+        fontManager.download(targetFont) { id in selectedCallbackID = id }
+        if case .downloading(let initialProgress) = fontManager.state(for: targetFont) {
+            observedProgress.append(initialProgress)
+        }
+        await waitFor { fontManager.state(for: targetFont) == .downloaded }
+        precondition(!observedProgress.isEmpty, "Font download must enter .downloading state immediately")
+        precondition(selectedCallbackID == targetFont.id, "Completing download must invoke selection callback")
+        precondition(FileManager.default.fileExists(atPath: fontManager.fontFileURL(for: targetFont).path), "Font file must be saved on disk")
+        guard let css = fontManager.fontFaceCSS[targetFont.id] else {
+            fatalError("Downloaded font must generate @font-face CSS")
+        }
+        precondition(css.contains("@font-face") && css.contains(targetFont.webFontFamilyName), "Generated CSS must define @font-face for the font's web family")
+
+        // Re-initializing manager against same directory must restore downloaded state and cached CSS synchronously
+        let restoredManager = ReadingFontManager(directory: tempFontDir)
+        precondition(restoredManager.state(for: targetFont) == .downloaded, "Restored manager must detect downloaded font on disk")
+        precondition(restoredManager.fontFaceCSS[targetFont.id] == css, "Restored manager must load cached @font-face CSS synchronously")
+
+        // Removing font must delete files and reset state
+        fontManager.removeFont(targetFont)
+        precondition(fontManager.state(for: targetFont) == .notDownloaded, "Removed font must return to .notDownloaded")
+        precondition(fontManager.fontFaceCSS[targetFont.id] == nil, "Removed font must clear cached CSS")
+        precondition(!FileManager.default.fileExists(atPath: fontManager.fontFileURL(for: targetFont).path), "Removed font file must be deleted from disk")
+
+        // Invalid font payload must fail cleanly
+        let failingManager = ReadingFontManager(directory: tempFontDir) { _, _ in
+            Data("<html>not a font</html>".utf8)
+        }
+        failingManager.download(targetFont)
+        await waitFor {
+            if case .failed = failingManager.state(for: targetFont) { return true }
+            return false
+        }
+        precondition(!FileManager.default.fileExists(atPath: failingManager.fontFileURL(for: targetFont).path), "Invalid font data must not be persisted")
+
+        print("PASS: sorting, current answer, comment ownership, stale responses and on-demand fonts")
     }
 }

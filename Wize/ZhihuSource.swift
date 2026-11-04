@@ -453,6 +453,14 @@ func commentHTMLFragments(_ html: String) -> [CommentHTMLFragment] {
     return fragments
 }
 
+private func htmlTagAttribute(_ name: String, in tag: String) -> String? {
+    let pattern = #"(?i)(?:^|\s)"# + name + #"\s*=\s*["']([^"']+)["']"#
+    guard let expression = try? NSRegularExpression(pattern: pattern),
+          let found = expression.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
+          let valueRange = Range(found.range(at: 1), in: tag) else { return nil }
+    return String(tag[valueRange])
+}
+
 func expandedImageHTML(_ html: String) -> String {
     guard let regex = try? NSRegularExpression(pattern: #"(?i)<img\b[^>]*>"#) else { return html }
     var result = html
@@ -464,7 +472,13 @@ func expandedImageHTML(_ html: String) -> String {
         let escaped = url.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "\"", with: "&quot;")
         let newTag = tag.replacingOccurrences(of: #"(?i)(?:^|\s)src\s*=\s*["'][^"']*["']"#, with: "", options: .regularExpression)
             .replacingOccurrences(of: #"(?i)(?:^|\s)loading\s*=\s*["'][^"']*["']"#, with: "", options: .regularExpression)
-        result.replaceSubrange(range, with: newTag.replacingOccurrences(of: "<img", with: "<img loading=\"lazy\" src=\"\(escaped)\"", options: .caseInsensitive))
+        var attributes = "loading=\"lazy\" decoding=\"async\" src=\"\(escaped)\""
+        if htmlTagAttribute("width", in: newTag) == nil, htmlTagAttribute("height", in: newTag) == nil,
+           let rawWidth = htmlTagAttribute("data-rawwidth", in: tag).flatMap(Int.init), rawWidth > 0,
+           let rawHeight = htmlTagAttribute("data-rawheight", in: tag).flatMap(Int.init), rawHeight > 0 {
+            attributes += " width=\"\(rawWidth)\" height=\"\(rawHeight)\""
+        }
+        result.replaceSubrange(range, with: newTag.replacingOccurrences(of: "<img", with: "<img \(attributes)", options: .caseInsensitive))
     }
     return result
 }

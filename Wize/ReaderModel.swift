@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CoreText
 
 @MainActor
 final class ReaderModel: ObservableObject {
@@ -212,13 +213,51 @@ final class ReaderModel: ObservableObject {
             return
         }
         scrollRequest = nil
-        selected = item; streamAnchor = item; streamItems = []; streamOffset = 0
+        streamOffset = 0
         resetStreamState()
-        bodyHTML = nil; bodyError = nil; showsComments = false
+        bodyError = nil; showsComments = false
         voteError = nil; voting = false
         bodyGeneration += 1
         let generation = bodyGeneration
         let voteRevision = voteRevisions[item.key, default: 0]
+        let matchedAnswer = item.questionID != nil && question?.id == item.questionID
+            ? answers.first(where: { $0.key == item.key && !($0.contentHTML ?? "").isEmpty })
+            : nil
+        let immediate = cachedDetail(for: item.key)
+            ?? (!(item.contentHTML ?? "").isEmpty ? item : matchedAnswer)
+        if let immediate, let html = immediate.contentHTML, !html.isEmpty {
+            selected = immediate
+            streamAnchor = immediate
+            bodyHTML = html
+            if item.kind == .answer, let questionID = item.questionID {
+                let existing = question?.id == questionID ? answers.filter { !($0.contentHTML ?? "").isEmpty } : []
+                if existing.contains(where: { $0.key == item.key }) {
+                    streamItems = existing.map { $0.key == item.key ? immediate : $0 }
+                    streamOffset = answers.count
+                    streamHasMore = hasMoreAnswers
+                } else {
+                    streamItems = [immediate]
+                    streamSeekingAnchor = true
+                    streamHasMore = true
+                }
+            } else {
+                streamItems = [immediate]
+            }
+            let needsDetailRefresh = cachedDetail(for: item.key) == nil
+            let needsStreamSearch = streamSeekingAnchor
+            guard needsDetailRefresh || needsStreamSearch else { return }
+            Task {
+                if needsDetailRefresh, let refreshed = try? await detail(for: item),
+                   generation == bodyGeneration, selected?.key == item.key, !voting {
+                    selected = refreshed
+                }
+                if needsStreamSearch, generation == bodyGeneration {
+                    await loadMoreStream()
+                }
+            }
+            return
+        }
+        selected = item; streamAnchor = item; streamItems = []; bodyHTML = nil
         Task {
             do {
                 var detail = try await detail(for: item)
@@ -228,7 +267,6 @@ final class ReaderModel: ObservableObject {
                     }
                     selected = detail
                     streamItems = [detail]
-                    bodyHTML = detail.contentHTML
                     if item.kind == .answer, let questionID = item.questionID {
                         let existing = question?.id == questionID ? answers.filter { !($0.contentHTML ?? "").isEmpty } : []
                         if existing.contains(where: { $0.key == item.key }) {
@@ -240,6 +278,9 @@ final class ReaderModel: ObservableObject {
                             streamHasMore = true
                             await loadMoreStream()
                         }
+                    }
+                    if generation == bodyGeneration {
+                        bodyHTML = detail.contentHTML
                     }
                 }
             } catch {
@@ -447,5 +488,477 @@ final class ReaderModel: ObservableObject {
             if answerError != nil { await loadAnswers(more: !answers.isEmpty && hasMoreAnswers) }
             if showsComments && commentError != nil { await loadComments(reset: true) }
         }
+    }
+}
+
+struct ReadingFontOption: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let license: String
+    let cssFamily: String
+    let postScriptName: String?
+    let urls: [URL]
+    let format: String
+    let mimeType: String
+    let fileName: String
+    var isBuiltIn: Bool { urls.isEmpty }
+    var webFontFamilyName: String { "WizeFont-\(id)" }
+
+    static let all: [ReadingFontOption] = [
+        ReadingFontOption(
+            id: "system",
+            title: "系统默认",
+            subtitle: "苹方 · 系统无衬线",
+            license: "System",
+            cssFamily: "-apple-system, 'PingFang SC', sans-serif",
+            postScriptName: nil,
+            urls: [],
+            format: "",
+            mimeType: "",
+            fileName: ""
+        ),
+        ReadingFontOption(
+            id: "serif",
+            title: "系统宋体",
+            subtitle: "宋体 · 系统衬线",
+            license: "System",
+            cssFamily: "'Songti SC', 'STSong', 'Source Han Serif SC', 'Noto Serif CJK SC', Georgia, serif",
+            postScriptName: "STSongti-SC-Regular",
+            urls: [],
+            format: "",
+            mimeType: "",
+            fileName: ""
+        ),
+        ReadingFontOption(
+            id: "lxgw-neo-zhisong",
+            title: "霞鹜新致宋",
+            subtitle: "开源宋体 · SIL OFL 1.1 · 约 10 MB",
+            license: "SIL Open Font License 1.1",
+            cssFamily: "'WizeFont-lxgw-neo-zhisong', 'LXGW Neo ZhiSong', 'Songti SC', Georgia, serif",
+            postScriptName: "LXGWNeoZhiSong",
+            urls: [
+                URL(string: "https://github.com/lxgw/LxgwNeoZhiSong/releases/download/v1.070/LXGWNeoZhiSong.ttf")!
+            ],
+            format: "truetype",
+            mimeType: "font/ttf",
+            fileName: "LXGWNeoZhiSong.ttf"
+        ),
+        ReadingFontOption(
+            id: "source-han-serif",
+            title: "思源宋体",
+            subtitle: "Adobe & Google 开源宋体 · SIL OFL 1.1 · 约 24 MB",
+            license: "SIL Open Font License 1.1",
+            cssFamily: "'WizeFont-source-han-serif', 'Source Han Serif SC', 'Noto Serif CJK SC', 'Songti SC', Georgia, serif",
+            postScriptName: "SourceHanSerifSC-Regular",
+            urls: [
+                URL(string: "https://raw.githubusercontent.com/adobe-fonts/source-han-serif/release/OTF/SimplifiedChinese/SourceHanSerifSC-Regular.otf")!,
+                URL(string: "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Serif/OTF/SimplifiedChinese/NotoSerifCJKsc-Regular.otf")!
+            ],
+            format: "opentype",
+            mimeType: "font/otf",
+            fileName: "SourceHanSerifSC-Regular.otf"
+        ),
+        ReadingFontOption(
+            id: "lxgw-wenkai",
+            title: "霞鹜文楷",
+            subtitle: "开源楷体 · SIL OFL 1.1 · 约 14 MB",
+            license: "SIL Open Font License 1.1",
+            cssFamily: "'WizeFont-lxgw-wenkai', 'LXGW WenKai Lite', 'LXGW WenKai', 'Kaiti SC', serif",
+            postScriptName: "LXGWWenKaiLite-Regular",
+            urls: [
+                URL(string: "https://github.com/lxgw/LxgwWenKai-Lite/releases/download/v1.530/LXGWWenKaiLite-Regular.ttf")!,
+                URL(string: "https://github.com/lxgw/LxgwWenKai/releases/download/v1.530/LXGWWenKai-Regular.ttf")!
+            ],
+            format: "truetype",
+            mimeType: "font/ttf",
+            fileName: "LXGWWenKaiLite-Regular.ttf"
+        ),
+        ReadingFontOption(
+            id: "lxgw-neo-xihei",
+            title: "霞鹜新晰黑",
+            subtitle: "开源阅读黑体 · SIL OFL 1.1 · 约 7 MB",
+            license: "SIL Open Font License 1.1",
+            cssFamily: "'WizeFont-lxgw-neo-xihei', 'LXGW Neo XiHei', -apple-system, sans-serif",
+            postScriptName: "LXGWNeoXiHei",
+            urls: [
+                URL(string: "https://github.com/lxgw/LxgwNeoXiHei/releases/download/v1.308/LXGWNeoXiHei.ttf")!
+            ],
+            format: "truetype",
+            mimeType: "font/ttf",
+            fileName: "LXGWNeoXiHei.ttf"
+        ),
+        ReadingFontOption(
+            id: "source-han-sans",
+            title: "思源黑体",
+            subtitle: "Adobe & Google 开源黑体 · SIL OFL 1.1 · 约 16 MB",
+            license: "SIL Open Font License 1.1",
+            cssFamily: "'WizeFont-source-han-sans', 'Source Han Sans SC', 'Noto Sans CJK SC', -apple-system, sans-serif",
+            postScriptName: "SourceHanSansSC-Regular",
+            urls: [
+                URL(string: "https://raw.githubusercontent.com/adobe-fonts/source-han-sans/release/OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf")!,
+                URL(string: "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf")!
+            ],
+            format: "opentype",
+            mimeType: "font/otf",
+            fileName: "SourceHanSansSC-Regular.otf"
+        )
+    ]
+
+    static func option(for id: String) -> ReadingFontOption {
+        all.first(where: { $0.id == id }) ?? all[0]
+    }
+}
+
+enum ReadingFontError: LocalizedError {
+    case invalidFontData
+    case downloadFailed
+    var errorDescription: String? {
+        switch self {
+        case .invalidFontData: return "下载的字体文件无效，请重试。"
+        case .downloadFailed: return "字体下载失败，请检查网络后重试。"
+        }
+    }
+}
+
+@MainActor
+final class ReadingFontManager: ObservableObject {
+    static let shared = ReadingFontManager()
+
+    enum State: Equatable {
+        case builtIn
+        case notDownloaded
+        case downloading(Double)
+        case downloaded
+        case failed(String)
+    }
+
+    typealias Fetcher = (ReadingFontOption, @escaping @Sendable (Double) -> Void) async throws -> Data
+
+    let options: [ReadingFontOption]
+    let directory: URL
+    private let fetcher: Fetcher?
+    @Published private(set) var states: [String: State] = [:]
+    @Published private(set) var fontFaceCSS: [String: String] = [:]
+    @Published private(set) var registeredFontNames: [String: String] = [:]
+    private var downloadTasks: [String: Task<Void, Never>] = [:]
+
+    init(directory: URL? = nil, options: [ReadingFontOption] = ReadingFontOption.all, fetcher: Fetcher? = nil) {
+        self.options = options
+        self.fetcher = fetcher
+        if let directory {
+            self.directory = directory
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            self.directory = base.appendingPathComponent("ReadingFonts", isDirectory: true)
+        }
+        ensureDirectory()
+        for option in options {
+            if option.isBuiltIn {
+                states[option.id] = .builtIn
+            } else {
+                let fileURL = fontFileURL(for: option)
+                if FileManager.default.fileExists(atPath: fileURL.path),
+                   let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
+                   Self.isValidFontData(data) {
+                    states[option.id] = .downloaded
+                    registerFontFile(at: fileURL, for: option)
+                    loadCachedFontFaceCSS(for: option, fontData: data)
+                } else {
+                    states[option.id] = .notDownloaded
+                }
+            }
+        }
+    }
+
+    func state(for option: ReadingFontOption) -> State {
+        states[option.id] ?? (option.isBuiltIn ? .builtIn : .notDownloaded)
+    }
+
+    func isAvailable(_ option: ReadingFontOption) -> Bool {
+        option.isBuiltIn || state(for: option) == .downloaded
+    }
+
+    func fontFileURL(for option: ReadingFontOption) -> URL {
+        directory.appendingPathComponent(option.fileName)
+    }
+
+    private func cssFileURL(for option: ReadingFontOption) -> URL {
+        directory.appendingPathComponent("\(option.id).css")
+    }
+
+    private func ensureDirectory() {
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var dir = directory
+        try? dir.setResourceValues(values)
+    }
+
+    nonisolated static func isValidFontData(_ data: Data) -> Bool {
+        guard data.count >= 12 else { return false }
+        let magic = [UInt8](data.prefix(4))
+        let signatures: [[UInt8]] = [
+            [0x00, 0x01, 0x00, 0x00], // TrueType
+            [0x4F, 0x54, 0x54, 0x4F], // OpenType CFF ("OTTO")
+            [0x74, 0x72, 0x75, 0x65], // Apple TrueType ("true")
+            [0x74, 0x74, 0x63, 0x66], // TrueType Collection ("ttcf")
+            [0x77, 0x4F, 0x46, 0x32]  // WOFF2 ("wOF2")
+        ]
+        return signatures.contains(magic)
+    }
+
+    nonisolated static func buildFontFaceCSS(for option: ReadingFontOption, data: Data) -> String {
+        let base64 = data.base64EncodedString()
+        return "@font-face { font-family: '\(option.webFontFamilyName)'; src: url('data:\(option.mimeType);base64,\(base64)') format('\(option.format)'); font-weight: normal; font-style: normal; font-display: block; }"
+    }
+
+    private func registerFontFile(at url: URL, for option: ReadingFontOption) {
+        CTFontManagerRegisterFontURLs([url] as CFArray, .process, true, nil)
+        if let descriptors = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor],
+           let first = descriptors.first {
+            if let psName = CTFontDescriptorCopyAttribute(first, kCTFontNameAttribute) as? String, !psName.isEmpty {
+                registeredFontNames[option.id] = psName
+            } else if let family = CTFontDescriptorCopyAttribute(first, kCTFontFamilyNameAttribute) as? String, !family.isEmpty {
+                registeredFontNames[option.id] = family
+            }
+        }
+    }
+
+    private func loadCachedFontFaceCSS(for option: ReadingFontOption, fontData: Data? = nil) {
+        if fontFaceCSS[option.id] != nil { return }
+        let cssURL = cssFileURL(for: option)
+        if let cached = try? String(contentsOf: cssURL, encoding: .utf8), !cached.isEmpty {
+            fontFaceCSS[option.id] = cached
+            return
+        }
+        let fileURL = fontFileURL(for: option)
+        Task.detached(priority: .utility) {
+            guard let data = fontData ?? (try? Data(contentsOf: fileURL, options: .mappedIfSafe)) else { return }
+            let css = ReadingFontManager.buildFontFaceCSS(for: option, data: data)
+            try? css.write(to: cssURL, atomically: true, encoding: .utf8)
+            await MainActor.run {
+                self.fontFaceCSS[option.id] = css
+            }
+        }
+    }
+
+    func prepareFontIfNeeded(id: String) {
+        let option = options.first(where: { $0.id == id }) ?? ReadingFontOption.option(for: id)
+        if option.id == "serif", let psName = option.postScriptName {
+            requestSystemFontIfNeeded(postScriptName: psName)
+        }
+        guard !option.isBuiltIn, state(for: option) == .downloaded else { return }
+        loadCachedFontFaceCSS(for: option)
+    }
+
+    private func requestSystemFontIfNeeded(postScriptName: String) {
+        let attrs = [kCTFontNameAttribute as String: postScriptName] as CFDictionary
+        let descriptor = CTFontDescriptorCreateWithAttributes(attrs)
+        CTFontDescriptorMatchFontDescriptorsWithProgressHandler([descriptor] as CFArray, nil) { _, _ in true }
+    }
+
+    func download(_ option: ReadingFontOption, onSelect: ((String) -> Void)? = nil) {
+        if option.isBuiltIn {
+            if option.id == "serif", let psName = option.postScriptName {
+                requestSystemFontIfNeeded(postScriptName: psName)
+            }
+            onSelect?(option.id)
+            return
+        }
+        if state(for: option) == .downloaded {
+            loadCachedFontFaceCSS(for: option)
+            onSelect?(option.id)
+            return
+        }
+        if case .downloading = state(for: option) { return }
+        states[option.id] = .downloading(0.02)
+        let customFetcher = fetcher
+        let targetFileURL = fontFileURL(for: option)
+        let targetCSSURL = cssFileURL(for: option)
+        ensureDirectory()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let reportProgress: @Sendable (Double) -> Void = { [weak self] progress in
+                    Task { @MainActor in
+                        guard let self, case .downloading = self.states[option.id] else { return }
+                        self.states[option.id] = .downloading(min(max(progress, 0.02), 0.99))
+                    }
+                }
+                let data: Data
+                if let customFetcher {
+                    data = try await customFetcher(option, reportProgress)
+                } else {
+                    data = try await Self.fetchFontData(for: option, onProgress: reportProgress)
+                }
+                try Task.checkCancellation()
+                guard Self.isValidFontData(data) else { throw ReadingFontError.invalidFontData }
+                let css = try await Task.detached(priority: .userInitiated) {
+                    try data.write(to: targetFileURL, options: .atomic)
+                    var values = URLResourceValues()
+                    values.isExcludedFromBackup = true
+                    var mutableURL = targetFileURL
+                    try? mutableURL.setResourceValues(values)
+                    let generatedCSS = ReadingFontManager.buildFontFaceCSS(for: option, data: data)
+                    try? generatedCSS.write(to: targetCSSURL, atomically: true, encoding: .utf8)
+                    return generatedCSS
+                }.value
+                try Task.checkCancellation()
+                self.registerFontFile(at: targetFileURL, for: option)
+                self.fontFaceCSS[option.id] = css
+                self.states[option.id] = .downloaded
+                self.downloadTasks[option.id] = nil
+                onSelect?(option.id)
+            } catch is CancellationError {
+                self.downloadTasks[option.id] = nil
+                if self.states[option.id] != .downloaded {
+                    self.states[option.id] = .notDownloaded
+                }
+            } catch {
+                self.downloadTasks[option.id] = nil
+                let nsError = error as NSError
+                if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                    self.states[option.id] = .notDownloaded
+                } else {
+                    self.states[option.id] = .failed((error as? LocalizedError)?.errorDescription ?? ReadingFontError.downloadFailed.localizedDescription)
+                }
+            }
+        }
+        downloadTasks[option.id] = task
+    }
+
+    func cancelDownload(_ option: ReadingFontOption) {
+        downloadTasks[option.id]?.cancel()
+        downloadTasks[option.id] = nil
+        if state(for: option) != .downloaded {
+            states[option.id] = .notDownloaded
+        }
+    }
+
+    func removeFont(_ option: ReadingFontOption) {
+        guard !option.isBuiltIn else { return }
+        cancelDownload(option)
+        let fileURL = fontFileURL(for: option)
+        let cssURL = cssFileURL(for: option)
+        CTFontManagerUnregisterFontURLs([fileURL] as CFArray, .process, nil)
+        try? FileManager.default.removeItem(at: fileURL)
+        try? FileManager.default.removeItem(at: cssURL)
+        fontFaceCSS.removeValue(forKey: option.id)
+        registeredFontNames.removeValue(forKey: option.id)
+        states[option.id] = .notDownloaded
+    }
+
+    private static func fetchFontData(for option: ReadingFontOption, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["WIZE_VISUAL_FIXTURE"] == "1"
+            || ProcessInfo.processInfo.environment["WIZE_FONT_FIXTURE"] == "1" {
+            for step in 1...4 {
+                try await Task.sleep(nanoseconds: 40_000_000)
+                onProgress(Double(step) * 0.24)
+            }
+            let candidates = [
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Monaco.ttf",
+                "/System/Library/Fonts/Core/Avenir.ttc"
+            ]
+            for path in candidates {
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)), isValidFontData(data) {
+                    return data
+                }
+            }
+            return Data([0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        }
+        #endif
+        var lastError: Error = ReadingFontError.downloadFailed
+        for url in option.urls {
+            do {
+                let data = try await FontDownloadTaskRunner.download(from: url, onProgress: onProgress)
+                if isValidFontData(data) { return data }
+                lastError = ReadingFontError.invalidFontData
+            } catch {
+                let nsError = error as NSError
+                if error is CancellationError || (nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled) {
+                    throw CancellationError()
+                }
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+}
+
+private final class FontDownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let onProgress: @Sendable (Double) -> Void
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var lastReported = Date.distantPast
+    private var session: URLSession?
+    private var task: URLSessionDownloadTask?
+
+    private init(onProgress: @escaping @Sendable (Double) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    static func download(from url: URL, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
+        let runner = FontDownloadTaskRunner(onProgress: onProgress)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                runner.start(url: url, continuation: continuation)
+            }
+        } onCancel: {
+            runner.cancel()
+        }
+    }
+
+    private func start(url: URL, continuation: CheckedContinuation<Data, Error>) {
+        self.continuation = continuation
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 300
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        self.session = session
+        var request = URLRequest(url: url)
+        request.setValue("Wize/1.0", forHTTPHeaderField: "User-Agent")
+        let task = session.downloadTask(with: request)
+        self.task = task
+        task.resume()
+    }
+
+    private func cancel() {
+        task?.cancel()
+        session?.invalidateAndCancel()
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        let now = Date()
+        guard now.timeIntervalSince(lastReported) >= 0.05 else { return }
+        lastReported = now
+        if totalBytesExpectedToWrite > 0 {
+            onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        defer { session.finishTasksAndInvalidate() }
+        guard let continuation = self.continuation else { return }
+        self.continuation = nil
+        if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            continuation.resume(throwing: SourceError.response(http.statusCode))
+            return
+        }
+        do {
+            let data = try Data(contentsOf: location)
+            continuation.resume(returning: data)
+        } catch {
+            continuation.resume(throwing: error)
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        defer { session.finishTasksAndInvalidate() }
+        guard let error, let continuation = self.continuation else { return }
+        self.continuation = nil
+        continuation.resume(throwing: error)
     }
 }
