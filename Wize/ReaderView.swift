@@ -835,9 +835,19 @@ private struct HTMLReader: UIViewRepresentable {
         .answer { background: \(paperColor); border: 1px solid rgba(128,128,128,.12); border-radius: 12px; padding: 26px 22px 28px; box-shadow: 0 5px 18px rgba(0,0,0,.08); }
         .answer + .answer { border-top: 1px solid rgba(128,128,128,.12); margin-top: 18px; padding-top: 26px; }
         """ : ""
-        let phoneAnswerCSS = paperCards ? "" : """
-        body { padding-bottom: 76px; }
-        .answer + .answer { border-top: 1px solid rgba(128,128,128,.24); margin-top: 30px; padding-top: 24px; }
+        let phoneGapColor: String
+        switch theme {
+        case "paper": phoneGapColor = "#e9e1d4"
+        case "light": phoneGapColor = "#eeefec"
+        case "dark": phoneGapColor = "#141719"
+        default: phoneGapColor = "light-dark(#e9ece7, #111513)"
+        }
+        let phoneAnswerCSS = paperCards || isPreview ? "" : """
+        body { margin: 0 auto; padding: 0 0 76px; background: \(colors.0); }
+        header { background: \(colors.0); padding: 36px clamp(20px, 5vw, 28px) 0; }
+        header h1 { margin-bottom: 0; }
+        .answer { background: \(colors.0); padding: 26px clamp(20px, 5vw, 28px) 32px; box-shadow: 0 3px 6px -4px rgba(0,0,0,.22); }
+        .answer + .answer { border: 0; border-top: 12px solid \(phoneGapColor); margin-top: 0; padding-top: 26px; background-clip: padding-box; }
         .byline { margin-bottom: 20px; }
         .author-name { font-size: 15px; font-weight: 600; }
         """
