@@ -359,6 +359,43 @@ enum CommentHTMLFragment {
     case image(URL)
 }
 
+enum CommentTextFragment {
+    case text(String)
+    case emoji(label: String, url: URL)
+}
+
+// Common Zhihu emoticons are returned as literal placeholders in comment text.
+// Load their images from Zhihu rather than bundling the artwork in the app.
+private let commentEmojiURLs: [String: String] = [
+    "感谢": "https://pic1.zhimg.com/v2-e39d5eebfef8b0ac6065ad156cb05e66.png",
+    "捂脸": "https://pic1.zhimg.com/v2-b62e608e405aeb33cd52830218f561ea.png",
+    "谢邀": "https://pic2.zhimg.com/v2-6fe2283baa639ae1d7c024487f1d68c7.png",
+    "赞同": "https://pic2.zhimg.com/v2-419a1a3ed02b7cfadc20af558aabc897.png",
+    "微笑": "https://pic1.zhimg.com/v2-3700cc07f14a49c6db94a82e989d4548.png",
+    "大笑": "https://pic1.zhimg.com/v2-3ac403672728e5e91f5b2d3c095e415a.png",
+    "笑哭": "https://pic4.zhimg.com/v2-ca0015e8ed8462cfce839fba518df585.png",
+    "思考": "https://pic4.zhimg.com/v2-bffb2bf11422c5ef7d8949788114c2ab.png",
+    "吃瓜": "https://pic4.zhimg.com/v2-74ecc4b114fce67b6b42b7f602c3b1d6.png",
+    "好奇": "https://pic2.zhimg.com/v2-72b9696632f66e05faaca12f1f1e614b.png",
+    "流泪": "https://pic4.zhimg.com/v2-dd613c7c81599bcc3085fc855c752950.png",
+    "抱抱": "https://pic2.zhimg.com/v2-b2e3fa9e0b6f431bd18d4a9d5d3c6596.png"
+]
+
+func commentTextFragments(_ text: String) -> [CommentTextFragment] {
+    guard let expression = try? NSRegularExpression(pattern: #"\[([^\[\]\n]{1,12})\]"#) else { return [.text(text)] }
+    var result: [CommentTextFragment] = []
+    var position = text.startIndex
+    for match in expression.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+        guard let range = Range(match.range, in: text), let nameRange = Range(match.range(at: 1), in: text),
+              let value = commentEmojiURLs[String(text[nameRange])], let url = URL(string: value) else { continue }
+        if position < range.lowerBound { result.append(.text(String(text[position..<range.lowerBound]))) }
+        result.append(.emoji(label: String(text[range]), url: url))
+        position = range.upperBound
+    }
+    if position < text.endIndex { result.append(.text(String(text[position...]))) }
+    return result
+}
+
 // Preserve the source order and repeated images instead of collecting every image at the end.
 func commentHTMLFragments(_ html: String) -> [CommentHTMLFragment] {
     guard let expression = try? NSRegularExpression(pattern: #"(?is)<img\b[^>]*>|<a\b[^>]*>.*?</a\s*>"#) else { return [.text(html)] }

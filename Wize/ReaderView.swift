@@ -522,10 +522,13 @@ struct ReaderView: View {
                         switch fragment {
                         case .text(let html):
                             let text = htmlText(html)
-                            if !text.isEmpty { Text(text).font(.body).textSelection(.enabled) }
+                            if !text.isEmpty { CommentInlineText(text: text) }
                         case .image(let url):
                             AnimatedCommentImage(url: url)
-                                .frame(width: 220, height: 180).clipShape(RoundedRectangle(cornerRadius: 8))
+                                .aspectRatio(4.0 / 3.0, contentMode: .fit)
+                                .frame(maxWidth: 400, maxHeight: 300)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
                 }.padding(.vertical, 7)
@@ -750,6 +753,44 @@ private func htmlText(_ html: String) -> String {
     let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'"]
     for (entity, value) in entities { text = text.replacingOccurrences(of: entity, with: value) }
     return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private struct CommentInlineText: View {
+    let text: String
+    @State private var images: [URL: UIImage] = [:]
+
+    private var fragments: [CommentTextFragment] { commentTextFragments(text) }
+    private var rendered: Text {
+        fragments.reduce(Text("")) { result, fragment in
+            switch fragment {
+            case .text(let value): return result + Text(value)
+            case .emoji(let label, let url):
+                if let image = images[url] { return result + Text(Image(uiImage: image)) }
+                return result + Text(label)
+            }
+        }
+    }
+    var body: some View {
+        rendered.font(.body).textSelection(.enabled)
+            .accessibilityLabel(text)
+            .task(id: text) { await loadEmojis() }
+    }
+    private func loadEmojis() async {
+        let urls = Set(fragments.compactMap { fragment -> URL? in
+            if case .emoji(_, let url) = fragment { return url }
+            return nil
+        })
+        for url in urls where images[url] == nil {
+            var request = URLRequest(url: url)
+            request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
+            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  !Task.isCancelled, let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode), let source = UIImage(data: data) else { continue }
+            let size = CGSize(width: 21, height: 21)
+            images[url] = UIGraphicsImageRenderer(size: size).image { _ in source.draw(in: CGRect(origin: .zero, size: size)) }
+        }
+    }
 }
 
 private struct AnimatedCommentImage: UIViewRepresentable {

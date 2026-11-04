@@ -2,7 +2,7 @@
 
 一个安静的 iPhone 和 iPad 阅读器。目前支持知乎推荐、热榜、回答与评论，让阅读回到内容本身。
 
-<img src="docs/media/iphone-demo.gif" alt="iPhone 演示：浏览内容、阅读连续回答和查看评论" width="280">
+<img src="docs/media/iphone-demo.gif" alt="iPhone 演示：浏览内容、阅读连续回答和上拉展开评论 sheet" width="280">
 
 [观看演示视频](docs/media/iphone-demo.mp4) · 演示使用应用内置样本
 

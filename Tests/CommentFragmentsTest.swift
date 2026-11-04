@@ -28,6 +28,11 @@ struct CommentFragmentsTest {
         precondition(linked.count == 3, "Image links should preserve surrounding text and ordinary links")
         guard case .image(let linkedURL) = linked[1], linkedURL.host == "pic.zhimg.com",
               case .text(let trailing) = linked[2], trailing.contains("普通链接") else { fatalError("Comment image links must render as media") }
+        let emoji = commentTextFragments("谢谢[感谢]，真的[捂脸][未知]。")
+        precondition(emoji.count == 5, "Known emoji should be inline while unknown markers stay as text")
+        guard case .text("谢谢") = emoji[0], case .emoji("[感谢]", _) = emoji[1],
+              case .text("，真的") = emoji[2], case .emoji("[捂脸]", _) = emoji[3],
+              case .text("[未知]。") = emoji[4] else { fatalError("Emoji and text must preserve their original order") }
         print("PASS: comment text, original GIFs and repeated images preserve their order")
     }
 }
