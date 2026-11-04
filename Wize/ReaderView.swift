@@ -1,0 +1,1353 @@
+import SwiftUI
+import WebKit
+
+struct ReaderView: View {
+    @EnvironmentObject private var model: ReaderModel
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var phonePath: [PhonePage] = []
+    @State private var availableWidth: CGFloat = 0
+    @State private var showsPinnedTitle = false
+    @State private var showsReadingSettings = false
+    @State private var profileItem: ReadingItem?
+    @State private var collectionItem: ReadingItem?
+    @State private var collectedKeys: Set<String> = []
+    @State private var collapsedComments: Set<String> = []
+    private let collectionSource = ZhihuSource()
+    @AppStorage("reading.theme") private var readingTheme = "system"
+    enum PhonePage: Hashable { case question, answer }
+
+    private var usesWideLayout: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad && sizeClass == .regular && availableWidth >= 760
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            Group {
+                if usesWideLayout { wideLayout } else { phoneLayout }
+            }
+            .onAppear { availableWidth = geometry.size.width }
+            .onChange(of: geometry.size.width) { availableWidth = $0 }
+        }
+        .tint(ReaderPalette.accent)
+        .sheet(isPresented: $model.showsLogin, onDismiss: model.resetAfterLogin) {
+            LoginView().presentationDetents([.large]).presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showsReadingSettings) { ReadingSettingsView() }
+        .sheet(item: $profileItem) { AuthorProfileView(item: $0) }
+        .sheet(item: $collectionItem) { item in
+            CollectionPickerView(item: item) { saved in
+                if saved { collectedKeys.insert(item.key) } else { collectedKeys.remove(item.key) }
+            }
+        }
+        .task { async let account: Void = model.loadAccount(); await model.loadFeed(); selectInitialContentIfNeeded(); await account }
+        .task(id: model.selected?.key) {
+            guard let item = model.selected else { return }
+            do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
+            guard !Task.isCancelled, model.selected?.key == item.key else { return }
+            await model.prefetchComments(item)
+        }
+        .task(id: model.selected?.key) {
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["WIZE_VISUAL_FIXTURE"] == "1" { return }
+            #endif
+            guard let item = model.selected, item.kind == .answer || item.kind == .article else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(350))
+                let folders = try await collectionSource.collections(for: item)
+                guard !Task.isCancelled, model.selected?.key == item.key else { return }
+                if folders.contains(where: \.isFavorited) { collectedKeys.insert(item.key) }
+                else { collectedKeys.remove(item.key) }
+            } catch { /* Keep the last known state until the collection picker is opened. */ }
+        }
+        .onChange(of: model.channel) { _ in selectInitialContentIfNeeded() }
+        .onChange(of: model.showsComments) { if $0 { collapsedComments = [] } }
+        .onChange(of: model.answerSort) { _ in Task { await model.loadAnswers() } }
+        .onChange(of: model.streamAnchor?.key) { _ in showsPinnedTitle = false }
+        .onChange(of: model.feeds[model.channel]) { _ in selectInitialContentIfNeeded() }
+        .onChange(of: model.answers) { answers in
+            if usesWideLayout, model.question != nil, model.selected == nil, let first = answers.first {
+                model.selectAnswer(first)
+            }
+        }
+        .onChange(of: usesWideLayout) { isWide in
+            if isWide {
+                phonePath = []
+                selectInitialContentIfNeeded()
+            } else {
+                var path: [PhonePage] = []
+                if model.question != nil { path.append(.question) }
+                if model.selected != nil { path.append(.answer) }
+                phonePath = path
+            }
+        }
+    }
+
+    private func selectInitialContentIfNeeded() {
+        guard usesWideLayout, model.selected == nil, model.question == nil,
+              let first = model.feeds[model.channel]?.first else { return }
+        model.open(first)
+    }
+
+    private var wideLayout: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .trailing) {
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        ipadChannelSwitcher
+                        ZStack {
+                            NavigationStack { feedList(for: model.channel) }
+                                .opacity(model.question == nil || model.channel == .hot ? 1 : 0)
+                                .allowsHitTesting(model.question == nil || model.channel == .hot)
+                            if model.question != nil && model.channel != .hot { NavigationStack { answerList } }
+                        }
+                    }
+                    .background(ReaderPalette.directory)
+                    .frame(width: geometry.size.width * 0.36)
+                    Divider()
+                    NavigationStack {
+                        detail.toolbar {
+                            ToolbarItem(placement: .principal) {
+                                if showsPinnedTitle, let title = model.selected?.title ?? model.question?.title {
+                                    Text(title).font(.subheadline.weight(.medium)).lineLimit(1).truncationMode(.tail)
+                                        .frame(width: max(geometry.size.width * 0.64 - 110, 180), alignment: .leading)
+                                }
+                            }
+                            ToolbarItem(placement: .navigationBarTrailing) {
+                                accountMenu
+                            }
+                            if model.channel == .hot && model.question != nil {
+                                ToolbarItem(placement: .navigationBarTrailing) {
+                                    Picker("回答排序", selection: $model.answerSort) {
+                                        Text("热度").tag("default"); Text("时间").tag("updated")
+                                    }.pickerStyle(.menu)
+                                }
+                            }
+                        }
+                    }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                if model.showsComments {
+                    Color.black.opacity(0.001)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture { model.showsComments = false }
+                    NavigationStack { commentList }
+                        .frame(width: min(max(geometry.size.width * 0.36, 320), 420))
+                        .frame(maxHeight: .infinity)
+                        .background(Color(uiColor: .systemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 18))
+                        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+                        .shadow(color: .black.opacity(0.22), radius: 16, x: -5)
+                        .padding(.vertical, 8)
+                        .padding(.trailing, 8)
+                        .simultaneousGesture(DragGesture(minimumDistance: 30).onEnded { value in
+                            if value.translation.width > 70 && abs(value.translation.width) > abs(value.translation.height) {
+                                model.showsComments = false
+                            }
+                        })
+                        .accessibilityAction(.escape) { model.showsComments = false }
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.22), value: model.showsComments)
+        }
+    }
+
+    private var channelPicker: some View {
+        Picker("栏目", selection: Binding(
+            get: { model.channel },
+            set: { channel in model.changeChannel(channel); Task { await model.loadFeed() } }
+        )) {
+            Label("推荐", systemImage: "sparkles").tag(ReaderModel.Channel.recommend)
+            Label("热榜", systemImage: "flame").tag(ReaderModel.Channel.hot)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    private var ipadChannelSwitcher: some View {
+        channelPicker
+            .padding(5)
+            .readerGlassCapsule()
+            .padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 6)
+    }
+
+    private var accountMenu: some View {
+        Menu {
+            if let name = model.accountName { Text(name) }
+            Button { showsReadingSettings = true } label: { Label("阅读设置", systemImage: "textformat.size") }
+            Button { model.showsLogin = true } label: { Label("知乎账号", systemImage: "person.crop.circle") }
+        } label: {
+            AvatarView(url: model.accountAvatarURL, size: 32)
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+        }
+        .accessibilityLabel("账号与阅读设置")
+    }
+
+    private var phoneLayout: some View {
+        NavigationStack(path: $phonePath) {
+            phoneFeedTabs
+                .navigationDestination(for: PhonePage.self) { page in
+                    switch page { case .question: answerList; case .answer: detail }
+                }
+        }
+        .sheet(isPresented: $model.showsComments) {
+            NavigationStack { commentList }
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .onChange(of: phonePath) { path in
+            guard !usesWideLayout else { return }
+            if path.isEmpty {
+                model.question = nil
+                model.leaveReading()
+            } else if path.last == .question {
+                model.leaveReading()
+            }
+        }
+    }
+
+    private var phoneFeedTabs: some View {
+        TabView(selection: Binding(
+            get: { model.channel },
+            set: { channel in model.changeChannel(channel); Task { await model.loadFeed() } }
+        )) {
+            feedList(for: .recommend).tag(ReaderModel.Channel.recommend)
+            feedList(for: .hot).tag(ReaderModel.Channel.hot)
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack(spacing: 14) {
+                channelPicker.frame(width: 160)
+                Spacer(minLength: 0)
+                accountMenu.frame(width: 44, height: 44).readerGlassCapsule()
+            }
+            .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 10)
+            .background(ReaderPalette.directory)
+        }
+        .background(ReaderPalette.directory.ignoresSafeArea())
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
+    }
+
+    private func feedList(for channel: ReaderModel.Channel) -> some View {
+        List {
+            ForEach(Array((model.feeds[channel] ?? []).enumerated()), id: \.element.key) { index, item in
+                Button {
+                    model.open(item)
+                    if !usesWideLayout { phonePath.append(item.kind == .question ? .question : .answer) }
+                } label: { ItemRow(item: item, isHot: channel == .hot) }
+                .buttonStyle(.plain)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                .listRowBackground(usesWideLayout && (model.selected?.key == item.key || model.question?.key == item.key) ? ReaderPalette.selection : Color.clear)
+                .task {
+                    guard channel == model.channel else { return }
+                    await model.prefetchDetail(item)
+                    if index >= max((model.feeds[channel]?.count ?? 0) - 4, 0) { await model.loadFeed() }
+                }
+            }
+            if channel == model.channel, let error = model.feedError { retryRow(error) { await model.loadFeed() }.listRowBackground(Color.clear) }
+            else if channel == model.channel, model.loadingFeed, !model.refreshingFeed,
+                    !(model.feeds[channel] ?? []).isEmpty {
+                loadingFooter("正在加载更多")
+                    .listRowSeparator(.hidden).listRowBackground(Color.clear)
+            }
+            else if channel == model.channel, !model.loadingFeed, model.feeds[channel]?.isEmpty == true {
+                ContentUnavailableView("暂无内容", systemImage: "text.book.closed", description: Text("下拉刷新，看看有没有新的内容。"))
+                    .listRowBackground(Color.clear)
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(ReaderPalette.directory.ignoresSafeArea(edges: .bottom))
+        .overlay {
+            if channel == model.channel, model.loadingFeed, (model.feeds[channel] ?? []).isEmpty {
+                loadingFooter("正在加载内容")
+            }
+        }
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(usesWideLayout ? .hidden : .automatic, for: .navigationBar)
+        .refreshable { if channel == model.channel { await model.loadFeed(reset: true) } }
+    }
+
+    private var answerList: some View {
+        List {
+            if let question = model.question {
+                Text(question.title).font(.title3.bold()).padding(.vertical, 8)
+            }
+            Picker("回答排序", selection: $model.answerSort) {
+                Text("热度").tag("default"); Text("时间").tag("updated")
+            }.pickerStyle(.segmented)
+            ForEach(Array(model.answers.enumerated()), id: \.element.key) { index, item in
+                Button { model.selectAnswer(item); if !usesWideLayout { phonePath.append(.answer) } } label: { ItemRow(item: item, showsTitle: false) }
+                    .buttonStyle(.plain)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                    .listRowBackground(usesWideLayout && model.selected?.key == item.key ? ReaderPalette.selection : Color.clear)
+                    .task {
+                        await model.prefetchDetail(item)
+                        if index >= max(model.answers.count - 4, 0), model.hasMoreAnswers { await model.loadAnswers(more: true) }
+                    }
+            }
+            if let error = model.answerError { retryRow(error) { await model.loadAnswers(more: !model.answers.isEmpty && model.hasMoreAnswers) }.listRowBackground(Color.clear) }
+            else if model.loadingAnswers {
+                loadingFooter(model.answers.isEmpty ? "正在加载回答" : "正在加载更多")
+                    .listRowSeparator(.hidden).listRowBackground(Color.clear)
+            }
+            else if model.answers.isEmpty {
+                ContentUnavailableView("暂无回答", systemImage: "text.bubble", description: Text("这个问题还没有可显示的回答。"))
+                    .listRowBackground(Color.clear)
+            }
+        }.listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(ReaderPalette.directory.ignoresSafeArea(edges: .bottom))
+            .navigationTitle(usesWideLayout ? "" : "回答")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { if usesWideLayout { ToolbarItem(placement: .navigationBarLeading) {
+                Button("返回列表") { model.question = nil }
+            } } }
+    }
+
+    private var readingBackground: Color {
+        switch readingTheme {
+        case "paper": return Color(red: 0.961, green: 0.941, blue: 0.902)
+        case "light": return .white
+        case "dark": return Color(red: 0.114, green: 0.125, blue: 0.137)
+        default: return ReaderPalette.page
+        }
+    }
+
+    @ViewBuilder private var detail: some View {
+        if let item = model.selected {
+            VStack(alignment: .leading, spacing: 0) {
+                if let html = model.bodyHTML {
+                    HTMLReader(
+                        html: html,
+                        item: model.streamAnchor ?? item,
+                        stream: model.streamItems,
+                        activeItem: item,
+                        paperCards: usesWideLayout,
+                        onTitleHidden: { if usesWideLayout { showsPinnedTitle = $0 } },
+                        scrollRequest: model.scrollRequest,
+                        onVisibleAnswer: { model.setVisibleAnswer($0) },
+                        onNearEnd: { Task { await model.loadMoreStream() } }
+                    ).id(model.streamAnchor?.key ?? item.key)
+                }
+                else if let error = model.bodyError {
+                    VStack(spacing: 12) { Text(error); Button("重试") { model.selectAnswer(item) } }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else { ProgressView("正在加载正文").frame(maxWidth: .infinity, maxHeight: .infinity) }
+                if let error = model.streamError {
+                    HStack {
+                        Text(error).font(.footnote).foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        if !model.streamSearchExhausted {
+                            Button("重试") { model.retryStream() }.font(.footnote)
+                        }
+                    }.padding(8)
+                        .padding(.bottom, usesWideLayout ? 0 : 64)
+                }
+            }
+            .background(readingBackground.ignoresSafeArea(edges: .bottom))
+            .overlay(alignment: .trailing) {
+                if usesWideLayout, !model.showsComments, model.bodyHTML != nil {
+                    VStack(spacing: 2) { answerActions(item) }
+                        .readerGlassCapsule()
+                        .padding(.trailing, 12)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if !usesWideLayout, model.bodyHTML != nil {
+                    HStack(spacing: 0) { answerActions(item) }
+                        .readerGlassCapsule()
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .alert("操作未完成", isPresented: Binding(get: { model.voteError != nil }, set: { if !$0 { model.voteError = nil } })) {
+                Button("好", role: .cancel) { model.voteError = nil }
+            } message: { Text(model.voteError ?? "") }
+            .toolbar {
+                if !usesWideLayout {
+                    ToolbarItem(placement: .principal) {
+                        Text(item.title).font(.subheadline.weight(.medium))
+                            .lineLimit(1).truncationMode(.tail)
+                    }
+                }
+                if !usesWideLayout, model.question == nil, let qid = item.questionID {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("全部回答") {
+                            model.open(ReadingItem(id: qid, kind: .question, title: item.title, excerpt: "", author: "", questionID: nil))
+                            if !usesWideLayout { phonePath = [.question] }
+                        }
+                    }
+                }
+            }
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "text.book.closed").font(.system(size: 36)).foregroundStyle(.tertiary)
+                Text(model.question == nil ? "选择一篇内容开始阅读" : "选择一个回答开始阅读").foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder private func answerActions(_ item: ReadingItem) -> some View {
+        if item.kind == .answer {
+            Button { profileItem = item } label: {
+                AvatarView(url: item.avatarURL, size: 36)
+                    .frame(maxWidth: usesWideLayout ? nil : .infinity)
+                    .frame(width: usesWideLayout ? 56 : nil, height: 52)
+            }.accessibilityLabel("查看作者：\(item.author.isEmpty ? "匿名用户" : item.author)")
+            Button { Task { await model.toggleVote(.up) } } label: {
+                actionLabel(item.vote == .up ? "hand.thumbsup.fill" : "hand.thumbsup", item.upCount)
+            }.disabled(model.voting).accessibilityLabel(item.vote == .up ? "取消赞同" : "赞同")
+        }
+        Button { model.showComments() } label: {
+            actionLabel("bubble.right", item.commentCount)
+        }.accessibilityLabel("查看评论")
+        if item.kind == .answer || item.kind == .article {
+            Button { collectionItem = item } label: {
+                Image(systemName: collectedKeys.contains(item.key) ? "star.fill" : "star")
+                    .font(.system(size: 18, weight: .medium))
+                    .frame(maxWidth: usesWideLayout ? nil : .infinity)
+                    .frame(width: usesWideLayout ? 52 : nil, height: 52)
+            }.accessibilityLabel(collectedKeys.contains(item.key) ? "管理收藏，已收藏" : "收藏")
+        }
+    }
+
+    @ViewBuilder private func actionLabel(_ icon: String, _ count: Int?) -> some View {
+        if usesWideLayout {
+            VStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 17, weight: .medium))
+                Text(displayCount(count)).font(.system(size: 10, weight: .medium)).monospacedDigit()
+            }.frame(width: 56, height: 52)
+        } else {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 17, weight: .medium))
+                Text(displayCount(count)).font(.system(size: 12, weight: .medium)).monospacedDigit()
+            }.fixedSize(horizontal: true, vertical: false)
+                .frame(maxWidth: .infinity, minHeight: 52)
+        }
+    }
+
+    private var commentList: some View {
+        let rows = commentTreeRows(model.comments.flatMap { [$0] + (model.commentReplies[$0.id] ?? []) }, collapsed: collapsedComments)
+        return List {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                let comment = row.comment
+                VStack(alignment: .leading, spacing: 7) {
+                    commentRow(comment)
+                    if row.hasChildren {
+                        Button(collapsedComments.contains(comment.id) ? "展开讨论" : "收起讨论") {
+                            if !collapsedComments.insert(comment.id).inserted { collapsedComments.remove(comment.id) }
+                        }.font(.caption).foregroundStyle(ReaderPalette.accent)
+                    }
+                }
+                .padding(.leading, CGFloat(min(row.depth, 3)) * 16)
+                .padding(.top, row.depth == 0 && index > 0 ? 12 : 0)
+                .overlay(alignment: .leading) {
+                    if row.depth > 0 {
+                        Rectangle().fill(ReaderPalette.accent.opacity(0.25)).frame(width: 1)
+                            .padding(.leading, CGFloat(min(row.depth, 3) - 1) * 16 + 5)
+                    }
+                }
+                .listRowSeparator(.hidden)
+                let isEndOfBranch = index + 1 == rows.count || rows[index + 1].depth == 0
+                let root = rows[...index].last(where: { $0.depth == 0 })?.comment
+                if isEndOfBranch, let root, !collapsedComments.contains(root.id), (root.replyCount > 0 || model.replyNext[root.id] != nil) {
+                    if model.loadingReplies.contains(root.id) {
+                        ProgressView().padding(.leading, 18).listRowSeparator(.hidden)
+                    } else if let error = model.replyErrors[root.id] {
+                        Button("回复加载失败，点击重试：\(error)") { Task { await model.loadReplies(to: root) } }
+                            .font(.caption).foregroundStyle(.secondary).padding(.leading, 18).listRowSeparator(.hidden)
+                    } else if model.commentReplies[root.id] == nil || model.replyNext[root.id] != nil {
+                        Button(model.commentReplies[root.id] == nil ? "查看 \(root.replyCount) 条回复" : "加载更多回复") {
+                            Task { await model.loadReplies(to: root) }
+                        }.font(.caption).padding(.leading, 18).listRowSeparator(.hidden)
+                    }
+                }
+            }
+            if let error = model.commentError { retryRow(error) { await model.loadComments(reset: true) }.listRowSeparator(.hidden) }
+            else if model.loadingComments { ProgressView().frame(maxWidth: .infinity).listRowSeparator(.hidden) }
+            else if model.canLoadMoreComments { Button("加载更多") { Task { await model.loadComments() } }.listRowSeparator(.hidden) }
+        }.listStyle(.plain)
+            .navigationTitle(model.commentTarget?.author.isEmpty == false ? "评论 · \(model.commentTarget?.author ?? "")" : "评论")
+            .navigationBarTitleDisplayMode(.inline)
+            .overlay {
+                if model.comments.isEmpty && !model.loadingComments && model.commentError == nil {
+                    VStack(spacing: 14) {
+                        ZStack {
+                            Circle().fill(ReaderPalette.accent.opacity(0.08)).frame(width: 100, height: 100)
+                            Circle().stroke(ReaderPalette.accent.opacity(0.16), lineWidth: 1).frame(width: 72, height: 72)
+                            Image(systemName: "bubble.left.and.bubble.right")
+                                .font(.system(size: 29, weight: .light)).foregroundStyle(ReaderPalette.accent.opacity(0.8))
+                            Circle().fill(ReaderPalette.accent.opacity(0.35)).frame(width: 5, height: 5).offset(x: 42, y: -29)
+                            Circle().fill(ReaderPalette.accent.opacity(0.20)).frame(width: 4, height: 4).offset(x: -40, y: 30)
+                        }
+                        Text("暂无评论").font(.headline).foregroundStyle(.primary)
+                        Text("这里还没有讨论").font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityElement(children: .combine)
+                    .allowsHitTesting(false)
+                }
+            }
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) {
+                Button { model.showsComments = false } label: { Image(systemName: "xmark") }
+                    .accessibilityLabel("关闭评论")
+            } }
+    }
+
+    private func commentRow(_ comment: ReadingComment) -> some View {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        AvatarView(url: comment.avatarURL, size: 30)
+                        Text(comment.author).font(.subheadline.weight(.semibold))
+                        if let replyTo = comment.replyTo {
+                            Text("回复").foregroundStyle(.secondary)
+                            Text(replyTo).fontWeight(.medium).lineLimit(1)
+                        }
+                        Spacer()
+                        if comment.likes > 0 {
+                            compactCount("hand.thumbsup", count: comment.likes)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .accessibilityLabel("\(displayCount(comment.likes)) 次赞同")
+                        }
+                    }
+                    ForEach(Array(commentHTMLFragments(comment.html).enumerated()), id: \.offset) { _, fragment in
+                        switch fragment {
+                        case .text(let html):
+                            let text = htmlText(html)
+                            if !text.isEmpty { Text(text).font(.body).textSelection(.enabled) }
+                        case .image(let url):
+                            AnimatedCommentImage(url: url)
+                                .frame(width: 220, height: 180).clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }.padding(.vertical, 7)
+    }
+
+    private func retryRow(_ message: String, action: @escaping () async -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 8) { Text(message).foregroundStyle(.secondary); Button("重试") { Task { await action() } } }.padding(.vertical, 8)
+    }
+
+    private func loadingFooter(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small).tint(ReaderPalette.accent)
+            Text(title).font(.footnote).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity).padding(.vertical, 14)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+
+private extension View {
+    func readerGlassCapsule() -> some View {
+        glassEffect(.regular.interactive(), in: Capsule())
+    }
+}
+
+private enum ReaderPalette {
+    static let accent = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.68, green: 0.77, blue: 0.72, alpha: 1)
+            : UIColor(red: 0.30, green: 0.41, blue: 0.36, alpha: 1)
+    })
+    static let directory = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.105, green: 0.116, blue: 0.111, alpha: 1)
+            : UIColor(red: 0.953, green: 0.953, blue: 0.933, alpha: 1)
+    })
+    static let page = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.098, green: 0.110, blue: 0.106, alpha: 1)
+            : UIColor(red: 0.984, green: 0.980, blue: 0.969, alpha: 1)
+    })
+    static let selection = accent.opacity(0.13)
+}
+
+private enum ReadingDefaults {
+    static var fontSize: Double { UIDevice.current.userInterfaceIdiom == .phone ? 17 : 18 }
+    static var width: Int { UIDevice.current.userInterfaceIdiom == .pad ? 800 : 680 }
+}
+
+private struct AuthorProfileView: View {
+    let item: ReadingItem
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                AvatarView(url: item.avatarURL, size: 76)
+                Text(item.author.isEmpty ? "匿名用户" : item.author).font(.title3.weight(.semibold))
+                if let headline = item.authorHeadline, !headline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(headline).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
+                if let token = item.authorToken, !token.isEmpty {
+                    Link(destination: URL(string: "https://www.zhihu.com/people")!.appendingPathComponent(token)) {
+                        Label("在知乎查看主页", systemImage: "arrow.up.right")
+                    }.buttonStyle(.bordered).padding(.top, 8)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 28).padding(.top, 28)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle("作者")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) {
+                Button { dismiss() } label: { Image(systemName: "xmark") }.accessibilityLabel("关闭")
+            } }
+        }.tint(ReaderPalette.accent).presentationDetents([.medium, .large])
+    }
+}
+
+private struct CollectionPickerView: View {
+    let item: ReadingItem
+    let onChange: (Bool) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var collections: [ReadingCollection] = []
+    @State private var loading = true
+    @State private var savingID: String?
+    @State private var error: String?
+    private let source = ZhihuSource()
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if loading { ProgressView().frame(maxWidth: .infinity) }
+                else if let error {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error).foregroundStyle(.secondary)
+                        Button("重试") { Task { await load() } }
+                    }
+                } else if collections.isEmpty {
+                    Text("没有可用的收藏夹，请先在知乎创建。 ").foregroundStyle(.secondary)
+                } else {
+                    ForEach(collections) { collection in
+                        Button {
+                            Task { await toggle(collection) }
+                        } label: {
+                            HStack {
+                                Text(collection.title).foregroundStyle(.primary)
+                                Spacer()
+                                if savingID == collection.id { ProgressView() }
+                                else if collection.isFavorited { Image(systemName: "checkmark").foregroundStyle(ReaderPalette.accent) }
+                            }.contentShape(Rectangle())
+                        }.buttonStyle(.plain).disabled(savingID != nil)
+                    }
+                }
+            }
+            .navigationTitle("收藏到")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) {
+                Button { dismiss() } label: { Image(systemName: "xmark") }.accessibilityLabel("关闭")
+            } }
+        }
+        .tint(ReaderPalette.accent)
+        .presentationDetents([.medium, .large])
+        .task { await load() }
+    }
+
+    private func load() async {
+        loading = true; error = nil
+        do {
+            collections = try await source.collections(for: item)
+            onChange(collections.contains(where: \.isFavorited))
+        } catch { self.error = error.localizedDescription }
+        loading = false
+    }
+
+    private func toggle(_ collection: ReadingCollection) async {
+        savingID = collection.id
+        defer { savingID = nil }
+        do {
+            try await source.setCollection(collection, for: item, add: !collection.isFavorited)
+            if let index = collections.firstIndex(where: { $0.id == collection.id }) {
+                collections[index].isFavorited.toggle()
+            }
+            onChange(collections.contains(where: \.isFavorited))
+        } catch { self.error = error.localizedDescription }
+    }
+}
+
+private func displayCount(_ count: Int?) -> String {
+    guard let count else { return "—" }
+    if count >= 10_000 { return String(format: "%.1f万", Double(count) / 10_000) }
+    return String(count)
+}
+
+private func compactCount(_ symbol: String, count: Int) -> some View {
+    HStack(spacing: 4) {
+        Image(systemName: symbol)
+        Text(displayCount(count)).monospacedDigit()
+    }.fixedSize(horizontal: true, vertical: false)
+}
+
+private struct ItemRow: View {
+    let item: ReadingItem
+    var isHot = false
+    var showsTitle: Bool = true
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                if showsTitle { Text(item.title).font(.system(size: 16, weight: .semibold)).lineSpacing(4).fixedSize(horizontal: false, vertical: true) }
+                if !isHot, !item.author.isEmpty {
+                    HStack(spacing: 7) {
+                        AvatarView(url: item.avatarURL, size: showsTitle ? 22 : 28)
+                        Text(item.author).font(showsTitle ? .caption.weight(.medium) : .headline)
+                            .foregroundStyle(showsTitle ? Color.secondary : Color.primary)
+                    }
+                }
+                if !item.excerpt.isEmpty { Text(htmlText(item.excerpt)).font(.system(size: 14)).foregroundStyle(.secondary).lineSpacing(3).lineLimit(2) }
+                if item.kind == .answer, item.upCount != nil || item.commentCount != nil {
+                    HStack(spacing: 16) {
+                        if let count = item.upCount {
+                            compactCount("hand.thumbsup", count: count)
+                                .accessibilityLabel("\(displayCount(count)) 次赞同")
+                        }
+                        if let count = item.commentCount {
+                            compactCount("bubble.right", count: count)
+                                .accessibilityLabel("\(displayCount(count)) 条评论")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }.padding(.vertical, 14)
+            if showsTitle, let url = item.imageURL {
+                AsyncImage(url: url) { image in image.resizable().scaledToFill() } placeholder: { Color.secondary.opacity(0.1) }
+                    .frame(width: 72, height: 82).clipped().clipShape(RoundedRectangle(cornerRadius: 10))
+                    .padding(.vertical, 14)
+            }
+        }
+        .padding(.horizontal, 10)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5).padding(.horizontal, 10) }
+    }
+}
+
+private struct AvatarView: View {
+    let url: URL?
+    let size: CGFloat
+    var body: some View {
+        AsyncImage(url: url) { image in image.resizable().scaledToFill() } placeholder: {
+            Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.secondary.opacity(0.5))
+        }
+        .frame(width: size, height: size).clipShape(Circle())
+        .accessibilityHidden(true)
+    }
+}
+
+private func htmlText(_ html: String) -> String {
+    // NSAttributedString's HTML importer can spin the main run loop while
+    // SwiftUI is rendering a List, causing an AttributeGraph reentrancy abort.
+    // List previews only need plain text; full answers use the web reader.
+    var text = html.replacingOccurrences(of: "(?i)<br\\s*/?>|</(?:p|div|li)\\s*>", with: "\n", options: .regularExpression)
+    text = text.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
+    let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'"]
+    for (entity, value) in entities { text = text.replacingOccurrences(of: entity, with: value) }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private struct AnimatedCommentImage: UIViewRepresentable {
+    let url: URL
+    func makeUIView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.isOpaque = false
+        view.backgroundColor = .clear
+        view.scrollView.isScrollEnabled = false
+        return view
+    }
+    func updateUIView(_ view: WKWebView, context: Context) {
+        guard context.coordinator.url != url else { return }
+        context.coordinator.url = url
+        let escaped = url.absoluteString.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "\"", with: "&quot;")
+        view.loadHTMLString("<html><meta name=\"viewport\" content=\"width=device-width\"><style>html,body{margin:0;width:100%;height:100%}img{width:100%;height:100%;object-fit:contain}</style><img src=\"\(escaped)\"></html>", baseURL: URL(string: "https://www.zhihu.com/"))
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    final class Coordinator { var url: URL? }
+}
+
+private func htmlEscape(_ value: String) -> String {
+    value.replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
+        .replacingOccurrences(of: "\"", with: "&quot;")
+}
+
+private struct HTMLReader: UIViewRepresentable {
+    let html: String
+    let item: ReadingItem
+    var stream: [ReadingItem] = []
+    let activeItem: ReadingItem
+    var paperCards = false
+    var isPreview = false
+    var onTitleHidden: (Bool) -> Void = { _ in }
+    var scrollRequest: ReaderModel.ScrollRequest? = nil
+    var onVisibleAnswer: (String) -> Void = { _ in }
+    var onNearEnd: () -> Void = {}
+    @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
+    @AppStorage("reading.lineHeight") private var lineHeight = 1.8
+    @AppStorage("reading.width") private var readingWidth = ReadingDefaults.width
+    @AppStorage("reading.paragraphSpacing") private var paragraphSpacing = 1.0
+    @AppStorage("reading.font") private var font = "system"
+    @AppStorage("reading.theme") private var theme = "system"
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration(); config.defaultWebpagePreferences.allowsContentJavaScript = false
+        let view = WKWebView(frame: .zero, configuration: config)
+        view.isOpaque = false; view.backgroundColor = .clear
+        view.scrollView.alwaysBounceHorizontal = false
+        view.scrollView.isDirectionalLockEnabled = true
+        view.navigationDelegate = context.coordinator
+        view.scrollView.delegate = context.coordinator
+        context.coordinator.attach(view)
+        context.coordinator.contentSizeObservation = view.scrollView.observe(\.contentSize, options: [.new]) { [weak coordinator = context.coordinator, weak view] _, _ in
+            DispatchQueue.main.async {
+                guard let coordinator, let view else { return }
+                coordinator.inspectAfterLayout(view)
+            }
+        }
+        return view
+    }
+    func updateUIView(_ view: WKWebView, context: Context) {
+        let colors: (String, String, String)
+        switch theme {
+        case "paper": colors = ("#f5f0e6", "#302b25", "light")
+        case "light": colors = ("#ffffff", "#222222", "light")
+        case "dark": colors = ("#1d2023", "#e5e5e3", "dark")
+        default: colors = ("light-dark(#fbfaf7, #191c1b)", "light-dark(#282b28, #e4e7e3)", "light dark")
+        }
+        let fontFamily = font == "serif" ? "'Songti SC', 'STSong', Georgia, serif" : "-apple-system, sans-serif"
+        let paperColor: String
+        switch theme {
+        case "paper": paperColor = "#fbf7ef"
+        case "light": paperColor = "#ffffff"
+        case "dark": paperColor = "#272b2e"
+        default: paperColor = "light-dark(#ffffff, #252a27)"
+        }
+        let cardCSS = paperCards ? """
+        body { padding-left: 16px; padding-right: 16px; }
+        .answer { background: \(paperColor); border: 1px solid rgba(128,128,128,.12); border-radius: 12px; padding: 26px 22px 28px; box-shadow: 0 5px 18px rgba(0,0,0,.08); }
+        .answer + .answer { border-top: 1px solid rgba(128,128,128,.12); margin-top: 18px; padding-top: 26px; }
+        """ : ""
+        let phoneAnswerCSS = paperCards ? "" : """
+        body { padding-bottom: 76px; }
+        .answer + .answer { border-top: 1px solid rgba(128,128,128,.24); margin-top: 30px; padding-top: 24px; }
+        .byline { margin-bottom: 20px; }
+        .author-name { font-size: 15px; font-weight: 600; }
+        """
+        // The settings preview uses the same document and typography as a real answer.
+        let previewCSS = isPreview ? """
+        body { margin: 0 auto; padding-top: 0; padding-bottom: 0; }
+        header, .byline { display: none; }
+        .answer { box-shadow: none; }
+        """ : ""
+        let title = htmlEscape(item.title)
+        let parts = stream.isEmpty ? [item] : stream
+        let sectionList = parts.enumerated().map { index, answer in
+            let author = htmlEscape(answer.author.isEmpty ? "匿名用户" : answer.author)
+            let avatar = answer.avatarURL.map { "<img class=\"avatar\" src=\"\(htmlEscape($0.absoluteString))\" alt=\"\">" } ?? ""
+            let content = answer.contentHTML ?? (index == 0 ? html : "")
+            let counts = """
+            <div class="counts"><span><svg viewBox="0 0 24 24" aria-label="赞同"><path d="M7 10v10H4V10h3zm2 10V10l4-7c.4-.8 1.6-.5 1.6.4V8H19c1.3 0 2.2 1.2 1.9 2.4l-1.6 7.5A2.5 2.5 0 0 1 16.8 20H9z"/></svg><b data-count="up">\(displayCount(answer.upCount))</b></span><span><svg viewBox="0 0 24 24" aria-label="评论"><path d="M4 5.5h16v11H11l-4.5 3v-3H4z"/></svg><b data-count="comments">\(displayCount(answer.commentCount))</b></span></div>
+            """
+            let byline = "<div class=\"byline\">\(avatar)<span class=\"author-name\">\(author)</span>\(counts)</div>"
+            return "<section class=\"answer\" data-wize-answer=\"\(htmlEscape(answer.id))\">\(byline)<main>\(expandedImageHTML(content))</main></section>"
+        }
+        let sections = sectionList.joined()
+        let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(fontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
+        let style = """
+        :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: 'Songti SC', 'STSong', Georgia, serif; font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
+        .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:16px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
+        main blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid rgba(128,128,128,.35); color: inherit; opacity: .82; }
+        main p:last-child { margin-bottom: 0; }
+        main figure { margin: .8em 0; }
+        main figcaption { margin-top: .4em; font-size: .8em; line-height: 1.5; text-align: center; opacity: .68; }
+        main ul, main ol { padding-left: 1.5em; }
+        main li + li { margin-top: .2em; }
+        main pre { overflow-x: auto; overflow-wrap: normal; } main table { display: block; max-width: 100%; overflow-x: auto; }
+        \(cardCSS)
+        \(phoneAnswerCSS)
+        \(previewCSS)
+        """
+        let document = """
+        <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>\(style)</style></head><body><header><h1>\(title)</h1></header>\(sections)</body></html>
+        """
+        context.coordinator.onVisibleAnswer = onVisibleAnswer
+        context.coordinator.onNearEnd = onNearEnd
+        context.coordinator.onTitleHidden = onTitleHidden
+        context.coordinator.streamEnabled = !stream.isEmpty
+        context.coordinator.activeItem = activeItem
+        if context.coordinator.lastHTML != document {
+            let coordinator = context.coordinator
+            if !coordinator.lastHTML.isEmpty, coordinator.sections == sectionList,
+               coordinator.documentTitle == title, coordinator.presentationKey != presentationKey {
+                coordinator.presentationKey = presentationKey
+                coordinator.lastHTML = document
+                coordinator.updateStyle(style, in: view, preservePosition: !isPreview)
+                return
+            }
+            if coordinator.presentationKey == presentationKey,
+               !coordinator.sections.isEmpty,
+               sectionList.count > coordinator.sections.count,
+               let start = (0...(sectionList.count - coordinator.sections.count)).first(where: {
+                   Array(sectionList[$0..<($0 + coordinator.sections.count)]) == coordinator.sections
+               }) {
+                let before = sectionList.prefix(start).joined()
+                let after = sectionList.dropFirst(start + coordinator.sections.count).joined()
+                coordinator.sections = sectionList
+                coordinator.lastHTML = document
+                coordinator.previousCount = parts.count
+                coordinator.previousFirstID = parts.first?.id
+                coordinator.enqueueSurrounding(before: before, after: after, in: view)
+                return
+            }
+            coordinator.presentationKey = presentationKey
+            coordinator.documentTitle = title
+            coordinator.sections = sectionList
+            coordinator.cancelPendingAppends()
+            if context.coordinator.lastHTML.isEmpty, parts.first?.id != item.id,
+               parts.contains(where: { $0.id == item.id }) {
+                context.coordinator.pendingAnchorID = item.id
+                context.coordinator.pendingOffset = 0
+            }
+            if !context.coordinator.lastHTML.isEmpty {
+                let extent = max(view.scrollView.contentSize.height - view.scrollView.bounds.height, 1)
+                if context.coordinator.previousCount == 1, context.coordinator.previousFirstID != parts.first?.id,
+                   parts.contains(where: { $0.id == item.id }) {
+                    context.coordinator.pendingAnchorID = item.id
+                    context.coordinator.pendingOffset = max(0, view.scrollView.contentOffset.y)
+                } else if context.coordinator.previousCount != parts.count {
+                    context.coordinator.pendingOffset = max(0, view.scrollView.contentOffset.y)
+                } else {
+                    context.coordinator.pendingScrollFraction = max(0, view.scrollView.contentOffset.y / extent)
+                }
+            }
+            context.coordinator.previousCount = parts.count
+            context.coordinator.previousFirstID = parts.first?.id
+            context.coordinator.lastHTML = document
+            coordinator.loadingDocument = true
+            view.loadHTMLString(document, baseURL: URL(string: "https://www.zhihu.com"))
+        } else if let request = scrollRequest, context.coordinator.lastScrollToken != request.token {
+            context.coordinator.lastScrollToken = request.token
+            context.coordinator.scrollToAnswer(request.id, in: view)
+        }
+        if context.coordinator.lastHTML == document { context.coordinator.updateActive(in: view) }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    final class Coordinator: NSObject, WKNavigationDelegate, UIScrollViewDelegate {
+        var lastHTML = ""
+        var previousCount = 0
+        var lastScrollToken: UUID?
+        var previousFirstID: String?
+        var pendingAnchorID: String?
+        var restoringAnchor = false
+        var pendingScrollFraction: CGFloat?
+        var pendingOffset: CGFloat?
+        var onVisibleAnswer: (String) -> Void = { _ in }
+        var onNearEnd: () -> Void = {}
+        var onTitleHidden: (Bool) -> Void = { _ in }
+        var streamEnabled = false
+        var activeItem: ReadingItem?
+        var contentSizeObservation: NSKeyValueObservation?
+        var presentationKey = ""
+        var documentTitle = ""
+        var sections: [String] = []
+        var loadingDocument = false
+        private var pendingStyle: String?
+        private var preserveStylePosition = true
+        private var applyingStyle = false
+        private struct Insertion: Encodable { let before: String; let after: String }
+        private var pendingAppends: [Insertion] = []
+        private var appending = false
+        private var documentGeneration = 0
+        private var lastInspection = Date.distantPast
+        private weak var webView: WKWebView?
+        func attach(_ webView: WKWebView) { self.webView = webView }
+        func cancelPendingAppends() {
+            documentGeneration += 1
+            pendingAppends.removeAll()
+            appending = false
+            pendingStyle = nil
+            applyingStyle = false
+        }
+        func updateStyle(_ style: String, in webView: WKWebView, preservePosition: Bool) {
+            pendingStyle = style
+            preserveStylePosition = preservePosition
+            flushStyle(in: webView)
+        }
+        private func flushStyle(in webView: WKWebView) {
+            guard !loadingDocument, !applyingStyle, let style = pendingStyle,
+                  let data = try? JSONEncoder().encode(style),
+                  let encoded = String(data: data, encoding: .utf8) else { return }
+            applyingStyle = true
+            let generation = documentGeneration
+            // Keep the text at a point in the viewport in place while it reflows.
+            let script = "(() => { const style = document.querySelector('style'); if (!style) return false; const x = innerWidth * .5, y = Math.min(innerHeight * .35, 140); const range = document.caretRangeFromPoint(x, y); const element = document.elementFromPoint(x, y); const rect = range?.getBoundingClientRect(); const useRange = rect && rect.height > 0; const top = useRange ? rect.top : element?.getBoundingClientRect().top; style.textContent = \(encoded); if (!\(preserveStylePosition)) { window.scrollTo(0, 0); } else if (top != null) { const next = useRange ? range.getBoundingClientRect().top : element?.getBoundingClientRect().top; if (next != null) window.scrollBy(0, next - top); } return true; })()"
+            webView.evaluateJavaScript(script) { [weak self, weak webView] result, _ in
+                guard let self, let webView, self.documentGeneration == generation else { return }
+                self.applyingStyle = false
+                if result as? Bool == true, self.pendingStyle == style { self.pendingStyle = nil }
+                if self.pendingStyle != nil, result as? Bool == true { self.flushStyle(in: webView) }
+                self.inspect(webView)
+            }
+        }
+        func enqueueSurrounding(before: String, after: String, in webView: WKWebView) {
+            pendingAppends.append(Insertion(before: before, after: after))
+            flushAppends(in: webView)
+        }
+        private func flushAppends(in webView: WKWebView) {
+            guard !appending, let html = pendingAppends.first,
+                  let data = try? JSONEncoder().encode(html),
+                  let encoded = String(data: data, encoding: .utf8) else { return }
+            appending = true
+            let generation = documentGeneration
+            // Preserve the first existing answer's screen position when earlier answers arrive.
+            // This also avoids briefly showing a different answer while the document reloads.
+            let script = "(() => { const first = document.querySelector('section[data-wize-answer]'); if (!document.body || !first) return false; const insertion = \(encoded); const top = first.getBoundingClientRect().top; if (insertion.before) first.insertAdjacentHTML('beforebegin', insertion.before); if (insertion.after) document.body.insertAdjacentHTML('beforeend', insertion.after); if (insertion.before) window.scrollBy(0, first.getBoundingClientRect().top - top); return true; })()"
+            webView.evaluateJavaScript(script) { [weak self, weak webView] result, _ in
+                guard let self, let webView, self.documentGeneration == generation else { return }
+                self.appending = false
+                if result as? Bool == true {
+                    self.pendingAppends.removeFirst()
+                    self.updateActive(in: webView)
+                    self.flushAppends(in: webView)
+                }
+            }
+        }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            self.webView = webView
+            loadingDocument = false
+            flushStyle(in: webView)
+            flushAppends(in: webView)
+            let extent = max(webView.scrollView.contentSize.height - webView.scrollView.bounds.height, 0)
+            if let id = pendingAnchorID, let offset = pendingOffset,
+               let encoded = try? String(data: JSONEncoder().encode(id), encoding: .utf8) {
+                pendingAnchorID = nil; pendingOffset = nil
+                restoringAnchor = true
+                let script = "(() => { const id = \(encoded); const el = Array.from(document.querySelectorAll('section[data-wize-answer]')).find(e => e.getAttribute('data-wize-answer') === id); if (el) window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY + \(offset)); })()"
+                webView.evaluateJavaScript(script) { [weak self, weak webView] _, _ in
+                    guard let self, let webView else { return }
+                    self.restoringAnchor = false
+                    self.updateActive(in: webView)
+                    self.inspect(webView)
+                }
+                return
+            } else if let offset = pendingOffset {
+                pendingOffset = nil
+                webView.scrollView.setContentOffset(CGPoint(x: 0, y: min(offset, extent)), animated: false)
+            } else if let fraction = pendingScrollFraction {
+                pendingScrollFraction = nil
+                webView.scrollView.setContentOffset(CGPoint(x: 0, y: min(fraction, 1) * extent), animated: false)
+            }
+            updateActive(in: webView)
+            inspect(webView)
+        }
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            guard streamEnabled, let webView else { return }
+            let remaining = scrollView.contentSize.height - scrollView.bounds.height - scrollView.contentOffset.y
+            if remaining < scrollView.bounds.height * 1.3 { onNearEnd() }
+            if Date().timeIntervalSince(lastInspection) > 0.2 { inspect(webView) }
+        }
+        func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+            if !decelerate, let webView, streamEnabled { inspect(webView) }
+        }
+        func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            if let webView, streamEnabled { inspect(webView) }
+        }
+        func inspectAfterLayout(_ webView: WKWebView) {
+            guard streamEnabled else { return }
+            flushAppends(in: webView)
+            inspect(webView)
+        }
+        func scrollToAnswer(_ id: String, in webView: WKWebView) {
+            guard let encoded = try? String(data: JSONEncoder().encode(id), encoding: .utf8) else { return }
+            let script = "(() => { const id = \(encoded); const el = Array.from(document.querySelectorAll('section[data-wize-answer]')).find(e => e.getAttribute('data-wize-answer') === id); if (el) el.scrollIntoView({block:'start'}); })()"
+            webView.evaluateJavaScript(script)
+        }
+        func updateActive(in webView: WKWebView) {
+            guard let item = activeItem,
+                  let data = try? JSONEncoder().encode([item.id, displayCount(item.upCount), displayCount(item.downCount), displayCount(item.commentCount)]),
+                  let values = String(data: data, encoding: .utf8) else { return }
+            let script = "(() => { const [id, up, down, comments] = \(values); document.querySelectorAll('section[data-wize-answer]').forEach(e => { const active = e.getAttribute('data-wize-answer') === id; e.classList.toggle('current', active); if (active) { for (const [key, value] of Object.entries({up, down, comments})) { const node = e.querySelector('[data-count=\\\"' + key + '\\\"]'); if (node) node.textContent = value; } } }); })()"
+            webView.evaluateJavaScript(script)
+        }
+        private func inspect(_ webView: WKWebView) {
+            guard streamEnabled, pendingAnchorID == nil, !restoringAnchor else { return }
+            lastInspection = Date()
+            // Tie edge actions to the answer at the reading focus, not a sliver at the top.
+            let script = "(() => { const answers = Array.from(document.querySelectorAll('section[data-wize-answer]')); const focus = Math.min(innerHeight * .35, innerHeight - 1); const answer = answers.find(e => e.getBoundingClientRect().bottom > focus) || answers.find(e => e.getBoundingClientRect().bottom > 0); const index = answers.indexOf(answer); if (index >= 0) answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager')); const title = document.querySelector('header h1'); return { id: answer?.getAttribute('data-wize-answer') || null, titleHidden: !!title && title.getBoundingClientRect().bottom <= 0 }; })()"
+            webView.evaluateJavaScript(script) { [weak self] result, _ in
+                guard let result = result as? [String: Any] else { return }
+                if let id = result["id"] as? String { self?.onVisibleAnswer(id) }
+                if let hidden = result["titleHidden"] as? Bool { self?.onTitleHidden(hidden) }
+            }
+        }
+    }
+}
+
+private struct ReadingSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
+    @AppStorage("reading.lineHeight") private var lineHeight = 1.8
+    @AppStorage("reading.width") private var readingWidth = ReadingDefaults.width
+    @AppStorage("reading.paragraphSpacing") private var paragraphSpacing = 1.0
+    @AppStorage("reading.font") private var font = "system"
+    @AppStorage("reading.theme") private var theme = "system"
+
+    private let previewHTML = """
+    <p>阅读让我们暂时放慢脚步，也让熟悉的世界重新变得清晰。</p>
+    <p>在不同的观点之间，留下思考的空间，<strong>找到自己的答案</strong>。</p>
+    <blockquote>好好阅读，慢慢思考。</blockquote>
+    """
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("预览") {
+                    let sample = ReadingItem(id: "reading-preview", kind: .article, title: "", excerpt: "", author: "", questionID: nil, contentHTML: previewHTML)
+                    HTMLReader(html: previewHTML, item: sample, activeItem: sample,
+                               paperCards: UIDevice.current.userInterfaceIdiom == .pad, isPreview: true)
+                        .frame(height: 210)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .listRowInsets(EdgeInsets())
+                }
+                Section("正文") {
+                    HStack {
+                        Text("字号")
+                        Slider(value: $fontSize, in: 15...25, step: 1)
+                        Text("\(Int(fontSize))").monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    Picker("字体", selection: $font) {
+                        Text("系统").tag("system")
+                        Text("宋体").tag("serif")
+                    }
+                    HStack {
+                        Text("行距")
+                        Slider(value: $lineHeight, in: 1.5...2.1, step: 0.1)
+                        Text(lineHeight, format: .number.precision(.fractionLength(1))).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                }
+                Section("版面") {
+                    Picker("行宽", selection: $readingWidth) {
+                        Text("紧凑").tag(560)
+                        Text("标准").tag(680)
+                        Text("宽松").tag(800)
+                    }.pickerStyle(.segmented)
+                    Text("行宽在阅读区域足够宽时生效。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    HStack {
+                        Text("段间距")
+                        Slider(value: $paragraphSpacing, in: 0.5...1.8, step: 0.1)
+                        Text(paragraphSpacing, format: .number.precision(.fractionLength(1))).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                }
+                Section("阅读配色") {
+                    Picker("背景", selection: $theme) {
+                        Text("跟随系统").tag("system")
+                        Text("明亮").tag("light")
+                        Text("纸色").tag("paper")
+                        Text("深色").tag("dark")
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Section {
+                    Button("恢复默认设置") {
+                        fontSize = ReadingDefaults.fontSize; lineHeight = 1.8; font = "system"; theme = "system"
+                        readingWidth = ReadingDefaults.width; paragraphSpacing = 1.0
+                    }
+                }
+            }
+            .navigationTitle("阅读设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+        }
+        .presentationDetents([.large])
+    }
+}
+
+private struct LoginView: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var session = ZhihuLoginSession()
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("在知乎完成登录或安全验证").font(.subheadline.weight(.semibold))
+                    Text("账号信息由知乎处理，登录状态保存在此设备。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20).padding(.vertical, 14)
+                .background(ReaderPalette.directory)
+
+                if session.loading {
+                    ProgressView().progressViewStyle(.linear).tint(ReaderPalette.accent)
+                }
+                ZStack {
+                    ZhihuLoginWebView(session: session)
+                    if let error = session.pageError {
+                        ContentUnavailableView {
+                            Label("无法打开知乎", systemImage: "wifi.exclamationmark")
+                        } description: {
+                            Text(error)
+                        } actions: {
+                            Button("重新加载") { session.reload() }.buttonStyle(.bordered)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(uiColor: .systemBackground))
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if let error = session.verificationError {
+                    Text(error).font(.footnote).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20).padding(.vertical, 10)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle("知乎账号")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { session.verify() } label: {
+                        if session.checking { ProgressView() } else { Text("完成登录") }
+                    }.disabled(session.checking || session.pageError != nil)
+                }
+                if session.canGoBack {
+                    ToolbarItem(placement: .bottomBar) {
+                        Button { session.goBack() } label: { Label("网页后退", systemImage: "chevron.left") }
+                    }
+                }
+            }
+            .onChange(of: session.verified) { verified in if verified { dismiss() } }
+            .onDisappear { session.stopObserving() }
+        }
+    }
+}
+
+@MainActor
+private final class ZhihuLoginSession: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver {
+    @Published var loading = true
+    @Published var checking = false
+    @Published var verified = false
+    @Published var canGoBack = false
+    @Published var pageError: String?
+    @Published var verificationError: String?
+    let webView: WKWebView
+    private let source = ZhihuSource()
+    private let loginURL = URL(string: "https://www.zhihu.com/signin")!
+    private var authCookie: String?
+    private var observingCookies = false
+    private var stopped = false
+    private var pendingAutoVerification = false
+    private var sawNewAuthCookie = false
+    private var sawSignInPage = false
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        configuration.defaultWebpagePreferences.preferredContentMode = .mobile
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        Task {
+            let store = webView.configuration.websiteDataStore.httpCookieStore
+            authCookie = Self.authCookieValue(await store.allCookies())
+            guard !stopped else { return }
+            store.add(self)
+            observingCookies = true
+            cookiesDidChange(in: store)
+        }
+        webView.load(URLRequest(url: loginURL))
+    }
+
+    func reload() {
+        pageError = nil
+        if webView.url == nil { webView.load(URLRequest(url: loginURL)) }
+        else { webView.reload() }
+    }
+    func goBack() { webView.goBack() }
+    func verify(silent: Bool = false) {
+        guard !checking else { return }
+        checking = true
+        if silent { pendingAutoVerification = false } else { verificationError = nil }
+        Task {
+            defer {
+                checking = false
+                if pendingAutoVerification && !loading && !verified && !stopped { verify(silent: true) }
+            }
+            do {
+                _ = try await source.currentUser()
+                verified = true
+            } catch {
+                if !silent { verificationError = "暂时无法确认登录。请在知乎页面完成登录或验证后重试。" }
+            }
+        }
+    }
+    func stopObserving() {
+        stopped = true
+        if observingCookies { webView.configuration.websiteDataStore.httpCookieStore.remove(self) }
+        observingCookies = false
+    }
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        Task {
+            let newValue = Self.authCookieValue(await cookieStore.allCookies())
+            guard observingCookies, newValue != authCookie else { return }
+            authCookie = newValue
+            if newValue != nil {
+                sawNewAuthCookie = true
+                pendingAutoVerification = true
+                if !loading { verify(silent: true) }
+            }
+        }
+    }
+    private static func authCookieValue(_ cookies: [HTTPCookie]) -> String? {
+        cookies.first {
+            let domain = $0.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+            return $0.name == "z_c0" && (domain == "zhihu.com" || domain.hasSuffix(".zhihu.com")) && !$0.value.isEmpty
+        }?.value
+    }
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        loading = true; pageError = nil; verificationError = nil
+    }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        loading = false; canGoBack = webView.canGoBack
+        if let url = webView.url, let host = url.host?.lowercased(),
+           host == "zhihu.com" || host.hasSuffix(".zhihu.com") {
+            if url.path.hasPrefix("/signin") { sawSignInPage = true }
+            if sawSignInPage && (url.path.isEmpty || url.path == "/") { pendingAutoVerification = true }
+        }
+        if sawNewAuthCookie { pendingAutoVerification = true }
+        if pendingAutoVerification { verify(silent: true) }
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail(error) }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail(error) }
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        loading = false; pageError = "页面已停止运行，请重新加载。"
+    }
+    private func fail(_ error: Error) {
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        loading = false; pageError = "请检查网络连接后重试。"
+    }
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+        return nil
+    }
+}
+
+private struct ZhihuLoginWebView: UIViewRepresentable {
+    @ObservedObject var session: ZhihuLoginSession
+    func makeUIView(context: Context) -> WKWebView {
+        session.webView
+    }
+    func updateUIView(_ view: WKWebView, context: Context) {}
+}

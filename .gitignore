@@ -4,5 +4,9 @@ DerivedData/
 xcuserdata/
 *.xcresult
 *.ipa
+*.xcarchive
+*.mobileprovision
+*.p12
+.build/
 .env
 .env.*
