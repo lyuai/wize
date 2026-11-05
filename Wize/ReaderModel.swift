@@ -46,6 +46,7 @@ final class ReaderModel: ObservableObject {
     @Published var accountName: String?
     @Published var accountAvatarURL: URL?
     @Published var accountHeadline: String?
+    @Published var accountToken: String?
     private let source: any ReadingSource
     init() { self.source = ZhihuSource() }
     init(source: any ReadingSource) { self.source = source }
@@ -471,10 +472,12 @@ final class ReaderModel: ObservableObject {
             accountName = account.name
             accountAvatarURL = account.avatar
             accountHeadline = account.headline?.trimmingCharacters(in: .whitespacesAndNewlines)
+            accountToken = account.token
         } catch {
             accountName = nil
             accountAvatarURL = nil
             accountHeadline = nil
+            accountToken = nil
         }
     }
 

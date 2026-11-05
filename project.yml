@@ -7,13 +7,19 @@ targets:
   Wize:
     type: application
     platform: iOS
-    sources: [Wize]
+    sources:
+      - path: Wize
+        excludes:
+          - Info.plist
+    configFiles:
+      Debug: Config/Build.xcconfig
+      Release: Config/Build.xcconfig
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lyuai.wize
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: 无知
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: 'UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight'
+        INFOPLIST_FILE: Wize/Info.plist
+        WIZE_RELEASE_DATE: '2026-11-05'
+        MARKETING_VERSION: '0.2.0'
+        CURRENT_PROJECT_VERSION: '2'
         SWIFT_VERSION: '5.0'
         TARGETED_DEVICE_FAMILY: '1,2'

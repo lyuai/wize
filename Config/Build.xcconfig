@@ -1,0 +1,4 @@
+// 所有构建共享的配置；本地密钥写在 Config/Local.xcconfig（git 忽略）。
+#include? "Local.xcconfig"
+
+WIZE_GITHUB_REPO = lyuai/wize

@@ -11,6 +11,7 @@ final class ReadingFixtureSource: ReadingSource {
         <p>我喜欢旧书店，并不是因为每一本书都稀有。真正有意思的，是你永远不知道下一页会遇到什么。</p>
         <p>有人在扉页写下日期，有人留下车票，也有人用一条细细的线，标出他觉得重要的句子。这些痕迹让阅读多了一点偶遇的意味。</p>
         <blockquote>一本书被许多人读过，也就有了许多种生活。</blockquote>
+        <hr>
         <p>在这样一个地方，时间似乎走得慢一些。你不必急着寻找答案，可以先把问题放在一边。</p>
         """
         let short = "<p>读到的也许不是答案，而是别人认真生活过的证据。</p>"
@@ -34,7 +35,7 @@ final class ReadingFixtureSource: ReadingSource {
             title: "排版样本｜你最近读到了什么？", excerpt: "关于阅读的一点闲谈。", author: "", questionID: nil)
         return Page(items: hot ? [question, longerQuestion, shortQuestion] : [samples[0], question], next: nil)
     }
-    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?) { ("阅读者", nil, "在阅读里发现更多") }
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?, token: String?) { ("阅读者", nil, "在阅读里发现更多", "reader-fixture") }
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
         let ordered = sort == "updated" ? Array(samples.reversed()) : samples
         // Split the time ordering so the last answer is outside its first page.

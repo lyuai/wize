@@ -69,7 +69,7 @@ enum SourceError: LocalizedError {
 @MainActor
 protocol ReadingSource {
     func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem>
-    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?)
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?, token: String?)
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem>
     func detail(_ item: ReadingItem, prefetch: Bool) async throws -> ReadingItem
     func setVote(answerID: String, vote: AnswerVote) async throws -> AnswerVoteResult
@@ -159,10 +159,10 @@ final class ZhihuSource: ReadingSource {
         return Page(items: objects(json).compactMap { parseFeed($0) }, next: nextURL(json))
     }
 
-    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?) {
-        let json = try await request(url("/api/v4/me", [.init(name: "include", value: "avatar_url,name,headline")]))
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?, token: String?) {
+        let json = try await request(url("/api/v4/me", [.init(name: "include", value: "avatar_url,name,headline,url_token")]))
         guard let name = json["name"] as? String, !name.isEmpty else { throw SourceError.malformed }
-        return (name, mediaURL(json["avatar_url"]), json["headline"] as? String)
+        return (name, mediaURL(json["avatar_url"]), json["headline"] as? String, json["url_token"] as? String)
     }
 
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {

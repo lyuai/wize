@@ -7,7 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		2DA59481EB2028243A80E8CF /* AppInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC443AFAC433745BB62C5425 /* AppInfo.swift */; };
 		5CDB7AD3E2CF5C0678B919B3 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 497EF928BA354DBFAA1751D0 /* Assets.xcassets */; };
+		63C7C9E13FDB6998550DAABF /* FeedbackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1513ECE571D3A1766770A025 /* FeedbackView.swift */; };
 		654DB24AA51E063F599CB2D0 /* ZhihuSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CFDD22C69B4DF1F867BCED7 /* ZhihuSource.swift */; };
 		86296562276992812ED67715 /* ReaderModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD1D3B6C3C88D1BA2C41D094 /* ReaderModel.swift */; };
 		A306960CD3B99909067FD6B5 /* ReadingFixtureSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED07394ED004DF23CFC88B80 /* ReadingFixtureSource.swift */; };
@@ -16,12 +18,15 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		1513ECE571D3A1766770A025 /* FeedbackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedbackView.swift; sourceTree = "<group>"; };
+		374163F308F8FB5C3762704E /* Build.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Build.xcconfig; sourceTree = "<group>"; };
 		3CFDD22C69B4DF1F867BCED7 /* ZhihuSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZhihuSource.swift; sourceTree = "<group>"; };
 		497EF928BA354DBFAA1751D0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		5C20A4F65F05689A18789C97 /* Wize.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Wize.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		724D76C8C21B301AA52BAD94 /* WizeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WizeApp.swift; sourceTree = "<group>"; };
 		C173098F011706D6E6779FAD /* ReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderView.swift; sourceTree = "<group>"; };
 		ED07394ED004DF23CFC88B80 /* ReadingFixtureSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadingFixtureSource.swift; sourceTree = "<group>"; };
+		FC443AFAC433745BB62C5425 /* AppInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInfo.swift; sourceTree = "<group>"; };
 		FD1D3B6C3C88D1BA2C41D094 /* ReaderModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderModel.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -29,6 +34,7 @@
 		61E4EE3CCFAEFF19EA89E57C = {
 			isa = PBXGroup;
 			children = (
+				C0AD8B9DB38FC72F13CF7A64 /* Config */,
 				911FE2FDBCB360AF2B3784B5 /* Wize */,
 				EEDCC2920ECD69FA6DAEE0CE /* Products */,
 			);
@@ -37,7 +43,9 @@
 		911FE2FDBCB360AF2B3784B5 /* Wize */ = {
 			isa = PBXGroup;
 			children = (
+				FC443AFAC433745BB62C5425 /* AppInfo.swift */,
 				497EF928BA354DBFAA1751D0 /* Assets.xcassets */,
+				1513ECE571D3A1766770A025 /* FeedbackView.swift */,
 				FD1D3B6C3C88D1BA2C41D094 /* ReaderModel.swift */,
 				C173098F011706D6E6779FAD /* ReaderView.swift */,
 				ED07394ED004DF23CFC88B80 /* ReadingFixtureSource.swift */,
@@ -45,6 +53,14 @@
 				3CFDD22C69B4DF1F867BCED7 /* ZhihuSource.swift */,
 			);
 			path = Wize;
+			sourceTree = "<group>";
+		};
+		C0AD8B9DB38FC72F13CF7A64 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				374163F308F8FB5C3762704E /* Build.xcconfig */,
+			);
+			path = Config;
 			sourceTree = "<group>";
 		};
 		EEDCC2920ECD69FA6DAEE0CE /* Products */ = {
@@ -122,6 +138,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				2DA59481EB2028243A80E8CF /* AppInfo.swift in Sources */,
+				63C7C9E13FDB6998550DAABF /* FeedbackView.swift in Sources */,
 				86296562276992812ED67715 /* ReaderModel.swift in Sources */,
 				F71846B68C93139E79313F1F /* ReaderView.swift in Sources */,
 				A306960CD3B99909067FD6B5 /* ReadingFixtureSource.swift in Sources */,
@@ -135,41 +153,43 @@
 /* Begin XCBuildConfiguration section */
 		46AB6629714C7A1C514B6E72 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 374163F308F8FB5C3762704E /* Build.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "无知";
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				CURRENT_PROJECT_VERSION = 2;
+				INFOPLIST_FILE = Wize/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.lyuai.wize;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				WIZE_RELEASE_DATE = "2026-11-05";
 			};
 			name = Debug;
 		};
 		74A5D8D291D521A46389C6F9 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 374163F308F8FB5C3762704E /* Build.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "无知";
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				CURRENT_PROJECT_VERSION = 2;
+				INFOPLIST_FILE = Wize/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.lyuai.wize;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				WIZE_RELEASE_DATE = "2026-11-05";
 			};
 			name = Release;
 		};

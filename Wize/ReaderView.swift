@@ -9,6 +9,8 @@ struct ReaderView: View {
     @State private var showsPinnedTitle = false
     @State private var showsReadingSettings = false
     @State private var showsAccountMenu = false
+    @State private var showsAbout = false
+    @State private var showsFeedback = false
     @State private var accountDestination: AccountDestination?
     @State private var profileItem: ReadingItem?
     @State private var collectionItem: ReadingItem?
@@ -17,7 +19,7 @@ struct ReaderView: View {
     private let collectionSource = ZhihuSource()
     @AppStorage("reading.theme") private var readingTheme = "system"
     enum PhonePage: Hashable { case question, answer }
-    private enum AccountDestination { case settings, login }
+    private enum AccountDestination { case settings, login, about, feedback }
 
     private var usesWideLayout: Bool {
         UIDevice.current.userInterfaceIdiom == .pad && sizeClass == .regular && availableWidth >= 760
@@ -36,6 +38,8 @@ struct ReaderView: View {
             LoginView().presentationDetents([.large]).presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showsReadingSettings) { ReadingSettingsView() }
+        .sheet(isPresented: $showsAbout) { AboutView() }
+        .sheet(isPresented: $showsFeedback) { FeedbackView(context: feedbackContext) }
         .sheet(item: $profileItem) { AuthorProfileView(item: $0) }
         .sheet(item: $collectionItem) { item in
             CollectionPickerView(item: item) { saved in
@@ -114,6 +118,9 @@ struct ReaderView: View {
                                     Text(title).font(.subheadline.weight(.medium)).lineLimit(1).truncationMode(.tail)
                                         .frame(width: max(geometry.size.width * 0.64 - 110, 180), alignment: .leading)
                                 }
+                            }
+                            ToolbarItem(placement: .navigationBarTrailing) {
+                                readingSettingsButton
                             }
                             ToolbarItem(placement: .navigationBarTrailing) {
                                 accountMenu
@@ -196,12 +203,11 @@ struct ReaderView: View {
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.padding(16)
                 Divider().padding(.horizontal, 16)
-                Button { accountDestination = .settings; showsAccountMenu = false } label: {
-                    Label("阅读设置", systemImage: "textformat.size").frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 12)
-                }
-                Button { accountDestination = .login; showsAccountMenu = false } label: {
-                    Label("知乎账号", systemImage: "person.crop.circle").frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 12)
-                }
+                accountMenuRow("阅读设置", systemImage: "textformat.size", destination: .settings)
+                accountMenuRow("知乎账号", systemImage: "person.crop.circle", destination: .login)
+                Divider().padding(.horizontal, 16)
+                accountMenuRow("问题反馈与建议", systemImage: "envelope", destination: .feedback)
+                accountMenuRow("关于", systemImage: "info.circle", destination: .about)
             }
             .frame(width: 290)
             .buttonStyle(.plain)
@@ -210,11 +216,34 @@ struct ReaderView: View {
                 switch accountDestination {
                 case .settings: showsReadingSettings = true
                 case .login: model.showsLogin = true
+                case .about: showsAbout = true
+                case .feedback: showsFeedback = true
                 case nil: break
                 }
                 accountDestination = nil
             }
         }
+    }
+
+    /// 整行可点的菜单项：命中区域覆盖整行宽度，而不是只有图标和文字。
+    private func accountMenuRow(_ title: String, systemImage: String, destination: AccountDestination) -> some View {
+        Button {
+            accountDestination = destination
+            showsAccountMenu = false
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.body)
+                    .frame(width: 22, alignment: .center)
+                Text(title)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 
     private var phoneLayout: some View {
@@ -363,6 +392,31 @@ struct ReaderView: View {
         }
     }
 
+    /// 反馈表单可附带的信息（用户可在表单里关闭）。
+    private var feedbackContext: FeedbackContext {
+        let defaults = UserDefaults.standard
+        let isPad = UIDevice.current.userInterfaceIdiom == .pad
+        return FeedbackContext(
+            accountName: model.accountName,
+            accountHeadline: model.accountHeadline,
+            accountToken: model.accountToken,
+            readingFontSize: defaults.object(forKey: "reading.fontSize") as? Int ?? (isPad ? 18 : 17),
+            readingLineHeight: defaults.object(forKey: "reading.lineHeight") as? Double ?? 1.8,
+            readingWidth: defaults.object(forKey: "reading.width") as? Int ?? (isPad ? 800 : 680),
+            readingFont: defaults.string(forKey: "reading.font") ?? "system",
+            readingTheme: defaults.string(forKey: "reading.theme") ?? "system"
+        )
+    }
+
+    /// 阅读界面里的直接入口：一键打开阅读设置（iPhone 单列与 iPad 宽栏都有）。
+    private var readingSettingsButton: some View {
+        Button { showsReadingSettings = true } label: {
+            Image(systemName: "textformat.size")
+        }
+        .accessibilityLabel("阅读设置")
+        .accessibilityHint("调整字号、行距、字体与阅读配色")
+    }
+
     @ViewBuilder private var detail: some View {
         if let item = model.selected {
             VStack(alignment: .leading, spacing: 0) {
@@ -431,6 +485,9 @@ struct ReaderView: View {
                     ToolbarItem(placement: .principal) {
                         Text(item.title).font(.subheadline.weight(.medium))
                             .lineLimit(1).truncationMode(.tail)
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        readingSettingsButton
                     }
                 }
             }
@@ -1153,6 +1210,7 @@ private struct HTMLReader: UIViewRepresentable {
         :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
         .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:16px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
         main blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid rgba(128,128,128,.35); color: inherit; opacity: .82; }
+        main hr { border: 0; height: 1px; background: currentColor; opacity: .18; margin: 1.8em 0; }
         main p:last-child { margin-bottom: 0; }
         main figure { margin: .8em 0; }
         main figcaption { margin-top: .4em; font-size: .8em; line-height: 1.5; text-align: center; opacity: .68; }

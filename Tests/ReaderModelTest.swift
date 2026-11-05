@@ -22,7 +22,7 @@ final class FixtureSource: ReadingSource {
         first = item("first"); middle = item("middle"); last = item("last")
     }
     func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem> { Page(items: [], next: nil) }
-    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?) { ("读者", nil, "爱阅读") }
+    func currentUser() async throws -> (name: String, avatar: URL?, headline: String?, token: String?) { ("读者", nil, "爱阅读", "test-reader") }
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
         answerRequests += 1
         if let anchorPage {
