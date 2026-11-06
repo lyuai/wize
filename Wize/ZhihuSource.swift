@@ -566,9 +566,12 @@ private func htmlTagAttribute(_ name: String, in tag: String) -> String? {
 }
 
 func expandedImageHTML(_ html: String) -> String {
-    guard let regex = try? NSRegularExpression(pattern: #"(?i)<img\b[^>]*>"#) else { return html }
-    var result = html
-    let matches = regex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+    // Zhihu often wraps images in links to the full-size asset. The reader has
+    // its own tap-to-preview gesture, so unwrap those links first to avoid the
+    // web view also navigating while the preview opens.
+    var result = unwrapImageLinks(html)
+    guard let regex = try? NSRegularExpression(pattern: #"(?i)<img\b[^>]*>"#) else { return result }
+    let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
     for match in matches.reversed() {
         guard let range = Range(match.range, in: result) else { continue }
         let tag = String(result[range])
@@ -583,6 +586,20 @@ func expandedImageHTML(_ html: String) -> String {
             attributes += " width=\"\(rawWidth)\" height=\"\(rawHeight)\""
         }
         result.replaceSubrange(range, with: newTag.replacingOccurrences(of: "<img", with: "<img \(attributes)", options: .caseInsensitive))
+    }
+    return result
+}
+
+private func unwrapImageLinks(_ html: String) -> String {
+    guard let regex = try? NSRegularExpression(pattern: #"(?is)<a\b[^>]*>(.*?)</a\s*>"#) else { return html }
+    let matches = regex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+    var result = html
+    for match in matches.reversed() {
+        guard let whole = Range(match.range, in: result),
+              let innerRange = Range(match.range(at: 1), in: html) else { continue }
+        let inner = String(html[innerRange])
+        guard inner.range(of: "<img", options: .caseInsensitive) != nil else { continue }
+        result.replaceSubrange(whole, with: inner)
     }
     return result
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import SafariServices
 
 /// The answer at the reading focus. It is deliberately separate from
 /// `ReaderModel.selected`: scrolling across answer boundaries should refresh the
@@ -26,9 +27,12 @@ struct ReaderView: View {
     @State private var showsAccountMenu = false
     @State private var showsAbout = false
     @State private var showsFeedback = false
+    @State private var feedbackSubmitted = false
+    @State private var showsFeedbackThanks = false
     @State private var accountDestination: AccountDestination?
     @State private var profileItem: ReadingItem?
     @State private var collectionItem: ReadingItem?
+    @State private var webLink: ReaderWebLink?
     @State private var collectedKeys: Set<String> = []
     // A reference type kept in @State on purpose: `@StateObject` would make this
     // screen observe every reading-focus change and bring the per-switch rebuild
@@ -58,8 +62,21 @@ struct ReaderView: View {
         }
         .sheet(isPresented: $showsReadingSettings) { ReadingSettingsView() }
         .sheet(isPresented: $showsAbout) { AboutView() }
-        .sheet(isPresented: $showsFeedback) { FeedbackView(context: feedbackContext) }
+        .sheet(isPresented: $showsFeedback, onDismiss: {
+            if feedbackSubmitted {
+                feedbackSubmitted = false
+                showsFeedbackThanks = true
+            }
+        }) {
+            FeedbackView(context: feedbackContext, onSubmitted: { feedbackSubmitted = true })
+        }
+        .fullScreenCover(isPresented: $showsFeedbackThanks) {
+            FeedbackThanksView { showsFeedbackThanks = false }
+        }
         .sheet(item: $profileItem) { AuthorProfileView(item: $0) }
+        .sheet(item: $webLink) { link in
+            SafariView(url: link.url).ignoresSafeArea()
+        }
         .sheet(item: $collectionItem) { item in
             CollectionPickerView(item: item) { saved in
                 if saved { collectedKeys.insert(item.key) } else { collectedKeys.remove(item.key) }
@@ -112,6 +129,14 @@ struct ReaderView: View {
         guard usesWideLayout, model.selected == nil, model.question == nil,
               let first = model.feeds[model.channel]?.first else { return }
         model.open(first)
+    }
+
+    private func openWebLink(_ url: URL) {
+        if url.scheme == "http" || url.scheme == "https" {
+            webLink = ReaderWebLink(url: url)
+        } else {
+            UIApplication.shared.open(url)
+        }
     }
 
     private var wideLayout: some View {
@@ -489,6 +514,7 @@ struct ReaderView: View {
                             }
                         },
                         onNearEnd: { Task { await model.loadMoreStream() } },
+                        onOpenLink: openWebLink,
                         onOpenImage: { url, frame in ImagePreviewPresenter.shared.present(url: url, sourceFrame: frame) }
                     )
                     .id(model.streamAnchor?.key ?? item.key)
@@ -828,8 +854,12 @@ private struct ReaderActionOverlay: View {
                     .frame(width: layout == .trailing ? 56 : 52, height: 52)
             }
             .accessibilityLabel("查看作者：\(item.author.isEmpty ? "匿名用户" : item.author)")
-            Button { Task { await model.toggleVote(.up, for: item) } } label: {
-                actionLabel(item.vote == .up ? "hand.thumbsup.fill" : "hand.thumbsup", item.upCount)
+            VoteActionButton(
+                isOn: item.vote == .up,
+                count: item.upCount,
+                vertical: layout == .trailing
+            ) {
+                Task { await model.toggleVote(.up, for: item) }
             }
             .disabled(model.voting)
             .accessibilityLabel(item.vote == .up ? "取消赞同" : "赞同")
@@ -862,6 +892,112 @@ private struct ReaderActionOverlay: View {
             }.fixedSize(horizontal: true, vertical: false)
                 .frame(maxWidth: .infinity, minHeight: 52)
         }
+    }
+}
+
+private struct VoteActionButton: View {
+    let isOn: Bool
+    let count: Int?
+    let vertical: Bool
+    let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var burst = 0
+    @State private var showsBurst = false
+
+    var body: some View {
+        Button {
+            showsBurst = !isOn && !reduceMotion
+            burst += 1
+            action()
+        } label: {
+            if vertical {
+                VStack(spacing: 4) {
+                    icon.frame(height: 22)
+                    countText.font(.system(size: 10, weight: .medium))
+                }
+                .frame(width: 56, height: 52)
+                .contentShape(Rectangle())
+            } else {
+                HStack(spacing: 4) {
+                    icon
+                    countText.font(.system(size: 12, weight: .medium))
+                }
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(maxWidth: .infinity, minHeight: 52)
+                .contentShape(Rectangle())
+            }
+        }
+        .buttonStyle(VotePressStyle())
+        .sensoryFeedback(.impact(weight: .light, intensity: 0.7), trigger: burst)
+    }
+
+    private var icon: some View {
+        ZStack {
+            if showsBurst {
+                LikeBurst().id(burst)
+            }
+            Image(systemName: isOn ? "hand.thumbsup.fill" : "hand.thumbsup")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(isOn ? ReaderPalette.accent : Color.primary)
+                .symbolEffect(.bounce, options: .speed(1.15), value: reduceMotion ? -1 : burst)
+                .contentTransition(.symbolEffect(.replace))
+                .animation(.easeInOut(duration: 0.18), value: isOn)
+        }
+        .frame(width: 26, height: 22)
+    }
+
+    private var countText: some View {
+        Text(displayCount(count))
+            .monospacedDigit()
+            .foregroundStyle(isOn ? ReaderPalette.accent : Color.primary)
+            .contentTransition(.numericText(value: Double(count ?? 0)))
+            .animation(.snappy(duration: 0.28), value: count)
+            .animation(.easeInOut(duration: 0.18), value: isOn)
+    }
+}
+
+private struct VotePressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.88 : 1)
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .animation(.spring(response: 0.24, dampingFraction: 0.62), value: configuration.isPressed)
+    }
+}
+
+private struct LikeBurst: View {
+    @State private var expanded = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(ReaderPalette.accent.opacity(0.5), lineWidth: 1)
+                .frame(width: 18, height: 18)
+                .scaleEffect(expanded ? 2.05 : 0.55)
+                .opacity(expanded ? 0 : 0.85)
+            ForEach(0..<7, id: \.self) { index in
+                let angle = Double(index) / 7 * .pi * 2 - .pi / 2
+                Circle()
+                    .fill(ReaderPalette.accent.opacity(index.isMultiple(of: 2) ? 0.9 : 0.55))
+                    .frame(width: index.isMultiple(of: 2) ? 3.5 : 2.2,
+                           height: index.isMultiple(of: 2) ? 3.5 : 2.2)
+                    .offset(x: expanded ? cos(angle) * 16 : 0,
+                            y: expanded ? sin(angle) * 16 : 0)
+                    .scaleEffect(expanded ? 0.2 : 1)
+                    .opacity(expanded ? 0 : 1)
+            }
+            Image(systemName: "sparkle")
+                .font(.system(size: 7, weight: .semibold))
+                .foregroundStyle(ReaderPalette.accent)
+                .offset(x: 11, y: -13)
+                .scaleEffect(expanded ? 0.2 : 1)
+                .opacity(expanded ? 0 : 1)
+        }
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.58)) { expanded = true }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -1279,6 +1415,23 @@ private func htmlEscape(_ value: String) -> String {
         .replacingOccurrences(of: "\"", with: "&quot;")
 }
 
+private struct ReaderWebLink: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+private struct SafariView: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let configuration = SFSafariViewController.Configuration()
+        configuration.entersReaderIfAvailable = false
+        let controller = SFSafariViewController(url: url, configuration: configuration)
+        controller.dismissButtonStyle = .close
+        return controller
+    }
+    func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
+}
+
 private struct HTMLReader: UIViewRepresentable {
     let html: String
     let item: ReadingItem
@@ -1289,6 +1442,7 @@ private struct HTMLReader: UIViewRepresentable {
     var scrollRequest: ReaderModel.ScrollRequest? = nil
     var onVisibleAnswer: (String) -> Void = { _ in }
     var onNearEnd: () -> Void = {}
+    var onOpenLink: (URL) -> Void = { _ in }
     var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
     @ObservedObject private var fontManager = ReadingFontManager.shared
     @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
@@ -1337,6 +1491,7 @@ private struct HTMLReader: UIViewRepresentable {
         view.scrollView.pinchGestureRecognizer?.isEnabled = false
         view.allowsBackForwardNavigationGestures = false
         view.navigationDelegate = context.coordinator
+        view.uiDelegate = context.coordinator
         view.scrollView.delegate = context.coordinator
         let imageTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(HTMLReader.Coordinator.handleImageTap(_:)))
         imageTap.cancelsTouchesInView = false
@@ -1402,6 +1557,7 @@ private struct HTMLReader: UIViewRepresentable {
         let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(fontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
         context.coordinator.onVisibleAnswer = onVisibleAnswer
         context.coordinator.onNearEnd = onNearEnd
+        context.coordinator.onOpenLink = onOpenLink
         context.coordinator.onOpenImage = onOpenImage
         context.coordinator.onChromeVisibility = onChromeVisibility
         context.coordinator.streamEnabled = !stream.isEmpty
@@ -1433,7 +1589,7 @@ private struct HTMLReader: UIViewRepresentable {
         let sections = sectionList.joined()
         let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
-        :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
+        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
         .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:16px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
         main blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid rgba(128,128,128,.35); color: inherit; opacity: .82; }
         main img.emojione, main img.ztext-emoji { display: inline-block; vertical-align: -0.18em; margin: 0 .06em; border-radius: 0; }
@@ -1541,7 +1697,7 @@ private struct HTMLReader: UIViewRepresentable {
         return hasher.finalize()
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
-    final class Coordinator: NSObject, WKNavigationDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         var lastHTML = ""
         var lastDocumentKey: Int?
         var previousCount = 0
@@ -1576,6 +1732,7 @@ private struct HTMLReader: UIViewRepresentable {
         private var lastScrollOffsetY: CGFloat = 0
         private var scrollAccum: CGFloat = 0
         private weak var webView: WKWebView?
+        var onOpenLink: (URL) -> Void = { _ in }
         var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
 
         func attach(_ webView: WKWebView) { self.webView = webView }
@@ -1678,6 +1835,45 @@ private struct HTMLReader: UIViewRepresentable {
                 }
             }
         }
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard navigationAction.navigationType == .linkActivated,
+                  let url = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+            let scheme = url.scheme?.lowercased()
+            if scheme == "http" || scheme == "https" {
+                if url.fragment != nil, let current = webView.url,
+                   current.host == url.host, current.path == url.path {
+                    decisionHandler(.allow)
+                    return
+                }
+                decisionHandler(.cancel)
+                if !isImageURL(url) { onOpenLink(url) }
+                return
+            }
+            decisionHandler(.cancel)
+            if scheme == "mailto" || scheme == "tel" { onOpenLink(url) }
+        }
+
+        func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                     for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+            if let url = navigationAction.request.url,
+               (url.scheme == "http" || url.scheme == "https"),
+               !isImageURL(url) {
+                onOpenLink(url)
+            }
+            return nil
+        }
+
+        private func isImageURL(_ url: URL) -> Bool {
+            let extensions: Set<String> = ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "tiff"]
+            if extensions.contains(url.pathExtension.lowercased()) { return true }
+            guard let host = url.host?.lowercased() else { return false }
+            return host == "zhimg.com" || host.hasSuffix(".zhimg.com")
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             self.webView = webView
             loadingDocument = false

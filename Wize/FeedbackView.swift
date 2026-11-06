@@ -18,6 +18,7 @@ struct FeedbackContext: Equatable {
 /// 问题反馈与建议：文本 + 可选图片附件 + 可选邮箱，直接提交到项目仓库的 Issues。
 struct FeedbackView: View {
     var context: FeedbackContext = FeedbackContext()
+    var onSubmitted: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
 
@@ -27,7 +28,6 @@ struct FeedbackView: View {
     @State private var attachments: [UIImage] = []
     @State private var isSubmitting = false
     @State private var errorMessage: String?
-    @State private var didSubmit = false
     @State private var includesContext = true
     @FocusState private var focusedField: Field?
 
@@ -159,38 +159,9 @@ struct FeedbackView: View {
             } message: {
                 Text(errorMessage ?? "")
             }
-            .overlay {
-                if didSubmit {
-                    successOverlay
-                }
-            }
             .tint(sage)
         }
         .presentationDetents([.large])
-    }
-
-    private var successOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.12).ignoresSafeArea()
-            VStack(spacing: 14) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 52))
-                    .foregroundStyle(sage)
-                Text("已收到你的反馈")
-                    .font(.headline)
-                Text("感谢你的建议，我们会尽快处理。")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Button("完成") { dismiss() }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, 4)
-            }
-            .padding(28)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .padding(.horizontal, 40)
-        }
-        .transition(.opacity)
     }
 
     @MainActor
@@ -214,7 +185,8 @@ struct FeedbackView: View {
                 attachments: attachments,
                 context: includesContext ? context : nil
             )
-            didSubmit = true
+            onSubmitted()
+            dismiss()
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? "提交失败，请稍后再试。"
         }
@@ -243,6 +215,130 @@ struct FeedbackView: View {
     private static func isValidEmail(_ value: String) -> Bool {
         let pattern = #"^[A-Z0-9a-z._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"#
         return value.range(of: pattern, options: .regularExpression) != nil
+    }
+}
+
+struct FeedbackThanksView: View {
+    let onFinished: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var appeared = false
+    @State private var finished = false
+    @State private var burst = 0
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color(red: 0.21, green: 0.30, blue: 0.26),
+                         Color(red: 0.36, green: 0.47, blue: 0.40)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            Circle()
+                .fill(Color.white.opacity(0.14))
+                .frame(width: 360, height: 360)
+                .blur(radius: 80)
+                .scaleEffect(appeared ? 1 : 0.6)
+                .opacity(appeared ? 0.9 : 0)
+
+            ThanksRings(appeared: appeared, reduceMotion: reduceMotion)
+
+            VStack(spacing: 24) {
+                ZStack {
+                    Circle()
+                        .fill(Color(red: 0.96, green: 0.95, blue: 0.90))
+                        .frame(width: 132, height: 132)
+                        .shadow(color: .black.opacity(0.18), radius: 24, y: 12)
+                    Circle()
+                        .strokeBorder(Color(red: 0.30, green: 0.41, blue: 0.36).opacity(0.22), lineWidth: 1)
+                        .frame(width: 104, height: 104)
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 48, weight: .medium))
+                        .foregroundStyle(Color(red: 0.25, green: 0.36, blue: 0.30))
+                        .scaleEffect(appeared ? 1 : 0.5)
+                        .opacity(appeared ? 1 : 0)
+                        .animation(reduceMotion ? .easeOut(duration: 0.2)
+                                                 : .spring(response: 0.5, dampingFraction: 0.62),
+                                   value: appeared)
+                }
+                .scaleEffect(appeared ? 1 : 0.72)
+                .animation(reduceMotion ? .easeOut(duration: 0.25)
+                                         : .spring(response: 0.52, dampingFraction: 0.7),
+                           value: appeared)
+
+                VStack(spacing: 10) {
+                    Text("谢谢你的反馈")
+                        .font(.system(size: 26, weight: .semibold, design: .serif))
+                    Text("每一条建议，都会让这里更安静一点。")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.72))
+                        .multilineTextAlignment(.center)
+                }
+                .foregroundStyle(Color(red: 0.98, green: 0.97, blue: 0.93))
+                .opacity(appeared ? 1 : 0)
+                .offset(y: appeared ? 0 : 12)
+                .animation(.easeOut(duration: 0.5).delay(0.12), value: appeared)
+            }
+            .padding(.horizontal, 36)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(red: 0.21, green: 0.30, blue: 0.26).ignoresSafeArea())
+        .statusBarHidden()
+        .contentShape(Rectangle())
+        .onTapGesture { finish() }
+        .task {
+            burst += 1
+            withAnimation(reduceMotion ? .easeOut(duration: 0.25)
+                                        : .spring(response: 0.55, dampingFraction: 0.74)) {
+                appeared = true
+            }
+            try? await Task.sleep(for: .seconds(reduceMotion ? 1.4 : 2.6))
+            guard !Task.isCancelled else { return }
+            finish()
+        }
+        .sensoryFeedback(.success, trigger: burst)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("反馈已提交，谢谢你的反馈")
+    }
+
+    private func finish() {
+        guard !finished else { return }
+        finished = true
+        onFinished()
+    }
+}
+
+private struct ThanksRings: View {
+    let appeared: Bool
+    let reduceMotion: Bool
+
+    var body: some View {
+        ZStack {
+            if !reduceMotion {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                        .frame(width: 150, height: 150)
+                        .scaleEffect(appeared ? 1.5 + CGFloat(index) * 0.36 : 0.62)
+                        .opacity(appeared ? 0 : 0.8)
+                        .animation(.easeOut(duration: 1.5).delay(Double(index) * 0.1), value: appeared)
+                }
+                ForEach(0..<9, id: \.self) { index in
+                    let angle = Double(index) / 9 * .pi * 2 - .pi / 2
+                    Circle()
+                        .fill(Color(red: 0.96, green: 0.95, blue: 0.90).opacity(index.isMultiple(of: 2) ? 0.85 : 0.5))
+                        .frame(width: index.isMultiple(of: 2) ? 5 : 3,
+                               height: index.isMultiple(of: 2) ? 5 : 3)
+                        .offset(x: appeared ? cos(angle) * 118 : 0,
+                                y: appeared ? sin(angle) * 118 : 0)
+                        .scaleEffect(appeared ? 0.2 : 1)
+                        .opacity(appeared ? 0 : 1)
+                        .animation(.easeOut(duration: 1.15).delay(0.05), value: appeared)
+                }
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 
