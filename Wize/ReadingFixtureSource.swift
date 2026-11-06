@@ -57,7 +57,7 @@ final class ReadingFixtureSource: ReadingSource {
         return AnswerVoteResult(vote: vote, upCount: nil, downCount: nil)
     }
     func comments(_ item: ReadingItem, next: URL?) async throws -> Page<ReadingComment> {
-        var comment = ReadingComment(id: "sample-comment", author: "一位读者", html: "<p>很喜欢这段话，读完想再慢慢想一会儿。</p>", likes: 12)
+        var comment = ReadingComment(id: "sample-comment", author: "一位读者", html: "<p>很喜欢这段话[调皮][吃瓜]，读完想再慢慢想一会儿[微笑]。</p>", likes: 12)
         comment.replyCount = 2
         return Page(items: [comment], next: nil)
     }

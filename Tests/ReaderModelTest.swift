@@ -10,6 +10,7 @@ final class FixtureSource: ReadingSource {
     var omitFirst = false
     var paged = false
     var commentRequests = 0
+    var detailRequests = 0
     var commentDelay: UInt64 = 0
     var votes: [String: AnswerVote] = [:]
     var detailDelay: UInt64 = 0
@@ -40,6 +41,7 @@ final class FixtureSource: ReadingSource {
         return Page(items: available, next: nil)
     }
     func detail(_ item: ReadingItem, prefetch: Bool) async throws -> ReadingItem {
+        detailRequests += 1
         var result = item
         result.vote = votes[item.id] ?? .neutral
         if detailDelay > 0 { try await Task.sleep(nanoseconds: detailDelay) }
@@ -243,6 +245,22 @@ struct ReaderModelTest {
             return false
         }
         precondition(!FileManager.default.fileExists(atPath: failingManager.fontFileURL(for: targetFont).path), "Invalid font data must not be persisted")
+
+        // Switching the visible answer while scrolling is a pure state update: the
+        // stream already carries the content, so no detail request may be issued.
+        let streamSource = FixtureSource()
+        let streamModel = ReaderModel(source: streamSource)
+        streamModel.question = ReadingItem(id: "q", kind: .question, title: "问题", excerpt: "", author: "", questionID: nil)
+        await streamModel.loadAnswers()
+        streamModel.selectAnswer(streamSource.middle)
+        await waitFor { streamModel.streamItems.count == 3 && streamModel.selected?.id == "middle" }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let requestsBeforeSwitch = streamSource.detailRequests
+        streamModel.setVisibleAnswer("first")
+        streamModel.setVisibleAnswer("last")
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        precondition(streamSource.detailRequests == requestsBeforeSwitch, "Switching the visible answer must not refetch the detail")
+        precondition(streamModel.selected?.id == "last", "The visible answer must follow the reading focus")
 
         print("PASS: sorting, current answer, comment ownership, stale responses and on-demand fonts")
     }

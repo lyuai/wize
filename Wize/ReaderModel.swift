@@ -348,15 +348,35 @@ final class ReaderModel: ObservableObject {
         Task { await loadMoreStream() }
     }
 
+    /// Switching the visible answer while scrolling stays in-memory: the stream
+    /// already carries this answer's content, counts and vote state. Refetching the
+    /// detail here ran once per answer boundary crossed, forcing an extra network
+    /// request and a second `selected` update on every switch.
     func setVisibleAnswer(_ id: String) {
         guard let item = streamItems.first(where: { $0.id == id }), item.key != selected?.key else { return }
-        selected = item; voting = false; voteError = nil
-        let key = item.key
-        let revision = voteRevisions[key, default: 0]
-        Task {
-            if let detail = try? await source.detail(item, prefetch: false), selected?.key == key, !voting,
-               voteRevisions[key, default: 0] == revision { selected = detail }
-        }
+        selected = item
+        voting = false
+        voteError = nil
+    }
+
+    /// Makes `item` the answer that the floating actions and comments act on when
+    /// the visible answer has scrolled away from the one originally opened. This is
+    /// a user-initiated change, so publishing `selected` here is acceptable.
+    func activate(_ item: ReadingItem) {
+        guard item.key != selected?.key else { return }
+        selected = item
+        voting = false
+        voteError = nil
+    }
+
+    func toggleVote(_ direction: AnswerVote, for item: ReadingItem) async {
+        activate(item)
+        await toggleVote(direction)
+    }
+
+    func showComments(for item: ReadingItem) {
+        activate(item)
+        showComments()
     }
 
     func toggleVote(_ direction: AnswerVote) async {

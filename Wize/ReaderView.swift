@@ -1,12 +1,27 @@
 import SwiftUI
 import WebKit
 
+/// The answer at the reading focus. It is deliberately separate from
+/// `ReaderModel.selected`: scrolling across answer boundaries should refresh the
+/// floating actions, not rebuild the whole reading screen.
+@MainActor
+final class ReadingFocus: ObservableObject {
+    @Published var item: ReadingItem?
+}
+
+/// Whether the reading chrome (reading settings / account) is showing. Kept in its
+/// own store so hiding it while scrolling never rebuilds the reading screen.
+@MainActor
+final class ReadingChrome: ObservableObject {
+    @Published var showsControls = true
+}
+
 struct ReaderView: View {
     @EnvironmentObject private var model: ReaderModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var phonePath: [PhonePage] = []
     @State private var availableWidth: CGFloat = 0
-    @State private var showsPinnedTitle = false
+    @State private var chrome = ReadingChrome()
     @State private var showsReadingSettings = false
     @State private var showsAccountMenu = false
     @State private var showsAbout = false
@@ -15,6 +30,10 @@ struct ReaderView: View {
     @State private var profileItem: ReadingItem?
     @State private var collectionItem: ReadingItem?
     @State private var collectedKeys: Set<String> = []
+    // A reference type kept in @State on purpose: `@StateObject` would make this
+    // screen observe every reading-focus change and bring the per-switch rebuild
+    // back. Only the floating actions observe the store.
+    @State private var focus = ReadingFocus()
     @State private var collapsedComments: Set<String> = []
     private let collectionSource = ZhihuSource()
     @AppStorage("reading.theme") private var readingTheme = "system"
@@ -69,7 +88,7 @@ struct ReaderView: View {
         .onChange(of: model.channel) { _ in selectInitialContentIfNeeded() }
         .onChange(of: model.showsComments) { if $0 { collapsedComments = [] } }
         .onChange(of: model.answerSort) { _ in Task { await model.loadAnswers() } }
-        .onChange(of: model.streamAnchor?.key) { _ in showsPinnedTitle = false }
+        .onChange(of: model.selected?.key) { _ in focus.item = model.selected }
         .onChange(of: model.feeds[model.channel]) { _ in selectInitialContentIfNeeded() }
         .onChange(of: model.answers) { answers in
             if usesWideLayout, model.question != nil, model.selected == nil, let first = answers.first {
@@ -110,39 +129,49 @@ struct ReaderView: View {
                     }
                     .background(ReaderPalette.directory)
                     .frame(width: geometry.size.width * 0.36)
-                    Divider()
-                    NavigationStack {
-                        detail.toolbar {
-                            ToolbarItem(placement: .principal) {
-                                if showsPinnedTitle, let title = model.selected?.title ?? model.question?.title {
-                                    Text(title).font(.subheadline.weight(.medium)).lineLimit(1).truncationMode(.tail)
-                                        .frame(width: max(geometry.size.width * 0.64 - 110, 180), alignment: .leading)
-                                }
-                            }
-                            ToolbarItem(placement: .navigationBarTrailing) {
-                                readingSettingsButton
-                            }
-                            ToolbarItem(placement: .navigationBarTrailing) {
-                                accountMenu
-                            }
-                            if model.channel == .hot && model.question != nil {
-                                ToolbarItem(placement: .navigationBarTrailing) {
-                                    Picker("回答排序", selection: $model.answerSort) {
-                                        Text("热度").tag("default"); Text("时间").tag("updated")
-                                    }.pickerStyle(.menu)
-                                }
-                            }
-                        }
-                    }
+                    detail
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .overlay(alignment: .topTrailing) {
+                            ReaderChromeCapsule(chrome: chrome) {
+                                HStack(spacing: 0) {
+                                    if model.channel == .hot && model.question != nil {
+                                        Picker("回答排序", selection: $model.answerSort) {
+                                            Text("热度").tag("default")
+                                            Text("时间").tag("updated")
+                                        }
+                                        .pickerStyle(.menu)
+                                        .frame(height: 44)
+                                    }
+                                    readingSettingsButton
+                                        .frame(width: 44, height: 44)
+                                        .contentShape(Rectangle())
+                                    accountMenu
+                                }
+                            }
+                            .padding(.top, 6)
+                            .padding(.trailing, 12)
+                        }
+                        .background(readingBackground.ignoresSafeArea())
                 }
+                // The directory rail sits above the reading page, so its shadow
+                // falls onto the page's leading edge instead of its own. Drawn
+                // as a full-bleed layer so it runs the whole screen height,
+                // including both safe areas.
+                HStack(spacing: 0) {
+                    Color.clear.frame(width: geometry.size.width * 0.36)
+                    directoryEdgeShadow.frame(width: 20)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .ignoresSafeArea(edges: .vertical)
+                .allowsHitTesting(false)
                 if model.showsComments {
                     Color.black.opacity(0.001)
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
                         .onTapGesture { model.showsComments = false }
                     NavigationStack { commentList }
-                        .frame(width: min(max(geometry.size.width * 0.36, 320), 420))
+                        .frame(width: min(max(geometry.size.width * 0.38, 360), 480))
                         .frame(maxHeight: .infinity)
                         .background(Color(uiColor: .systemBackground))
                         .clipShape(RoundedRectangle(cornerRadius: 18))
@@ -161,6 +190,28 @@ struct ReaderView: View {
             }
             .animation(.easeInOut(duration: 0.22), value: model.showsComments)
         }
+    }
+
+    /// A gradient stand-in for the shadow the directory rail casts onto the
+    /// reading page. It replaces the hard `Divider` so the two columns share
+    /// the paper cards' softened, floating edge language. Kept as a scrim
+    /// instead of `.shadow` so the page's WKWebView is never rasterized into
+    /// an offscreen shadow layer while scrolling.
+    private var directoryEdgeShadow: some View {
+        LinearGradient(
+            stops: [
+                .init(color: ReaderPalette.edgeShadow, location: 0),
+                .init(color: ReaderPalette.edgeShadow.opacity(0.58), location: 0.24),
+                .init(color: ReaderPalette.edgeShadow.opacity(0.24), location: 0.55),
+                .init(color: ReaderPalette.edgeShadow.opacity(0.06), location: 0.82),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+        .frame(width: 20)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private var channelPicker: some View {
@@ -425,18 +476,20 @@ struct ReaderView: View {
                         html: html,
                         item: model.streamAnchor ?? item,
                         stream: model.streamItems,
-                        activeItem: item,
                         paperCards: usesWideLayout,
-                        onTitleHidden: { if usesWideLayout && showsPinnedTitle != $0 { showsPinnedTitle = $0 } },
+                        onChromeVisibility: { chrome.showsControls = $0 },
                         scrollRequest: model.scrollRequest,
                         onVisibleAnswer: { id in
-                            model.setVisibleAnswer(id)
-                            if let index = model.streamItems.firstIndex(where: { $0.id == id }) {
-                                let urls = Array(model.streamItems.dropFirst(max(0, index - 1)).prefix(6)).compactMap(\.avatarURL)
-                                Task { await AvatarCache.shared.prefetch(urls) }
+                            guard let answer = model.streamItems.first(where: { $0.id == id }) else { return }
+                            if focus.item?.key != answer.key { focus.item = answer }
+                            // Only the edge action avatar is drawn by SwiftUI; the
+                            // stream's own avatars are loaded by the web view.
+                            if let url = answer.avatarURL {
+                                Task { await AvatarCache.shared.prefetch([url]) }
                             }
                         },
-                        onNearEnd: { Task { await model.loadMoreStream() } }
+                        onNearEnd: { Task { await model.loadMoreStream() } },
+                        onOpenImage: { url, frame in ImagePreviewPresenter.shared.present(url: url, sourceFrame: frame) }
                     )
                     .id(model.streamAnchor?.key ?? item.key)
                     .ignoresSafeArea(.container, edges: usesWideLayout ? [] : .bottom)
@@ -461,14 +514,20 @@ struct ReaderView: View {
             .background(readingBackground.ignoresSafeArea(edges: .bottom))
             .overlay(alignment: .trailing) {
                 if usesWideLayout, !model.showsComments, model.bodyHTML != nil {
-                    VStack(spacing: 2) { answerActions(item) }
+                    ReaderActionOverlay(focus: focus, model: model, layout: .trailing,
+                                        collectedKeys: collectedKeys,
+                                        onProfile: { profileItem = $0 },
+                                        onCollect: { collectionItem = $0 })
                         .readerGlassCapsule()
                         .padding(.trailing, 12)
                 }
             }
             .overlay(alignment: .bottom) {
                 if !usesWideLayout, model.bodyHTML != nil {
-                    HStack(spacing: 0) { answerActions(item) }
+                    ReaderActionOverlay(focus: focus, model: model, layout: .bottom,
+                                        collectedKeys: collectedKeys,
+                                        onProfile: { profileItem = $0 },
+                                        onCollect: { collectionItem = $0 })
                         .frame(maxWidth: 260)
                         .readerGlassCapsule()
                         .padding(.horizontal, 16)
@@ -499,48 +558,14 @@ struct ReaderView: View {
         }
     }
 
-    @ViewBuilder private func answerActions(_ item: ReadingItem) -> some View {
-        if item.kind == .answer {
-            Button { profileItem = item } label: {
-                AvatarView(url: item.avatarURL, size: 36)
-                    .frame(width: usesWideLayout ? 56 : 52, height: 52)
-            }.accessibilityLabel("查看作者：\(item.author.isEmpty ? "匿名用户" : item.author)")
-            Button { Task { await model.toggleVote(.up) } } label: {
-                actionLabel(item.vote == .up ? "hand.thumbsup.fill" : "hand.thumbsup", item.upCount)
-            }.disabled(model.voting).accessibilityLabel(item.vote == .up ? "取消赞同" : "赞同")
-        }
-        Button { model.showComments() } label: {
-            actionLabel("bubble.right", item.commentCount)
-        }.accessibilityLabel("查看评论")
-        if item.kind == .answer || item.kind == .article {
-            Button { collectionItem = item } label: {
-                Image(systemName: collectedKeys.contains(item.key) ? "star.fill" : "star")
-                    .font(.system(size: 18, weight: .medium))
-                    .frame(width: 52, height: 52)
-            }.accessibilityLabel(collectedKeys.contains(item.key) ? "管理收藏，已收藏" : "收藏")
-        }
-    }
-
-    @ViewBuilder private func actionLabel(_ icon: String, _ count: Int?) -> some View {
-        if usesWideLayout {
-            VStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: 17, weight: .medium))
-                Text(displayCount(count)).font(.system(size: 10, weight: .medium)).monospacedDigit()
-            }.frame(width: 56, height: 52)
-        } else {
-            HStack(spacing: 4) {
-                Image(systemName: icon).font(.system(size: 17, weight: .medium))
-                Text(displayCount(count)).font(.system(size: 12, weight: .medium)).monospacedDigit()
-            }.fixedSize(horizontal: true, vertical: false)
-                .frame(maxWidth: .infinity, minHeight: 52)
-        }
-    }
-
     private var commentList: some View {
         let rows = commentTreeRows(model.comments.flatMap { [$0] + (model.commentReplies[$0.id] ?? []) }, collapsed: collapsedComments)
         return List {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                 let comment = row.comment
+                let depth = min(row.depth, 3)
+                let isEndOfBranch = index + 1 == rows.count || rows[index + 1].depth == 0
+                let root = rows[...index].last(where: { $0.depth == 0 })?.comment
                 VStack(alignment: .leading, spacing: 7) {
                     commentRow(comment)
                     if row.hasChildren {
@@ -554,60 +579,29 @@ struct ReaderView: View {
                                 .foregroundStyle(ReaderPalette.accent)
                         }
                         .buttonStyle(.plain)
+                        .padding(.leading, 32)
                         .accessibilityLabel(isCollapsed ? "展开 \(count) 条回复" : "收起 \(count) 条回复")
                     }
+                    if isEndOfBranch, let root, !collapsedComments.contains(root.id),
+                       root.replyCount > 0 || model.replyNext[root.id] != nil {
+                        replyPagination(for: root)
+                            .padding(.leading, 32)
+                    }
                 }
-                .padding(.leading, CGFloat(min(row.depth, 3)) * 16)
-                .padding(.top, row.depth == 0 && index > 0 ? 4 : 0)
+                .padding(.leading, CGFloat(depth) * 24)
+                .padding(.top, row.depth == 0 ? (index == 0 ? 4 : 12) : 6)
+                .padding(.bottom, row.depth == 0 ? 4 : 6)
                 .overlay(alignment: .leading) {
-                    if row.depth > 0 {
-                        Rectangle().fill(ReaderPalette.accent.opacity(0.25)).frame(width: 1)
-                            .padding(.leading, CGFloat(min(row.depth, 3) - 1) * 16 + 5)
+                    if depth > 0 {
+                        commentThreadLines(depth: depth, index: index, rows: rows)
                     }
                 }
                 .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
+                .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
                 .task { await AvatarCache.shared.prefetch(Array(rows.dropFirst(index).prefix(6)).compactMap { $0.comment.avatarURL }) }
                 .task {
                     if index == rows.count - 1, model.canLoadMoreComments {
                         await model.loadComments()
-                    }
-                }
-                let isEndOfBranch = index + 1 == rows.count || rows[index + 1].depth == 0
-                let root = rows[...index].last(where: { $0.depth == 0 })?.comment
-                if isEndOfBranch, let root, !collapsedComments.contains(root.id), (root.replyCount > 0 || model.replyNext[root.id] != nil) {
-                    if model.loadingReplies.contains(root.id) {
-                        ProgressView().padding(.leading, 18).listRowSeparator(.hidden)
-                    } else if model.replyErrors[root.id] != nil {
-                        Button { Task { await model.loadReplies(to: root) } } label: {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.leading, 18)
-                        .listRowSeparator(.hidden)
-                        .accessibilityLabel("重试加载回复")
-                    } else if model.commentReplies[root.id] == nil || model.replyNext[root.id] != nil {
-                        let loaded = model.commentReplies[root.id]?.count ?? 0
-                        let remaining = model.commentReplies[root.id] == nil ? max(root.replyCount, 1) : max(root.replyCount - loaded, 0)
-                        Button {
-                            Task { await model.loadReplies(to: root) }
-                        } label: {
-                            if remaining > 0 {
-                                compactCount("bubble.right", count: remaining)
-                                    .font(.caption.weight(.medium))
-                                    .foregroundStyle(ReaderPalette.accent)
-                            } else {
-                                Image(systemName: "ellipsis")
-                                    .font(.caption.weight(.medium))
-                                    .foregroundStyle(ReaderPalette.accent)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.leading, 18)
-                        .listRowSeparator(.hidden)
-                        .accessibilityLabel(model.commentReplies[root.id] == nil ? "查看 \(root.replyCount) 条回复" : "加载更多回复")
                     }
                 }
             }
@@ -670,6 +664,66 @@ struct ReaderView: View {
             }
     }
 
+    /// Replies are joined by quiet vertical rules aligned under the parent comment's
+    /// avatar. A reply at depth d draws the rule of every ancestor level as well, so
+    /// the thread stays continuous when replies are nested; the rules start and end
+    /// with a soft cap instead of a cut-off stub.
+    private func commentThreadLines(depth: Int, index: Int, rows: [CommentTreeRow]) -> some View {
+        let previousDepth = index > 0 ? min(rows[index - 1].depth, 3) : -1
+        let nextDepth = index + 1 < rows.count ? min(rows[index + 1].depth, 3) : -1
+        return ZStack(alignment: .leading) {
+            ForEach(1...depth, id: \.self) { level in
+                let starts = previousDepth < level
+                let ends = nextDepth < level
+                UnevenRoundedRectangle(
+                    topLeadingRadius: starts ? 0.75 : 0,
+                    bottomLeadingRadius: ends ? 0.75 : 0,
+                    bottomTrailingRadius: ends ? 0.75 : 0,
+                    topTrailingRadius: starts ? 0.75 : 0
+                )
+                .fill(ReaderPalette.accent.opacity(0.32))
+                .frame(width: 1.5)
+                .padding(.leading, 12 + CGFloat(level - 1) * 24)
+            }
+        }
+        .frame(maxHeight: .infinity)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private func replyPagination(for root: ReadingComment) -> some View {
+        if model.loadingReplies.contains(root.id) {
+            ProgressView()
+        } else if model.replyErrors[root.id] != nil {
+            Button { Task { await model.loadReplies(to: root) } } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("重试加载回复")
+        } else if model.commentReplies[root.id] == nil || model.replyNext[root.id] != nil {
+            let loaded = model.commentReplies[root.id]?.count ?? 0
+            let remaining = model.commentReplies[root.id] == nil ? max(root.replyCount, 1) : max(root.replyCount - loaded, 0)
+            Button {
+                Task { await model.loadReplies(to: root) }
+            } label: {
+                if remaining > 0 {
+                    compactCount("bubble.right", count: remaining)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(ReaderPalette.accent)
+                } else {
+                    Image(systemName: "ellipsis")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(ReaderPalette.accent)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(model.commentReplies[root.id] == nil ? "查看 \(root.replyCount) 条回复" : "加载更多回复")
+        }
+    }
+
     private func commentRow(_ comment: ReadingComment) -> some View {
         HStack(alignment: .top, spacing: 8) {
             AvatarView(url: comment.avatarURL, size: 24)
@@ -696,11 +750,7 @@ struct ReaderView: View {
                             let text = htmlText(html)
                             if !text.isEmpty { CommentInlineText(text: text) }
                         case .image(let url):
-                            AnimatedCommentImage(url: url)
-                                .aspectRatio(4.0 / 3.0, contentMode: .fit)
-                                .frame(maxWidth: 400, maxHeight: 300)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                            CommentImageView(url: url)
                         }
                     }
             }
@@ -712,6 +762,107 @@ struct ReaderView: View {
         VStack(alignment: .leading, spacing: 8) { Text(message).foregroundStyle(.secondary); Button("重试") { Task { await action() } } }.padding(.vertical, 8)
     }
 
+}
+
+
+/// Floating reading chrome (reading settings / account). It fades out while the
+/// reader scrolls down so the page reads edge-to-edge, and comes back on scroll up
+/// or when the page is at the top. Only this capsule observes the visibility store.
+private struct ReaderChromeCapsule<Content: View>: View {
+    @ObservedObject var chrome: ReadingChrome
+    let content: Content
+
+    init(chrome: ReadingChrome, @ViewBuilder content: () -> Content) {
+        self.chrome = chrome
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .padding(.horizontal, 2)
+            .readerGlassCapsule()
+            .opacity(chrome.showsControls ? 1 : 0)
+            .allowsHitTesting(chrome.showsControls)
+            .accessibilityHidden(!chrome.showsControls)
+            .animation(.easeInOut(duration: 0.18), value: chrome.showsControls)
+    }
+}
+
+/// Floating reading actions for the answer at the reading focus. It observes the
+/// lightweight `ReadingFocus` store so scrolling across answer boundaries only
+/// refreshes this bar.
+private struct ReaderActionOverlay: View {
+    enum Layout { case trailing, bottom }
+
+    @ObservedObject var focus: ReadingFocus
+    @ObservedObject var model: ReaderModel
+    let layout: Layout
+    let collectedKeys: Set<String>
+    var onProfile: (ReadingItem) -> Void
+    var onCollect: (ReadingItem) -> Void
+
+    private var item: ReadingItem? {
+        // Prefer the newest copy of the focused answer so vote counts and vote
+        // state reflect changes without rebuilding the reading screen.
+        if let key = focus.item?.key, let latest = model.streamItems.first(where: { $0.key == key }) {
+            return latest
+        }
+        return focus.item ?? model.selected
+    }
+
+    var body: some View {
+        if let item {
+            if layout == .trailing {
+                VStack(spacing: 2) { actions(for: item) }
+            } else {
+                HStack(spacing: 0) { actions(for: item) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actions(for item: ReadingItem) -> some View {
+        if item.kind == .answer {
+            Button { onProfile(item) } label: {
+                AvatarView(url: item.avatarURL, size: 36)
+                    .frame(width: layout == .trailing ? 56 : 52, height: 52)
+            }
+            .accessibilityLabel("查看作者：\(item.author.isEmpty ? "匿名用户" : item.author)")
+            Button { Task { await model.toggleVote(.up, for: item) } } label: {
+                actionLabel(item.vote == .up ? "hand.thumbsup.fill" : "hand.thumbsup", item.upCount)
+            }
+            .disabled(model.voting)
+            .accessibilityLabel(item.vote == .up ? "取消赞同" : "赞同")
+        }
+        Button { model.showComments(for: item) } label: {
+            actionLabel("bubble.right", item.commentCount)
+        }
+        .accessibilityLabel("查看评论")
+        if item.kind == .answer || item.kind == .article {
+            Button { onCollect(item) } label: {
+                Image(systemName: collectedKeys.contains(item.key) ? "star.fill" : "star")
+                    .font(.system(size: 18, weight: .medium))
+                    .frame(width: 52, height: 52)
+            }
+            .accessibilityLabel(collectedKeys.contains(item.key) ? "管理收藏，已收藏" : "收藏")
+        }
+    }
+
+    @ViewBuilder
+    private func actionLabel(_ icon: String, _ count: Int?) -> some View {
+        if layout == .trailing {
+            VStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 17, weight: .medium))
+                Text(displayCount(count)).font(.system(size: 10, weight: .medium)).monospacedDigit()
+            }.frame(width: 56, height: 52)
+        } else {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 17, weight: .medium))
+                Text(displayCount(count)).font(.system(size: 12, weight: .medium)).monospacedDigit()
+            }.fixedSize(horizontal: true, vertical: false)
+                .frame(maxWidth: .infinity, minHeight: 52)
+        }
+    }
 }
 
 private struct LoadingSkeleton: View {
@@ -790,6 +941,14 @@ private enum ReaderPalette {
             : UIColor(red: 0.984, green: 0.980, blue: 0.969, alpha: 1)
     })
     static let selection = accent.opacity(0.13)
+    /// The reading sheet rests on the directory, so its leading edge casts a
+    /// soft shadow onto the directory's trailing edge. Dark mode needs extra
+    /// weight: a black-on-black shadow all but disappears without it.
+    static let edgeShadow = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor.black.withAlphaComponent(0.40)
+            : UIColor.black.withAlphaComponent(0.10)
+    })
 }
 
 private enum ReadingDefaults {
@@ -1025,7 +1184,10 @@ private struct CommentInlineText: View {
             switch fragment {
             case .text(let value): return result + Text(value)
             case .emoji(let label, let url):
-                if let image = images[url] { return result + Text(Image(uiImage: image)) }
+                if let image = images[url] {
+                    // 行内表情图默认与文字基线底部对齐，视觉上会偏高，向下微调。
+                    return result + Text(Image(uiImage: image)).baselineOffset(-3)
+                }
                 return result + Text(label)
             }
         }
@@ -1041,15 +1203,49 @@ private struct CommentInlineText: View {
             return nil
         })
         for url in urls where images[url] == nil {
-            var request = URLRequest(url: url)
-            request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
-            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            guard let (data, response) = try? await URLSession.shared.data(for: request),
-                  !Task.isCancelled, let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode), let source = UIImage(data: data) else { continue }
-            let size = CGSize(width: 21, height: 21)
-            images[url] = UIGraphicsImageRenderer(size: size).image { _ in source.draw(in: CGRect(origin: .zero, size: size)) }
+            var image = await Self.fetchEmoji(url)
+            if image == nil, let fallback = CommentEmoji.fallbackURL(for: url) {
+                image = await Self.fetchEmoji(fallback)
+            }
+            if let image, !Task.isCancelled { images[url] = image }
         }
+    }
+
+    private static func fetchEmoji(_ url: URL) async -> UIImage? {
+        var request = URLRequest(url: url)
+        request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode), let source = UIImage(data: data) else { return nil }
+        let size = CGSize(width: 21, height: 21)
+        return UIGraphicsImageRenderer(size: size).image { _ in source.draw(in: CGRect(origin: .zero, size: size)) }
+    }
+}
+
+private struct CommentImageView: View {
+    let url: URL
+    @State private var frame: CGRect = .zero
+
+    var body: some View {
+        AnimatedCommentImage(url: url)
+            .aspectRatio(4.0 / 3.0, contentMode: .fit)
+            .frame(maxWidth: 400, maxHeight: 300)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear
+                        .onAppear { frame = proxy.frame(in: .global) }
+                        .onChange(of: proxy.frame(in: .global)) { _, newValue in frame = newValue }
+                }
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                ImagePreviewPresenter.shared.present(url: url, sourceFrame: frame == .zero ? nil : frame)
+            }
+            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel("查看评论图片")
     }
 }
 
@@ -1062,6 +1258,8 @@ private struct AnimatedCommentImage: UIViewRepresentable {
         view.isOpaque = false
         view.backgroundColor = .clear
         view.scrollView.isScrollEnabled = false
+        // 图片本身不需要交互，让点击事件冒泡给 SwiftUI 的放大手势。
+        view.isUserInteractionEnabled = false
         return view
     }
     func updateUIView(_ view: WKWebView, context: Context) {
@@ -1085,13 +1283,13 @@ private struct HTMLReader: UIViewRepresentable {
     let html: String
     let item: ReadingItem
     var stream: [ReadingItem] = []
-    let activeItem: ReadingItem
     var paperCards = false
     var isPreview = false
-    var onTitleHidden: (Bool) -> Void = { _ in }
+    var onChromeVisibility: (Bool) -> Void = { _ in }
     var scrollRequest: ReaderModel.ScrollRequest? = nil
     var onVisibleAnswer: (String) -> Void = { _ in }
     var onNearEnd: () -> Void = {}
+    var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
     @ObservedObject private var fontManager = ReadingFontManager.shared
     @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
     @AppStorage("reading.lineHeight") private var lineHeight = 1.8
@@ -1134,8 +1332,16 @@ private struct HTMLReader: UIViewRepresentable {
         view.scrollView.backgroundColor = .clear
         view.scrollView.alwaysBounceHorizontal = false
         view.scrollView.isDirectionalLockEnabled = true
+        // 阅读区只允许纵向滚动：禁用横向拖动与缩放导致的面板平移。
+        view.scrollView.showsHorizontalScrollIndicator = false
+        view.scrollView.pinchGestureRecognizer?.isEnabled = false
+        view.allowsBackForwardNavigationGestures = false
         view.navigationDelegate = context.coordinator
         view.scrollView.delegate = context.coordinator
+        let imageTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(HTMLReader.Coordinator.handleImageTap(_:)))
+        imageTap.cancelsTouchesInView = false
+        imageTap.delegate = context.coordinator
+        view.addGestureRecognizer(imageTap)
         context.coordinator.attach(view)
         context.coordinator.contentSizeObservation = view.scrollView.observe(\.contentSize, options: [.new]) { [weak coordinator = context.coordinator, weak view] _, _ in
             DispatchQueue.main.async {
@@ -1193,6 +1399,27 @@ private struct HTMLReader: UIViewRepresentable {
         """ : ""
         let title = htmlEscape(item.title)
         let parts = stream.isEmpty ? [item] : stream
+        let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(fontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
+        context.coordinator.onVisibleAnswer = onVisibleAnswer
+        context.coordinator.onNearEnd = onNearEnd
+        context.coordinator.onOpenImage = onOpenImage
+        context.coordinator.onChromeVisibility = onChromeVisibility
+        context.coordinator.streamEnabled = !stream.isEmpty
+        // Scrolling only changes the active answer, never the stream contents. Skip the
+        // expensive document build (every answer's HTML is scanned for images) unless
+        // what the document is made of actually changed.
+        let documentKey = documentFingerprint(parts: parts, presentationKey: presentationKey,
+                                              fallbackHTML: html)
+        if !context.coordinator.lastHTML.isEmpty, documentKey == context.coordinator.lastDocumentKey {
+            if context.coordinator.fontFaceKey != fontFaceKey {
+                context.coordinator.updateFontFace(fontFaceCSS, key: fontFaceKey, in: view)
+            }
+            if let request = scrollRequest, context.coordinator.lastScrollToken != request.token {
+                context.coordinator.lastScrollToken = request.token
+                context.coordinator.scrollToAnswer(request.id, in: view)
+            }
+            return
+        }
         let sectionList = parts.enumerated().map { index, answer in
             let author = htmlEscape(answer.author.isEmpty ? "匿名用户" : answer.author)
             let avatar = answer.avatarURL.map { "<img class=\"avatar\" loading=\"lazy\" decoding=\"async\" src=\"\(htmlEscape($0.absoluteString))\" alt=\"\">" } ?? ""
@@ -1204,12 +1431,12 @@ private struct HTMLReader: UIViewRepresentable {
             return "<section class=\"answer\" data-wize-answer=\"\(htmlEscape(answer.id))\">\(byline)<main>\(expandedImageHTML(content))</main></section>"
         }
         let sections = sectionList.joined()
-        let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(fontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
         let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
         :root { overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: #6d9280; } pre { white-space: pre-wrap; }
         .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:16px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
         main blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid rgba(128,128,128,.35); color: inherit; opacity: .82; }
+        main img.emojione, main img.ztext-emoji { display: inline-block; vertical-align: -0.18em; margin: 0 .06em; border-radius: 0; }
         main hr { border: 0; height: 1px; background: currentColor; opacity: .18; margin: 1.8em 0; }
         main p:last-child { margin-bottom: 0; }
         main figure { margin: .8em 0; }
@@ -1222,19 +1449,15 @@ private struct HTMLReader: UIViewRepresentable {
         \(previewCSS)
         """
         let document = """
-        <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>\(style)</style><style id="wize-font-face"></style></head><body data-wize-anchor="\(htmlEscape(item.id))" data-wize-pending="1"><header><h1>\(title)</h1></header>\(sections)</body></html>
+        <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><style>\(style)</style><style id="wize-font-face"></style></head><body data-wize-anchor="\(htmlEscape(item.id))" data-wize-pending="1"><header><h1>\(title)</h1></header>\(sections)</body></html>
         """
-        context.coordinator.onVisibleAnswer = onVisibleAnswer
-        context.coordinator.onNearEnd = onNearEnd
-        context.coordinator.onTitleHidden = onTitleHidden
-        context.coordinator.streamEnabled = !stream.isEmpty
-        context.coordinator.activeItem = activeItem
         if context.coordinator.lastHTML != document {
             let coordinator = context.coordinator
             if !coordinator.lastHTML.isEmpty, coordinator.sections == sectionList,
                coordinator.documentTitle == title, coordinator.presentationKey != presentationKey {
                 coordinator.presentationKey = presentationKey
                 coordinator.lastHTML = document
+                coordinator.lastDocumentKey = documentKey
                 coordinator.updateFontFace(fontFaceCSS, key: fontFaceKey, in: view)
                 coordinator.updateStyle(style, in: view, preservePosition: !isPreview)
                 return
@@ -1249,6 +1472,7 @@ private struct HTMLReader: UIViewRepresentable {
                 let after = sectionList.dropFirst(start + coordinator.sections.count).joined()
                 coordinator.sections = sectionList
                 coordinator.lastHTML = document
+                coordinator.lastDocumentKey = documentKey
                 coordinator.previousCount = parts.count
                 coordinator.previousFirstID = parts.first?.id
                 coordinator.enqueueSurrounding(before: before, after: after, in: view)
@@ -1279,6 +1503,7 @@ private struct HTMLReader: UIViewRepresentable {
             context.coordinator.previousCount = parts.count
             context.coordinator.previousFirstID = parts.first?.id
             context.coordinator.lastHTML = document
+            context.coordinator.lastDocumentKey = documentKey
             coordinator.fontFaceKey = fontFaceKey
             coordinator.loadingDocument = true
             let initialHTML = fontFaceCSS.isEmpty
@@ -1294,11 +1519,31 @@ private struct HTMLReader: UIViewRepresentable {
                 context.coordinator.scrollToAnswer(request.id, in: view)
             }
         }
-        if context.coordinator.lastHTML == document { context.coordinator.updateActive(in: view) }
+    }
+    /// A cheap fingerprint of the document's inputs. Stream items only ever append,
+    /// and an item's content is replaced only together with its counts, so the id,
+    /// the metadata and the content length identify a rendered section exactly.
+    private func documentFingerprint(parts: [ReadingItem], presentationKey: String, fallbackHTML: String) -> Int {
+        var hasher = Hasher()
+        hasher.combine(presentationKey)
+        hasher.combine(item.id)
+        hasher.combine(parts.count)
+        hasher.combine(fallbackHTML.utf8.count)
+        for part in parts {
+            hasher.combine(part.id)
+            hasher.combine(part.author)
+            hasher.combine(part.avatarURL?.absoluteString)
+            hasher.combine(part.upCount ?? -1)
+            hasher.combine(part.downCount ?? -1)
+            hasher.combine(part.commentCount ?? -1)
+            hasher.combine(part.contentHTML?.utf8.count ?? -1)
+        }
+        return hasher.finalize()
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
-    final class Coordinator: NSObject, WKNavigationDelegate, UIScrollViewDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         var lastHTML = ""
+        var lastDocumentKey: Int?
         var previousCount = 0
         var lastScrollToken: UUID?
         var previousFirstID: String?
@@ -1308,9 +1553,8 @@ private struct HTMLReader: UIViewRepresentable {
         var pendingOffset: CGFloat?
         var onVisibleAnswer: (String) -> Void = { _ in }
         var onNearEnd: () -> Void = {}
-        var onTitleHidden: (Bool) -> Void = { _ in }
+        var onChromeVisibility: (Bool) -> Void = { _ in }
         var streamEnabled = false
-        var activeItem: ReadingItem?
         var contentSizeObservation: NSKeyValueObservation?
         var presentationKey = ""
         var documentTitle = ""
@@ -1327,8 +1571,49 @@ private struct HTMLReader: UIViewRepresentable {
         private var appending = false
         private var documentGeneration = 0
         private var lastInspection = Date.distantPast
+        private var lastNearEnd = Date.distantPast
+        private var chromeVisible = true
+        private var lastScrollOffsetY: CGFloat = 0
+        private var scrollAccum: CGFloat = 0
         private weak var webView: WKWebView?
+        var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
+
         func attach(_ webView: WKWebView) { self.webView = webView }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
+
+        /// 阅读区里点到图片时打开全屏查看；头像、行内表情与小图标不触发。
+        @objc func handleImageTap(_ gesture: UITapGestureRecognizer) {
+            guard let webView else { return }
+            let point = gesture.location(in: webView)
+            let script = """
+            (() => {
+                const el = document.elementFromPoint(\(point.x), \(point.y));
+                const img = el && el.closest ? el.closest('img') : null;
+                if (!img) return null;
+                const rect = img.getBoundingClientRect();
+                return { src: img.currentSrc || img.src || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top, cls: String(img.className || '') };
+            })()
+            """
+            webView.evaluateJavaScript(script) { [weak self] result, _ in
+                guard let self,
+                      let info = result as? [String: Any],
+                      let src = info["src"] as? String,
+                      let url = URL(string: src),
+                      let width = info["width"] as? Double,
+                      let className = info["cls"] as? String else { return }
+                // 跳过头像、行内表情和其他小图；只放大正文里的图片。
+                guard width >= 60, !className.contains("avatar") else { return }
+                let rect = CGRect(x: info["x"] as? Double ?? 0,
+                                  y: info["y"] as? Double ?? 0,
+                                  width: width,
+                                  height: info["height"] as? Double ?? width)
+                let frame = webView.convert(rect, to: nil)
+                DispatchQueue.main.async { self.onOpenImage(url, frame) }
+            }
+        }
         func cancelPendingAppends() {
             documentGeneration += 1
             pendingAppends.removeAll()
@@ -1389,7 +1674,6 @@ private struct HTMLReader: UIViewRepresentable {
                 self.appending = false
                 if result as? Bool == true {
                     self.pendingAppends.removeFirst()
-                    self.updateActive(in: webView)
                     self.flushAppends(in: webView)
                 }
             }
@@ -1397,6 +1681,10 @@ private struct HTMLReader: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             self.webView = webView
             loadingDocument = false
+            chromeVisible = true
+            lastScrollOffsetY = 0
+            scrollAccum = 0
+            onChromeVisibility(true)
             flushFontFace(in: webView)
             flushStyle(in: webView)
             flushAppends(in: webView)
@@ -1409,7 +1697,6 @@ private struct HTMLReader: UIViewRepresentable {
                 webView.evaluateJavaScript(script) { [weak self, weak webView] _, _ in
                     guard let self, let webView else { return }
                     self.restoringAnchor = false
-                    self.updateActive(in: webView)
                     self.inspect(webView)
                 }
                 return
@@ -1420,17 +1707,51 @@ private struct HTMLReader: UIViewRepresentable {
                 pendingScrollFraction = nil
                 webView.scrollView.setContentOffset(CGPoint(x: 0, y: min(fraction, 1) * extent), animated: false)
             }
-            updateActive(in: webView)
             inspect(webView)
         }
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
             userHasScrolled = true
         }
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            if scrollView.contentOffset.x != 0 {
+                scrollView.setContentOffset(CGPoint(x: 0, y: scrollView.contentOffset.y), animated: false)
+            }
             guard streamEnabled, !loadingDocument, pendingAnchorID == nil, !restoringAnchor,
                   scrollView.contentSize.height > 0, let webView else { return }
+            if userHasScrolled {
+                let y = scrollView.contentOffset.y
+                let delta = y - lastScrollOffsetY
+                lastScrollOffsetY = y
+                if y <= 16 {
+                    if !chromeVisible {
+                        chromeVisible = true
+                        onChromeVisibility(true)
+                    }
+                    scrollAccum = 0
+                } else {
+                    scrollAccum += delta
+                    if scrollAccum > 48, chromeVisible {
+                        chromeVisible = false
+                        scrollAccum = 0
+                        onChromeVisibility(false)
+                    } else if scrollAccum < -40, !chromeVisible {
+                        chromeVisible = true
+                        scrollAccum = 0
+                        onChromeVisibility(true)
+                    } else if abs(scrollAccum) > 160 {
+                        scrollAccum = 0
+                    }
+                }
+            } else {
+                // Keep the baseline in step with programmatic scrolling (anchor restore).
+                lastScrollOffsetY = scrollView.contentOffset.y
+            }
             let remaining = scrollView.contentSize.height - scrollView.bounds.height - scrollView.contentOffset.y
-            if remaining < scrollView.bounds.height * 1.3 { onNearEnd() }
+            if remaining < scrollView.bounds.height * 1.3,
+               Date().timeIntervalSince(lastNearEnd) > 0.6 {
+                lastNearEnd = Date()
+                onNearEnd()
+            }
             if userHasScrolled, Date().timeIntervalSince(lastInspection) > 0.2 { inspect(webView) }
         }
         func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
@@ -1442,6 +1763,9 @@ private struct HTMLReader: UIViewRepresentable {
         func inspectAfterLayout(_ webView: WKWebView) {
             guard streamEnabled, !loadingDocument else { return }
             flushAppends(in: webView)
+            // Content size also changes while lazy images decode; do not round-trip to
+            // the web process for every one of those changes.
+            guard Date().timeIntervalSince(lastInspection) > 0.12 else { return }
             inspect(webView)
         }
         func scrollToAnswer(_ id: String, in webView: WKWebView) {
@@ -1450,22 +1774,14 @@ private struct HTMLReader: UIViewRepresentable {
             let script = "(() => { const id = \(encoded); const el = Array.from(document.querySelectorAll('section[data-wize-answer]')).find(e => e.getAttribute('data-wize-answer') === id); if (el) el.scrollIntoView({block:'start'}); })()"
             webView.evaluateJavaScript(script)
         }
-        func updateActive(in webView: WKWebView) {
-            guard !loadingDocument, let item = activeItem,
-                  let data = try? JSONEncoder().encode([item.id, displayCount(item.upCount), displayCount(item.downCount), displayCount(item.commentCount)]),
-                  let values = String(data: data, encoding: .utf8) else { return }
-            let script = "(() => { const [id, up, down, comments] = \(values); document.querySelectorAll('section[data-wize-answer]').forEach(e => { const active = e.getAttribute('data-wize-answer') === id; e.classList.toggle('current', active); if (active) { for (const [key, value] of Object.entries({up, down, comments})) { const node = e.querySelector('[data-count=\\\"' + key + '\\\"]'); if (node) node.textContent = value; } } }); })()"
-            webView.evaluateJavaScript(script)
-        }
         private func inspect(_ webView: WKWebView) {
             guard streamEnabled, !loadingDocument, pendingAnchorID == nil, !restoringAnchor else { return }
             lastInspection = Date()
             // Tie edge actions to the answer at the reading focus, not a sliver at the top.
-            let script = "(() => { const answers = Array.from(document.querySelectorAll('section[data-wize-answer]')); const focus = Math.min(innerHeight * .35, innerHeight - 1); const answer = answers.find(e => e.getBoundingClientRect().bottom > focus) || answers.find(e => e.getBoundingClientRect().bottom > 0); const index = answers.indexOf(answer); if (index >= 0) answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager')); const title = document.querySelector('header h1'); return { id: answer?.getAttribute('data-wize-answer') || null, titleHidden: !!title && title.getBoundingClientRect().bottom <= 0 }; })()"
+            let script = "(() => { const answers = Array.from(document.querySelectorAll('section[data-wize-answer]')); const focus = Math.min(innerHeight * .35, innerHeight - 1); const answer = answers.find(e => e.getBoundingClientRect().bottom > focus) || answers.find(e => e.getBoundingClientRect().bottom > 0); const index = answers.indexOf(answer); if (index >= 0) answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager')); return { id: answer?.getAttribute('data-wize-answer') || null }; })()"
             webView.evaluateJavaScript(script) { [weak self] result, _ in
                 guard let self, let result = result as? [String: Any] else { return }
                 if self.userHasScrolled, let id = result["id"] as? String { self.onVisibleAnswer(id) }
-                if let hidden = result["titleHidden"] as? Bool { self.onTitleHidden(hidden) }
             }
         }
     }
@@ -1492,7 +1808,7 @@ private struct ReadingSettingsView: View {
             Form {
                 Section("预览") {
                     let sample = ReadingItem(id: "reading-preview", kind: .article, title: "", excerpt: "", author: "", questionID: nil, contentHTML: previewHTML)
-                    HTMLReader(html: previewHTML, item: sample, activeItem: sample,
+                    HTMLReader(html: previewHTML, item: sample,
                                paperCards: UIDevice.current.userInterfaceIdiom == .pad, isPreview: true)
                         .frame(height: 210)
                         .clipShape(RoundedRectangle(cornerRadius: 12))

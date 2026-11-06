@@ -12,6 +12,7 @@
 		63C7C9E13FDB6998550DAABF /* FeedbackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1513ECE571D3A1766770A025 /* FeedbackView.swift */; };
 		654DB24AA51E063F599CB2D0 /* ZhihuSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CFDD22C69B4DF1F867BCED7 /* ZhihuSource.swift */; };
 		86296562276992812ED67715 /* ReaderModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD1D3B6C3C88D1BA2C41D094 /* ReaderModel.swift */; };
+		9067406AD64BFDFCDB19B86E /* ImageViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51026AB5CC7220FE22DE0910 /* ImageViewer.swift */; };
 		A306960CD3B99909067FD6B5 /* ReadingFixtureSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED07394ED004DF23CFC88B80 /* ReadingFixtureSource.swift */; };
 		EFB401F57A6C8C93861BAF6B /* WizeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 724D76C8C21B301AA52BAD94 /* WizeApp.swift */; };
 		F71846B68C93139E79313F1F /* ReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C173098F011706D6E6779FAD /* ReaderView.swift */; };
@@ -22,6 +23,7 @@
 		374163F308F8FB5C3762704E /* Build.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Build.xcconfig; sourceTree = "<group>"; };
 		3CFDD22C69B4DF1F867BCED7 /* ZhihuSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZhihuSource.swift; sourceTree = "<group>"; };
 		497EF928BA354DBFAA1751D0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		51026AB5CC7220FE22DE0910 /* ImageViewer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageViewer.swift; sourceTree = "<group>"; };
 		5C20A4F65F05689A18789C97 /* Wize.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Wize.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		724D76C8C21B301AA52BAD94 /* WizeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WizeApp.swift; sourceTree = "<group>"; };
 		C173098F011706D6E6779FAD /* ReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderView.swift; sourceTree = "<group>"; };
@@ -46,6 +48,7 @@
 				FC443AFAC433745BB62C5425 /* AppInfo.swift */,
 				497EF928BA354DBFAA1751D0 /* Assets.xcassets */,
 				1513ECE571D3A1766770A025 /* FeedbackView.swift */,
+				51026AB5CC7220FE22DE0910 /* ImageViewer.swift */,
 				FD1D3B6C3C88D1BA2C41D094 /* ReaderModel.swift */,
 				C173098F011706D6E6779FAD /* ReaderView.swift */,
 				ED07394ED004DF23CFC88B80 /* ReadingFixtureSource.swift */,
@@ -140,6 +143,7 @@
 			files = (
 				2DA59481EB2028243A80E8CF /* AppInfo.swift in Sources */,
 				63C7C9E13FDB6998550DAABF /* FeedbackView.swift in Sources */,
+				9067406AD64BFDFCDB19B86E /* ImageViewer.swift in Sources */,
 				86296562276992812ED67715 /* ReaderModel.swift in Sources */,
 				F71846B68C93139E79313F1F /* ReaderView.swift in Sources */,
 				A306960CD3B99909067FD6B5 /* ReadingFixtureSource.swift in Sources */,
