@@ -56,19 +56,40 @@ def main():
     gray = gray.filter(ImageFilter.MedianFilter(3))
     pixels = np.asarray(gray, dtype=np.float32)
 
-    # 墨迹（深色）到纸张（浅色）之间的平滑过渡
-    dark, light = np.percentile(pixels, 2), np.percentile(pixels, 90)
-    alpha = np.clip((light - pixels) / max(light - dark, 1.0), 0.0, 1.0)
-
-    # 用 0.55 的阈值估计笔画区域，去掉纸面小噪点
-    mask = alpha > 0.55
-    if mask.any():
-        kept = keep_glyph_components(mask)
-        # 膨胀一圈，避免把笔画边缘「吃掉」
-        dilated = np.asarray(
-            Image.fromarray((kept * 255).astype(np.uint8), "L").filter(ImageFilter.MaxFilter(3))
-        ) > 128
-        alpha = alpha * dilated
+    # 用 Otsu 自动阈值区分墨迹与纸张；墨迹通常只占版面的 10% 左右，
+    # 不能按分位数猜阈值，否则会把纸纹当成墨迹。
+    hist, _ = np.histogram(pixels, bins=256, range=(0, 256))
+    total = pixels.size
+    sum_all = float((np.arange(256) * hist).sum())
+    weight_background = 0
+    sum_background = 0.0
+    best_variance = 0.0
+    threshold = 128.0
+    for level in range(256):
+        weight_background += int(hist[level])
+        if weight_background == 0:
+            continue
+        weight_foreground = total - weight_background
+        if weight_foreground == 0:
+            break
+        sum_background += level * int(hist[level])
+        mean_background = sum_background / weight_background
+        mean_foreground = (sum_all - sum_background) / weight_foreground
+        variance = weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
+        if variance > best_variance:
+            best_variance = variance
+            threshold = level + 0.5
+    mask_image = Image.fromarray(((pixels < threshold) * 255).astype(np.uint8), "L")
+    # 闭运算：先膨胀 5px 再腐蚀 5px，填孔但保持外轮廓
+    mask_image = mask_image.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    # 去掉纸面孤立小点（保留「灬」等独立笔画，面积阈值很低）
+    kept = keep_glyph_components(np.asarray(mask_image) > 128)
+    if not kept.any():
+        raise SystemExit("未找到笔画")
+    outline = Image.fromarray((kept * 255).astype(np.uint8), "L").filter(ImageFilter.MaxFilter(3))
+    # 用平滑后的二值轮廓生成抗锯齿 alpha
+    alpha_image = outline.filter(ImageFilter.GaussianBlur(1.2))
+    alpha = np.asarray(alpha_image, dtype=np.float32) / 255.0
 
     ys, xs = np.where(alpha > 0.05)
     if len(ys) == 0:
