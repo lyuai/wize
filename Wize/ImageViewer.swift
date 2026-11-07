@@ -1,4 +1,5 @@
 import AVKit
+import Photos
 import SwiftUI
 import UIKit
 
@@ -288,6 +289,18 @@ actor RemoteImageLoader {
         return image
     }
 
+    /// 保存到照片时需要原始字节（保留 GIF 动图），不能复用解码后的 UIImage。
+    func originalData(for url: URL) async -> Data? {
+        var request = URLRequest(url: url)
+        request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 30
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else { return nil }
+        return data
+    }
+
     private static func download(_ url: URL) async -> UIImage? {
         var request = URLRequest(url: url)
         request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
@@ -472,6 +485,45 @@ struct VideoPlayerScreen: View {
         } catch {
             guard !Task.isCancelled else { return }
             errorMessage = (error as? LocalizedError)?.errorDescription ?? "视频暂时无法播放，请稍后重试。"
+        }
+    }
+}
+
+enum PhotoSaveResult {
+    case success
+    case denied
+    case failed
+}
+
+/// 把图片保存到系统照片图库；GIF 以原始文件写入，保留动图。
+@MainActor
+enum PhotoImageSaver {
+    static func save(url: URL) async -> PhotoSaveResult {
+        guard let data = await RemoteImageLoader.shared.originalData(for: url) else { return .failed }
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard status == .authorized || status == .limited else { return .denied }
+
+        let ext = url.pathExtension.isEmpty ? "jpg" : url.pathExtension
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wize-photo-\(UUID().uuidString).\(ext)")
+        do {
+            try data.write(to: temporary)
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                PHPhotoLibrary.shared().performChanges {
+                    let request = PHAssetCreationRequest.forAsset()
+                    request.addResource(with: .photo, fileURL: temporary, options: nil)
+                } completionHandler: { success, error in
+                    if success {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(throwing: error ?? CocoaError(.fileWriteUnknown))
+                    }
+                }
+            }
+            return .success
+        } catch {
+            return .failed
         }
     }
 }

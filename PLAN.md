@@ -37,6 +37,7 @@
 - 以中文长文为主：支持系统黑体、系统宋体及多款 SIL Open Font License 1.1 开源字体（霞鹜新致宋、思源宋体、霞鹜文楷、霞鹜新晰黑、思源黑体）按需下载与切换，正文控制字号、行距、行宽与段间距；文字列在宽屏中保持合理宽度，图片仍可自适应。
 - 阅读背景提供跟随系统、明亮、纸色和深色；提供真实风格预览和恢复默认，设置仅保存在本机。
 - 正文、标题与作者共同滚动；切换排版时尽量保持当前阅读进度。评论浮层不改变正文的宽度或滚动位置。
+- 正文图片单击不响应，长按弹出「放大查看 / 存储到照片」菜单；评论区缩略图仍直接点击查看大图。
 - Liquid Glass 作为导航和悬浮操作层，正文保持清晰的实色阅读面；避免玻璃效果与大量装饰侵入内容。
 - 视觉以安静的阅读目录为基调：目录使用轻微暖灰绿，正文使用接近纸白或深墨的阅读面；鼠尾草绿只用于选择和操作。标题使用宋体层次，列表通过精细分隔、头像、图片和间距建立节奏，不把每条内容包成卡片。浅色和深色均保持同样的语义层级；用户选择的阅读配色优先。
 - 参考 [Bear 排版设置](https://bear.app/zh/faq/typography-options/)、[Apple Books 外观设置](https://support.apple.com/en-ph/guide/iphone/iphc1af7c57/27/ios/27)、[iA Writer 设置](https://ia.net/writer/support/basics/settings?tab=settings-ipados) 与 [Apple 材质指南](https://developer.apple.com/design/human-interface-guidelines/materials)。这些是设计参考，并非现有体验已经过用户验收的证明。

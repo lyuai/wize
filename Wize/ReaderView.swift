@@ -34,6 +34,8 @@ struct ReaderView: View {
     @State private var collectionItem: ReadingItem?
     @State private var webLink: ReaderWebLink?
     @State private var videoPreview: VideoPreviewItem?
+    @State private var imageMenu: ReaderImageMenuTarget?
+    @State private var imageNotice: String?
     @State private var collectedKeys: Set<String> = []
     // A reference type kept in @State on purpose: `@StateObject` would make this
     // screen observe every reading-focus change and bring the per-switch rebuild
@@ -127,6 +129,49 @@ struct ReaderView: View {
                 phonePath = path
             }
         }
+        .confirmationDialog(
+            "图片",
+            isPresented: Binding(get: { imageMenu != nil }, set: { if !$0 { imageMenu = nil } }),
+            titleVisibility: .hidden,
+            presenting: imageMenu
+        ) { target in
+            Button("放大查看") {
+                // 等 confirmationDialog 收起后再创建浮层窗口，避免转场冲突。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    ImagePreviewPresenter.shared.present(url: target.url, sourceFrame: target.frame)
+                }
+            }
+            Button("存储到照片") {
+                Task { await saveImage(target.url) }
+            }
+            Button("取消", role: .cancel) {}
+        }
+        .overlay(alignment: .bottom) {
+            if let imageNotice {
+                Text(imageNotice)
+                    .font(.footnote)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.72), in: Capsule())
+                    .padding(.bottom, 28)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private func saveImage(_ url: URL) async {
+        let result = await PhotoImageSaver.save(url: url)
+        let message: String
+        switch result {
+        case .success: message = "已存储到照片"
+        case .denied: message = "没有照片写入权限"
+        case .failed: message = "图片存储失败"
+        }
+        withAnimation(.easeOut(duration: 0.18)) { imageNotice = message }
+        try? await Task.sleep(for: .seconds(2))
+        withAnimation(.easeIn(duration: 0.2)) { imageNotice = nil }
     }
 
     private func selectInitialContentIfNeeded() {
@@ -516,7 +561,7 @@ struct ReaderView: View {
                         },
                         onNearEnd: { Task { await model.loadMoreStream() } },
                         onOpenLink: openWebLink,
-                        onOpenImage: { url, frame in ImagePreviewPresenter.shared.present(url: url, sourceFrame: frame) },
+                        onOpenImage: { url, frame in imageMenu = ReaderImageMenuTarget(url: url, frame: frame) },
                         onOpenVideo: { reference, poster, _ in
                             videoPreview = VideoPreviewItem(reference: reference, poster: poster)
                         }
@@ -1501,6 +1546,12 @@ private struct ReaderWebLink: Identifiable {
     var id: String { url.absoluteString }
 }
 
+private struct ReaderImageMenuTarget: Identifiable {
+    let url: URL
+    let frame: CGRect
+    var id: String { url.absoluteString }
+}
+
 private struct SafariView: UIViewControllerRepresentable {
     let url: URL
     func makeUIViewController(context: Context) -> SFSafariViewController {
@@ -1575,10 +1626,18 @@ private struct HTMLReader: UIViewRepresentable {
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
         view.scrollView.delegate = context.coordinator
-        let imageTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(HTMLReader.Coordinator.handleImageTap(_:)))
-        imageTap.cancelsTouchesInView = false
-        imageTap.delegate = context.coordinator
-        view.addGestureRecognizer(imageTap)
+        // 单击不再打开查看器：阅读时点击图片不应打断滚动；长按才弹出菜单。
+        let imageLongPress = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(HTMLReader.Coordinator.handleImageLongPress(_:)))
+        imageLongPress.minimumPressDuration = 0.45
+        imageLongPress.allowableMovement = 12
+        imageLongPress.cancelsTouchesInView = false
+        imageLongPress.delegate = context.coordinator
+        view.addGestureRecognizer(imageLongPress)
+        // 视频卡片保持单击播放；只有点中视频才响应，图片仍然走长按菜单。
+        let videoTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(HTMLReader.Coordinator.handleVideoTap(_:)))
+        videoTap.cancelsTouchesInView = false
+        videoTap.delegate = context.coordinator
+        view.addGestureRecognizer(videoTap)
         context.coordinator.attach(view)
         context.coordinator.contentSizeObservation = view.scrollView.observe(\.contentSize, options: [.new]) { [weak coordinator = context.coordinator, weak view] _, _ in
             DispatchQueue.main.async {
@@ -1674,7 +1733,7 @@ private struct HTMLReader: UIViewRepresentable {
         let sections = sectionList.joined()
         let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
-        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
+        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; -webkit-touch-callout: none; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
         .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:14px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts .ip { max-width:9em; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
         .wize-video { position:relative; display:block; margin:1.1em 0; border-radius:8px; overflow:hidden; background:#111; }
         .wize-video-poster { display:block; width:100%; height:auto; margin:0; border-radius:0; }
@@ -1833,9 +1892,10 @@ private struct HTMLReader: UIViewRepresentable {
             true
         }
 
-        /// 阅读区里点到图片时打开全屏查看；头像、行内表情与小图标不触发。
-        @objc func handleImageTap(_ gesture: UITapGestureRecognizer) {
-            guard let webView else { return }
+        /// 阅读区长按图片时弹出「放大查看 / 存储到照片」菜单；头像、行内表情与小图标不触发。
+        @objc func handleImageLongPress(_ gesture: UILongPressGestureRecognizer) {
+            guard gesture.state == .began, let webView else { return }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
             let point = gesture.location(in: webView)
             let script = """
             (() => {
@@ -1873,6 +1933,33 @@ private struct HTMLReader: UIViewRepresentable {
                 DispatchQueue.main.async { self.onOpenImage(url, frame) }
             }
         }
+        /// 阅读区点击视频卡片时直接播放；图片不再响应单击。
+        @objc func handleVideoTap(_ gesture: UITapGestureRecognizer) {
+            guard let webView else { return }
+            let point = gesture.location(in: webView)
+            let script = """
+            (() => {
+                const el = document.elementFromPoint(\(point.x), \(point.y));
+                const video = el && el.closest ? el.closest('[data-wize-video]') : null;
+                if (!video) return null;
+                const rect = video.getBoundingClientRect();
+                return { id: video.getAttribute('data-wize-video') || '', kind: video.getAttribute('data-wize-video-kind') || 'lens', poster: video.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
+            })()
+            """
+            webView.evaluateJavaScript(script) { [weak self] result, _ in
+                guard let self, let info = result as? [String: Any],
+                      let id = info["id"] as? String, !id.isEmpty else { return }
+                let kind = VideoKind(rawValue: info["kind"] as? String ?? "") ?? .lens
+                let poster = (info["poster"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) }
+                let rect = CGRect(x: info["x"] as? Double ?? 0,
+                                  y: info["y"] as? Double ?? 0,
+                                  width: info["width"] as? Double ?? 0,
+                                  height: info["height"] as? Double ?? 0)
+                let frame = webView.convert(rect, to: nil)
+                DispatchQueue.main.async { self.onOpenVideo(VideoReference(id: id, kind: kind), poster, frame) }
+            }
+        }
+
         func cancelPendingAppends() {
             documentGeneration += 1
             pendingAppends.removeAll()

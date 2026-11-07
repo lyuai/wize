@@ -24,6 +24,8 @@
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>将图片保存到你的照片图库以支持长按保存。</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
@@ -38,11 +40,11 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<key>WizeReleaseDate</key>
-	<string>$(WIZE_RELEASE_DATE)</string>
 	<key>WizeGitHubRepo</key>
 	<string>$(WIZE_GITHUB_REPO)</string>
 	<key>WizeGitHubToken</key>
 	<string>$(WIZE_GITHUB_TOKEN)</string>
+	<key>WizeReleaseDate</key>
+	<string>$(WIZE_RELEASE_DATE)</string>
 </dict>
 </plist>
