@@ -1245,31 +1245,36 @@ private struct ItemRow: View {
     let item: ReadingItem
     var isHot = false
     var showsTitle: Bool = true
+
+    /// The answer list mirrors the reading header: author on the left, counts
+    /// on the right of the same line. Feed rows keep their separate footer so
+    /// thumbnails still have room.
+    private var showsInlineCounts: Bool {
+        !showsTitle && item.kind == .answer && (item.upCount != nil || item.commentCount != nil)
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 8) {
                 if showsTitle { Text(item.title).font(.system(size: 16, weight: .semibold)).lineSpacing(4).fixedSize(horizontal: false, vertical: true) }
-                if !isHot, !item.author.isEmpty {
+                if !isHot, (!item.author.isEmpty || showsInlineCounts) {
                     HStack(spacing: 7) {
-                        AvatarView(url: item.avatarURL, size: showsTitle ? 22 : 28)
-                        Text(item.author).font(showsTitle ? .caption.weight(.medium) : .headline)
-                            .foregroundStyle(showsTitle ? Color.secondary : Color.primary)
+                        if !item.author.isEmpty {
+                            AvatarView(url: item.avatarURL, size: showsTitle ? 22 : 28)
+                            Text(item.author).font(showsTitle ? .caption.weight(.medium) : .headline)
+                                .foregroundStyle(showsTitle ? Color.secondary : Color.primary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        if showsInlineCounts {
+                            Spacer(minLength: 8)
+                            countsRow
+                        }
                     }
                 }
                 if !item.excerpt.isEmpty { Text(htmlText(item.excerpt)).font(.system(size: 14)).foregroundStyle(.secondary).lineSpacing(3).lineLimit(2) }
-                if item.kind == .answer, item.upCount != nil || item.commentCount != nil {
-                    HStack(spacing: 16) {
-                        if let count = item.upCount {
-                            compactCount("hand.thumbsup", count: count)
-                                .accessibilityLabel("\(displayCount(count)) 次赞同")
-                        }
-                        if let count = item.commentCount {
-                            compactCount("bubble.right", count: count)
-                                .accessibilityLabel("\(displayCount(count)) 条评论")
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if !showsInlineCounts, item.kind == .answer, item.upCount != nil || item.commentCount != nil {
+                    countsRow
                 }
             }.padding(.vertical, 14)
             if showsTitle, let url = item.imageURL {
@@ -1280,6 +1285,22 @@ private struct ItemRow: View {
         }
         .padding(.horizontal, 10)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5).padding(.horizontal, 10) }
+    }
+
+    private var countsRow: some View {
+        HStack(spacing: 16) {
+            if let count = item.upCount {
+                compactCount("hand.thumbsup", count: count)
+                    .accessibilityLabel("\(displayCount(count)) 次赞同")
+            }
+            if let count = item.commentCount {
+                compactCount("bubble.right", count: count)
+                    .accessibilityLabel("\(displayCount(count)) 条评论")
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: true, vertical: false)
     }
 }
 
