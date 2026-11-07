@@ -22,6 +22,24 @@ struct ReadingItem: Identifiable, Hashable {
     var key: String { "\(kind.rawValue):\(id)" }
 }
 
+/// Public Zhihu page for sharing. The app is not on the App Store yet, so a
+/// universal/app link would only add dead weight: recipients should simply
+/// open the original Zhihu page in their browser or Zhihu app.
+func zhihuWebURL(for item: ReadingItem) -> URL? {
+    guard !item.id.isEmpty else { return nil }
+    switch item.kind {
+    case .answer:
+        if let questionID = item.questionID, !questionID.isEmpty {
+            return URL(string: "https://www.zhihu.com/question/\(questionID)/answer/\(item.id)")
+        }
+        return URL(string: "https://www.zhihu.com/answer/\(item.id)")
+    case .article:
+        return URL(string: "https://zhuanlan.zhihu.com/p/\(item.id)")
+    case .question:
+        return URL(string: "https://www.zhihu.com/question/\(item.id)")
+    }
+}
+
 enum AnswerVote: String { case up, down, neutral }
 
 struct AnswerVoteResult {

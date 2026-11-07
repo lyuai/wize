@@ -901,6 +901,16 @@ private struct ReaderActionOverlay: View {
             }
             .accessibilityLabel(collectedKeys.contains(item.key) ? "管理收藏，已收藏" : "收藏")
         }
+        if let shareURL = zhihuWebURL(for: item) {
+            ShareLink(item: shareURL, subject: Text(item.title)) {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 18, weight: .medium))
+                    .frame(width: 52, height: 52)
+                    .foregroundStyle(Color.primary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("分享")
+        }
     }
 
     @ViewBuilder

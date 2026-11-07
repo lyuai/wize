@@ -23,6 +23,19 @@ struct ReaderLinkTest {
         precondition(output.components(separatedBy: "<img").count == 3,
                      "both images should remain in place")
 
+        let answer = ReadingItem(id: "123", kind: .answer, title: "回答", excerpt: "", author: "", questionID: "456")
+        precondition(zhihuWebURL(for: answer)?.absoluteString == "https://www.zhihu.com/question/456/answer/123",
+                     "answers should share their question page")
+        let looseAnswer = ReadingItem(id: "123", kind: .answer, title: "回答", excerpt: "", author: "", questionID: nil)
+        precondition(zhihuWebURL(for: looseAnswer)?.absoluteString == "https://www.zhihu.com/answer/123",
+                     "answers without a question should fall back to the answer page")
+        let article = ReadingItem(id: "789", kind: .article, title: "文章", excerpt: "", author: "", questionID: nil)
+        precondition(zhihuWebURL(for: article)?.absoluteString == "https://zhuanlan.zhihu.com/p/789",
+                     "articles should share their Zhuanlan page")
+        let question = ReadingItem(id: "456", kind: .question, title: "问题", excerpt: "", author: "", questionID: nil)
+        precondition(zhihuWebURL(for: question)?.absoluteString == "https://www.zhihu.com/question/456",
+                     "questions should share their question page")
+
         if let readerPath = CommandLine.arguments.dropFirst().first {
             let reader = try String(contentsOfFile: readerPath, encoding: .utf8)
             precondition(reader.contains("--wize-link"), "links should use the reader accent")
@@ -31,6 +44,6 @@ struct ReaderLinkTest {
             precondition(reader.contains("a:visited"), "visited links should keep the reading palette")
         }
 
-        print("PASS: image links, original sources and reader link styling")
+        print("PASS: image links, share URLs and reader link styling")
     }
 }
