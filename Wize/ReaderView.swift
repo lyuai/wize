@@ -1246,43 +1246,56 @@ private struct ItemRow: View {
     var isHot = false
     var showsTitle: Bool = true
 
-    /// The answer list mirrors the reading header: author on the left, counts
-    /// on the right of the same line. Feed rows keep their separate footer so
-    /// thumbnails still have room.
+    /// Counts sit on the author line, right-aligned, matching the reading
+    /// header. The thumbnail only occupies the title row so the author name
+    /// still has room next to the counts in feed rows.
     private var showsInlineCounts: Bool {
-        !showsTitle && item.kind == .answer && (item.upCount != nil || item.commentCount != nil)
+        item.kind == .answer && (item.upCount != nil || item.commentCount != nil)
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 8) {
-                if showsTitle { Text(item.title).font(.system(size: 16, weight: .semibold)).lineSpacing(4).fixedSize(horizontal: false, vertical: true) }
-                if !isHot, (!item.author.isEmpty || showsInlineCounts) {
-                    HStack(spacing: 7) {
-                        if !item.author.isEmpty {
-                            AvatarView(url: item.avatarURL, size: showsTitle ? 22 : 28)
-                            Text(item.author).font(showsTitle ? .caption.weight(.medium) : .headline)
-                                .foregroundStyle(showsTitle ? Color.secondary : Color.primary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                        }
-                        if showsInlineCounts {
-                            Spacer(minLength: 8)
-                            countsRow
-                        }
+        VStack(alignment: .leading, spacing: 8) {
+            if showsTitle {
+                HStack(alignment: .top, spacing: 12) {
+                    Text(item.title)
+                        .font(.system(size: 16, weight: .semibold))
+                        .lineSpacing(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let url = item.imageURL {
+                        AsyncImage(url: url) { image in image.resizable().scaledToFill() } placeholder: { Color.secondary.opacity(0.1) }
+                            .frame(width: 72, height: 82).clipped().clipShape(RoundedRectangle(cornerRadius: 10))
                     }
                 }
-                if !item.excerpt.isEmpty { Text(htmlText(item.excerpt)).font(.system(size: 14)).foregroundStyle(.secondary).lineSpacing(3).lineLimit(2) }
-                if !showsInlineCounts, item.kind == .answer, item.upCount != nil || item.commentCount != nil {
+            }
+            if !isHot, (!item.author.isEmpty || showsInlineCounts) {
+                HStack(spacing: 7) {
+                    if !item.author.isEmpty {
+                        AvatarView(url: item.avatarURL, size: showsTitle ? 22 : 28)
+                        Text(item.author).font(showsTitle ? .caption.weight(.medium) : .headline)
+                            .foregroundStyle(showsTitle ? Color.secondary : Color.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    if showsInlineCounts {
+                        Spacer(minLength: 8)
+                        countsRow
+                    }
+                }
+            } else if isHot, showsInlineCounts {
+                HStack {
+                    Spacer(minLength: 0)
                     countsRow
                 }
-            }.padding(.vertical, 14)
-            if showsTitle, let url = item.imageURL {
-                AsyncImage(url: url) { image in image.resizable().scaledToFill() } placeholder: { Color.secondary.opacity(0.1) }
-                    .frame(width: 72, height: 82).clipped().clipShape(RoundedRectangle(cornerRadius: 10))
-                    .padding(.vertical, 14)
+            }
+            if !item.excerpt.isEmpty {
+                Text(htmlText(item.excerpt)).font(.system(size: 14)).foregroundStyle(.secondary).lineSpacing(3).lineLimit(2)
+            }
+            if !showsInlineCounts, item.kind == .answer, item.upCount != nil || item.commentCount != nil {
+                countsRow
             }
         }
+        .padding(.vertical, 14)
         .padding(.horizontal, 10)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5).padding(.horizontal, 10) }
     }
@@ -1303,6 +1316,7 @@ private struct ItemRow: View {
         .fixedSize(horizontal: true, vertical: false)
     }
 }
+
 
 @MainActor
 private final class AvatarCache {
