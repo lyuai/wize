@@ -70,6 +70,14 @@ struct CommentFragmentsTest {
             precondition(visibleCommentLines.contains(#"Image(systemName: "arrowtriangle.right.fill")"#), "Reply target should use an icon instead of text label")
         }
 
+        let withIP = parseReadingComments([[
+            "id": 9,
+            "author": ["name": "甲"],
+            "content": "来自浙江的评论",
+            "comment_tag": [["type": "ip_info", "text": "浙江"]]
+        ]])
+        precondition(withIP.first?.ipInfo == "浙江", "Comment IP location should be parsed from comment_tag")
+
         print("PASS: comment text, original GIFs, repeated images, raw image dimensions and pure icon-based comment UI")
     }
 }

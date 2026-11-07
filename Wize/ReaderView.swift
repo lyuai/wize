@@ -33,6 +33,7 @@ struct ReaderView: View {
     @State private var profileItem: ReadingItem?
     @State private var collectionItem: ReadingItem?
     @State private var webLink: ReaderWebLink?
+    @State private var videoPreview: VideoPreviewItem?
     @State private var collectedKeys: Set<String> = []
     // A reference type kept in @State on purpose: `@StateObject` would make this
     // screen observe every reading-focus change and bring the per-switch rebuild
@@ -71,7 +72,10 @@ struct ReaderView: View {
             FeedbackView(context: feedbackContext, onSubmitted: { feedbackSubmitted = true })
         }
         .fullScreenCover(isPresented: $showsFeedbackThanks) {
-            FeedbackThanksView { showsFeedbackThanks = false }
+            FeedbackThanksView(name: model.accountName) { showsFeedbackThanks = false }
+        }
+        .fullScreenCover(item: $videoPreview) { item in
+            VideoPlayerScreen(item: item)
         }
         .sheet(item: $profileItem) { AuthorProfileView(item: $0) }
         .sheet(item: $webLink) { link in
@@ -195,7 +199,8 @@ struct ReaderView: View {
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
                         .onTapGesture { model.showsComments = false }
-                    NavigationStack { commentList }
+                    NavigationStack { commentList.simultaneousGesture(closeCommentsGesture) }
+                        .simultaneousGesture(closeCommentsGesture)
                         .frame(width: min(max(geometry.size.width * 0.38, 360), 480))
                         .frame(maxHeight: .infinity)
                         .background(Color(uiColor: .systemBackground))
@@ -204,11 +209,6 @@ struct ReaderView: View {
                         .shadow(color: .black.opacity(0.22), radius: 16, x: -5)
                         .padding(.vertical, 8)
                         .padding(.trailing, 8)
-                        .simultaneousGesture(DragGesture(minimumDistance: 30).onEnded { value in
-                            if value.translation.width > 70 && abs(value.translation.width) > abs(value.translation.height) {
-                                model.showsComments = false
-                            }
-                        })
                         .accessibilityAction(.escape) { model.showsComments = false }
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
@@ -330,7 +330,8 @@ struct ReaderView: View {
                 }
         }
         .sheet(isPresented: $model.showsComments) {
-            NavigationStack { commentList }
+            NavigationStack { commentList.simultaneousGesture(closeCommentsGesture) }
+                .simultaneousGesture(closeCommentsGesture)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -515,7 +516,10 @@ struct ReaderView: View {
                         },
                         onNearEnd: { Task { await model.loadMoreStream() } },
                         onOpenLink: openWebLink,
-                        onOpenImage: { url, frame in ImagePreviewPresenter.shared.present(url: url, sourceFrame: frame) }
+                        onOpenImage: { url, frame in ImagePreviewPresenter.shared.present(url: url, sourceFrame: frame) },
+                        onOpenVideo: { reference, poster, _ in
+                            videoPreview = VideoPreviewItem(reference: reference, poster: poster)
+                        }
                     )
                     .id(model.streamAnchor?.key ?? item.key)
                     .ignoresSafeArea(.container, edges: usesWideLayout ? [] : .bottom)
@@ -581,6 +585,16 @@ struct ReaderView: View {
                 Image(systemName: "text.book.closed").font(.system(size: 36)).foregroundStyle(.tertiary)
                 Text(model.question == nil ? "选择一篇内容开始阅读" : "选择一个回答开始阅读").foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// A horizontal swipe closes the comment panel on both iPhone and iPad,
+    /// instead of requiring a scroll to the top before pulling the sheet down.
+    private var closeCommentsGesture: some Gesture {
+        DragGesture(minimumDistance: 24).onEnded { value in
+            let dx = value.translation.width
+            guard abs(dx) > 56, abs(dx) > abs(value.translation.height) * 1.2 else { return }
+            model.showsComments = false
         }
     }
 
@@ -709,7 +723,7 @@ struct ReaderView: View {
                 )
                 .fill(ReaderPalette.accent.opacity(0.32))
                 .frame(width: 1.5)
-                .padding(.leading, 12 + CGFloat(level - 1) * 24)
+                .padding(.leading, 11.25 + CGFloat(level - 1) * 24)
             }
         }
         .frame(maxHeight: .infinity)
@@ -764,6 +778,17 @@ struct ReaderView: View {
                             Text(replyTo).font(.subheadline.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer(minLength: 4)
+                        if let ip = comment.ipInfo, !ip.isEmpty {
+                            HStack(spacing: 3) {
+                                Image(systemName: "mappin.and.ellipse")
+                                    .font(.system(size: 10, weight: .medium))
+                                Text(ip).lineLimit(1)
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .accessibilityLabel("地区：\(ip)")
+                        }
                         if comment.likes > 0 {
                             compactCount("hand.thumbsup", count: comment.likes)
                                 .font(.caption).foregroundStyle(.secondary)
@@ -885,12 +910,14 @@ private struct ReaderActionOverlay: View {
                 Image(systemName: icon).font(.system(size: 17, weight: .medium))
                 Text(displayCount(count)).font(.system(size: 10, weight: .medium)).monospacedDigit()
             }.frame(width: 56, height: 52)
+                .foregroundStyle(ReaderPalette.accent)
         } else {
             HStack(spacing: 4) {
                 Image(systemName: icon).font(.system(size: 17, weight: .medium))
                 Text(displayCount(count)).font(.system(size: 12, weight: .medium)).monospacedDigit()
             }.fixedSize(horizontal: true, vertical: false)
                 .frame(maxWidth: .infinity, minHeight: 52)
+                .foregroundStyle(ReaderPalette.accent)
         }
     }
 }
@@ -933,12 +960,20 @@ private struct VoteActionButton: View {
 
     private var icon: some View {
         ZStack {
+            if isOn {
+                Circle()
+                    .fill(ReaderPalette.accent.opacity(0.16))
+                    .frame(width: 30, height: 30)
+                Circle()
+                    .strokeBorder(ReaderPalette.accent.opacity(0.26), lineWidth: 0.75)
+                    .frame(width: 30, height: 30)
+            }
             if showsBurst {
                 LikeBurst().id(burst)
             }
             Image(systemName: isOn ? "hand.thumbsup.fill" : "hand.thumbsup")
-                .font(.system(size: 17, weight: .medium))
-                .foregroundStyle(isOn ? ReaderPalette.accent : Color.primary)
+                .font(.system(size: 17, weight: isOn ? .semibold : .medium))
+                .foregroundStyle(ReaderPalette.accent)
                 .symbolEffect(.bounce, options: .speed(1.15), value: reduceMotion ? -1 : burst)
                 .contentTransition(.symbolEffect(.replace))
                 .animation(.easeInOut(duration: 0.18), value: isOn)
@@ -949,7 +984,8 @@ private struct VoteActionButton: View {
     private var countText: some View {
         Text(displayCount(count))
             .monospacedDigit()
-            .foregroundStyle(isOn ? ReaderPalette.accent : Color.primary)
+            .fontWeight(isOn ? .semibold : .medium)
+            .foregroundStyle(ReaderPalette.accent)
             .contentTransition(.numericText(value: Double(count ?? 0)))
             .animation(.snappy(duration: 0.28), value: count)
             .animation(.easeInOut(duration: 0.18), value: isOn)
@@ -1444,6 +1480,7 @@ private struct HTMLReader: UIViewRepresentable {
     var onNearEnd: () -> Void = {}
     var onOpenLink: (URL) -> Void = { _ in }
     var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
+    var onOpenVideo: (VideoReference, URL?, CGRect) -> Void = { _, _, _ in }
     @ObservedObject private var fontManager = ReadingFontManager.shared
     @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
     @AppStorage("reading.lineHeight") private var lineHeight = 1.8
@@ -1528,7 +1565,7 @@ private struct HTMLReader: UIViewRepresentable {
         let cardCSS = paperCards ? """
         body { padding-left: 16px; padding-right: 16px; }
         .answer { background: \(paperColor); border: 1px solid rgba(128,128,128,.12); border-radius: 12px; padding: 26px 22px 28px; box-shadow: 0 5px 18px rgba(0,0,0,.08); }
-        .answer + .answer { border-top: 1px solid rgba(128,128,128,.12); margin-top: 18px; padding-top: 26px; }
+        .answer + .answer { border-top: 1px dotted rgba(128,128,128,.28); margin-top: 18px; padding-top: 26px; }
         """ : ""
         let phoneGapColor: String
         switch theme {
@@ -1559,6 +1596,7 @@ private struct HTMLReader: UIViewRepresentable {
         context.coordinator.onNearEnd = onNearEnd
         context.coordinator.onOpenLink = onOpenLink
         context.coordinator.onOpenImage = onOpenImage
+        context.coordinator.onOpenVideo = onOpenVideo
         context.coordinator.onChromeVisibility = onChromeVisibility
         context.coordinator.streamEnabled = !stream.isEmpty
         // Scrolling only changes the active answer, never the stream contents. Skip the
@@ -1579,9 +1617,11 @@ private struct HTMLReader: UIViewRepresentable {
         let sectionList = parts.enumerated().map { index, answer in
             let author = htmlEscape(answer.author.isEmpty ? "匿名用户" : answer.author)
             let avatar = answer.avatarURL.map { "<img class=\"avatar\" loading=\"lazy\" decoding=\"async\" src=\"\(htmlEscape($0.absoluteString))\" alt=\"\">" } ?? ""
-            let content = answer.contentHTML ?? (index == 0 ? html : "")
+            let content = expandedVideoHTML(answer.contentHTML ?? (index == 0 ? html : ""))
+            let ip = (answer.ipInfo ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let ipSpan = ip.isEmpty ? "" : "<span class=\"ip\"><svg viewBox=\"0 0 24 24\" aria-label=\"地区\"><path d=\"M12 21.2c4.3-4.4 6.6-7.9 6.6-11.1a6.6 6.6 0 1 0-13.2 0c0 3.2 2.3 6.7 6.6 11.1z\"/><circle cx=\"12\" cy=\"9.9\" r=\"2.2\"/></svg>\(htmlEscape(ip))</span>"
             let counts = """
-            <div class="counts"><span><svg viewBox="0 0 24 24" aria-label="赞同"><path d="M7 10v10H4V10h3zm2 10V10l4-7c.4-.8 1.6-.5 1.6.4V8H19c1.3 0 2.2 1.2 1.9 2.4l-1.6 7.5A2.5 2.5 0 0 1 16.8 20H9z"/></svg><b data-count="up">\(displayCount(answer.upCount))</b></span><span><svg viewBox="0 0 24 24" aria-label="评论"><path d="M4 5.5h16v11H11l-4.5 3v-3H4z"/></svg><b data-count="comments">\(displayCount(answer.commentCount))</b></span></div>
+            <div class="counts">\(ipSpan)<span><svg viewBox="0 0 24 24" aria-label="赞同"><path d="M7 10v10H4V10h3zm2 10V10l4-7c.4-.8 1.6-.5 1.6.4V8H19c1.3 0 2.2 1.2 1.9 2.4l-1.6 7.5A2.5 2.5 0 0 1 16.8 20H9z"/></svg><b data-count="up">\(displayCount(answer.upCount))</b></span><span><svg viewBox="0 0 24 24" aria-label="评论"><path d="M4 5.5h16v11H11l-4.5 3v-3H4z"/></svg><b data-count="comments">\(displayCount(answer.commentCount))</b></span></div>
             """
             let byline = "<div class=\"byline\">\(avatar)<span class=\"author-name\">\(author)</span>\(counts)</div>"
             return "<section class=\"answer\" data-wize-answer=\"\(htmlEscape(answer.id))\">\(byline)<main>\(expandedImageHTML(content))</main></section>"
@@ -1589,11 +1629,17 @@ private struct HTMLReader: UIViewRepresentable {
         let sections = sectionList.joined()
         let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
-        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .answer + .answer { border-top: 1px solid rgba(128,128,128,.25); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
-        .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:16px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
-        main blockquote { margin: 1em 0; padding-left: 1em; border-left: 3px solid rgba(128,128,128,.35); color: inherit; opacity: .82; }
+        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
+        .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:14px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts .ip { max-width:9em; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
+        .wize-video { position:relative; display:block; margin:1.1em 0; border-radius:8px; overflow:hidden; background:#111; }
+        .wize-video-poster { display:block; width:100%; height:auto; margin:0; border-radius:0; }
+        .wize-video:not(:has(.wize-video-poster)) { aspect-ratio:16/9; background:linear-gradient(135deg,#2d3833,#111); }
+        .wize-video-play { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:linear-gradient(180deg,rgba(0,0,0,.02),rgba(0,0,0,.28)); }
+        .wize-video-play svg { width:54px; height:54px; padding:11px; border-radius:50%; background:rgba(255,255,255,.94); fill:#1b1f1d; box-shadow:0 6px 20px rgba(0,0,0,.24); }
+        .wize-video-title { position:absolute; left:14px; right:14px; bottom:12px; color:#fff; font:500 13px -apple-system,sans-serif; line-height:1.35; text-shadow:0 1px 4px rgba(0,0,0,.55); }
+        main blockquote { margin: 1.2em 0; padding-left: 1em; border-left: 2px dotted rgba(128,128,128,.42); color: inherit; opacity: .82; }
         main img.emojione, main img.ztext-emoji { display: inline-block; vertical-align: -0.18em; margin: 0 .06em; border-radius: 0; }
-        main hr { border: 0; height: 1px; background: currentColor; opacity: .18; margin: 1.8em 0; }
+        main hr { border: 0; height: 0; border-top: 1.5px dotted color-mix(in srgb, currentColor 36%, transparent); margin: 2em 0; }
         main p:last-child { margin-bottom: 0; }
         main figure { margin: .8em 0; }
         main figcaption { margin-top: .4em; font-size: .8em; line-height: 1.5; text-align: center; opacity: .68; }
@@ -1734,6 +1780,7 @@ private struct HTMLReader: UIViewRepresentable {
         private weak var webView: WKWebView?
         var onOpenLink: (URL) -> Void = { _ in }
         var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
+        var onOpenVideo: (VideoReference, URL?, CGRect) -> Void = { _, _, _ in }
 
         func attach(_ webView: WKWebView) { self.webView = webView }
 
@@ -1748,6 +1795,11 @@ private struct HTMLReader: UIViewRepresentable {
             let script = """
             (() => {
                 const el = document.elementFromPoint(\(point.x), \(point.y));
+                const video = el && el.closest ? el.closest('[data-wize-video]') : null;
+                if (video) {
+                    const rect = video.getBoundingClientRect();
+                    return { video: video.getAttribute('data-wize-video') || '', kind: video.getAttribute('data-wize-video-kind') || 'lens', poster: video.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
+                }
                 const img = el && el.closest ? el.closest('img') : null;
                 if (!img) return null;
                 const rect = img.getBoundingClientRect();
@@ -1755,19 +1807,24 @@ private struct HTMLReader: UIViewRepresentable {
             })()
             """
             webView.evaluateJavaScript(script) { [weak self] result, _ in
-                guard let self,
-                      let info = result as? [String: Any],
-                      let src = info["src"] as? String,
-                      let url = URL(string: src),
-                      let width = info["width"] as? Double,
-                      let className = info["cls"] as? String else { return }
-                // 跳过头像、行内表情和其他小图；只放大正文里的图片。
-                guard width >= 60, !className.contains("avatar") else { return }
+                guard let self, let info = result as? [String: Any] else { return }
+                let width = info["width"] as? Double ?? 0
                 let rect = CGRect(x: info["x"] as? Double ?? 0,
                                   y: info["y"] as? Double ?? 0,
                                   width: width,
                                   height: info["height"] as? Double ?? width)
                 let frame = webView.convert(rect, to: nil)
+                if let id = info["video"] as? String, !id.isEmpty {
+                    let kind = VideoKind(rawValue: info["kind"] as? String ?? "") ?? .lens
+                    let poster = (info["poster"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) }
+                    DispatchQueue.main.async { self.onOpenVideo(VideoReference(id: id, kind: kind), poster, frame) }
+                    return
+                }
+                guard let src = info["src"] as? String,
+                      let url = URL(string: src),
+                      let className = info["cls"] as? String else { return }
+                // 跳过头像、行内表情和其他小图；只放大正文里的图片。
+                guard width >= 60, !className.contains("avatar") else { return }
                 DispatchQueue.main.async { self.onOpenImage(url, frame) }
             }
         }

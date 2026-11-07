@@ -219,6 +219,7 @@ struct FeedbackView: View {
 }
 
 struct FeedbackThanksView: View {
+    var name: String? = nil
     let onFinished: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var appeared = false
@@ -268,8 +269,10 @@ struct FeedbackThanksView: View {
                            value: appeared)
 
                 VStack(spacing: 10) {
-                    Text("谢谢你的反馈")
+                    Text(thanksTitle)
                         .font(.system(size: 26, weight: .semibold, design: .serif))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
                     Text("每一条建议，都会让这里更安静一点。")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.72))
@@ -299,7 +302,12 @@ struct FeedbackThanksView: View {
         }
         .sensoryFeedback(.success, trigger: burst)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("反馈已提交，谢谢你的反馈")
+        .accessibilityLabel(thanksTitle)
+    }
+
+    private var thanksTitle: String {
+        let trimmed = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "谢谢你的反馈" : "谢谢你的反馈，\(trimmed)"
     }
 
     private func finish() {

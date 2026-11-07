@@ -8,6 +8,7 @@ final class ReadingFixtureSource: ReadingSource {
     private let question = ReadingItem(id: "sample-question", kind: .question, title: "排版样本｜从一座城市里的旧书店，能读到什么？", excerpt: "", author: "", questionID: nil)
     private var samples: [ReadingItem] {
         let long = """
+        <a class="video-box" href="https://www.zhihu.com/video/1965789251959526374" data-lens-id="1965789251959526374" data-poster="https://picx.zhimg.com/v2-f08ce62b9adca0db656dc08963d71541_720w.jpg?source=ccfced1a"><img class="thumbnail" src="https://picx.zhimg.com/v2-f08ce62b9adca0db656dc08963d71541_720w.jpg?source=ccfced1a"></a>
         <p>我喜欢旧书店，并不是因为每一本书都稀有。真正有意思的，是你永远不知道下一页会遇到什么。</p>
         <p>有人在扉页写下日期，有人留下车票，也有人用一条细细的线，标出他觉得重要的句子。这些痕迹让阅读多了一点偶遇的意味。</p>
         <blockquote>一本书被许多人读过，也就有了许多种生活。</blockquote>
@@ -21,7 +22,9 @@ final class ReadingFixtureSource: ReadingSource {
         <p>把注意力交给眼前的内容，也给思考留一点余地。</p>
         """
         func answer(_ id: String, _ author: String, _ html: String, _ excerpt: String, _ votes: Int, _ comments: Int) -> ReadingItem {
-            ReadingItem(id: id, kind: .answer, title: question.title, excerpt: excerpt, author: author, questionID: question.id, contentHTML: html, upCount: votes, commentCount: comments)
+            var item = ReadingItem(id: id, kind: .answer, title: question.title, excerpt: excerpt, author: author, questionID: question.id, contentHTML: html, upCount: votes, commentCount: comments)
+            item.ipInfo = "北京"
+            return item
         }
         return [answer("sample-long", "林间来信", long, "那些被读过的书，留下了许多人的生活痕迹。", 1286, 42),
                 answer("sample-short", "未完成的旅人", short, "读到的是别人认真生活过的证据。", 286, 8),
@@ -58,13 +61,19 @@ final class ReadingFixtureSource: ReadingSource {
     }
     func comments(_ item: ReadingItem, next: URL?) async throws -> Page<ReadingComment> {
         var comment = ReadingComment(id: "sample-comment", author: "一位读者", html: "<p>很喜欢这段话[调皮][吃瓜]，读完想再慢慢想一会儿[微笑]。</p>", likes: 12)
+        comment.ipInfo = "浙江"
         comment.replyCount = 2
         return Page(items: [comment], next: nil)
     }
     func replies(to comment: ReadingComment, next: URL?) async throws -> Page<ReadingComment> {
         var reply = ReadingComment(id: next == nil ? "sample-reply-1" : "sample-reply-2", author: next == nil ? "另一位读者" : "路过的人", html: "<p>我也这样觉得。</p>", likes: 1)
+        reply.ipInfo = "上海"
         reply.depth = 1; reply.replyTo = comment.author; reply.parentID = comment.id
-        return Page(items: [reply], next: next == nil ? URL(string: "https://example.invalid/replies") : nil)
+        var child = ReadingComment(id: "sample-reply-child", author: "路过的猫", html: "<p>同意，而且愿意再读一遍。</p>", likes: 0)
+        child.ipInfo = "广东"
+        child.depth = 2; child.replyTo = reply.author; child.parentID = reply.id
+        if next == nil { return Page(items: [reply, child], next: nil) }
+        return Page(items: [reply], next: nil)
     }
 }
 #endif

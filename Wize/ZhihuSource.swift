@@ -12,6 +12,7 @@ struct ReadingItem: Identifiable, Hashable {
     var avatarURL: URL? = nil
     var authorHeadline: String? = nil
     var authorToken: String? = nil
+    var ipInfo: String? = nil
     var imageURL: URL? = nil
     var contentHTML: String? = nil
     var upCount: Int? = nil
@@ -29,12 +30,26 @@ struct AnswerVoteResult {
     let downCount: Int?
 }
 
+enum VideoKind: String, Hashable { case lens, zvideo }
+
+struct VideoReference: Hashable {
+    let id: String
+    let kind: VideoKind
+}
+
+struct VideoPlayback {
+    let url: URL
+    let title: String?
+    let poster: URL?
+}
+
 struct ReadingComment: Identifiable {
     let id: String
     let author: String
     let html: String
     let likes: Int
     var avatarURL: URL? = nil
+    var ipInfo: String? = nil
     var replyTo: String? = nil
     var depth: Int = 0
     var replyCount: Int = 0
@@ -53,7 +68,7 @@ struct ReadingCollection: Identifiable {
 }
 
 enum SourceError: LocalizedError {
-    case response(Int), malformed, unsupported, voteUnconfirmed
+    case response(Int), malformed, unsupported, voteUnconfirmed, videoUnavailable
     var errorDescription: String? {
         switch self {
         case .response(401), .response(403): return "知乎要求登录或安全验证，请先登录后重试。"
@@ -61,6 +76,7 @@ enum SourceError: LocalizedError {
         case .malformed: return "无法读取知乎返回的数据。"
         case .unsupported: return "暂不支持此类型的内容。"
         case .voteUnconfirmed: return "无法确认知乎的赞同状态，请稍后重试。"
+        case .videoUnavailable: return "视频暂时无法播放，请稍后重试。"
         }
     }
 }
@@ -167,7 +183,7 @@ final class ZhihuSource: ReadingSource {
 
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
         let json = try await request(url("/api/v4/questions/\(questionID)/answers", [
-            .init(name: "include", value: "data[*].content,voteup_count,votedown_count,comment_count,voting,relationship.voting,author,question"),
+            .init(name: "include", value: "data[*].content,voteup_count,votedown_count,comment_count,voting,relationship.voting,author,question,ip_info"),
             .init(name: "sort_by", value: sort), .init(name: "offset", value: String(offset)), .init(name: "limit", value: "20")
         ]))
         return Page(items: objects(json).compactMap { parseObject($0, fallbackQuestionID: questionID) }, next: nextURL(json))
@@ -175,7 +191,7 @@ final class ZhihuSource: ReadingSource {
 
     func detail(_ item: ReadingItem, prefetch: Bool = false) async throws -> ReadingItem {
         let path = item.kind == .article ? "/api/v4/articles/\(item.id)" : "/api/v4/answers/\(item.id)"
-        let json = try await request(url(path, [.init(name: "include", value: "content,author,question,voteup_count,votedown_count,comment_count,voting,relationship.voting")]), prefetch: prefetch)
+        let json = try await request(url(path, [.init(name: "include", value: "content,author,question,voteup_count,votedown_count,comment_count,voting,relationship.voting,ip_info")]), prefetch: prefetch)
         guard let content = json["content"] as? String, !content.isEmpty else { throw SourceError.malformed }
         var updated = item
         updated.contentHTML = content
@@ -184,6 +200,7 @@ final class ZhihuSource: ReadingSource {
             updated.authorHeadline = author["headline"] as? String ?? item.authorHeadline
             updated.authorToken = author["url_token"] as? String ?? item.authorToken
         }
+        updated.ipInfo = (json["ip_info"] as? String) ?? item.ipInfo
         updated.upCount = json["voteup_count"] as? Int ?? item.upCount
         updated.downCount = json["votedown_count"] as? Int ?? item.downCount
         updated.commentCount = json["comment_count"] as? Int ?? item.commentCount
@@ -206,6 +223,62 @@ final class ZhihuSource: ReadingSource {
         if let value = answerVote(from: json) { confirmed = value }
         else { confirmed = try await answerRelationshipVote(answerID: answerID) }
         return AnswerVoteResult(vote: confirmed, upCount: json["voteup_count"] as? Int, downCount: json["votedown_count"] as? Int)
+    }
+
+    func videoPlayback(_ reference: VideoReference) async throws -> VideoPlayback {
+        switch reference.kind {
+        case .lens:
+            return try await lensVideoPlayback(id: reference.id)
+        case .zvideo:
+            let json = try await request(url("/api/v4/zvideos/\(reference.id)", [
+                .init(name: "include", value: "video")
+            ]))
+            let video = json["video"] as? [String: Any] ?? json
+            if let lensID = identifier(video["video_id"]) ?? identifier(video["id"]),
+               video["playlist"] == nil, video["playlist_v2"] == nil {
+                return try await lensVideoPlayback(id: lensID)
+            }
+            return try playback(from: video, fallbackTitle: json["title"] as? String, poster: nil)
+        }
+    }
+
+    private func lensVideoPlayback(id: String) async throws -> VideoPlayback {
+        guard let url = URL(string: "https://lens.zhihu.com/api/v4/videos/\(id)") else {
+            throw SourceError.malformed
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw SourceError.malformed }
+        guard (200..<300).contains(http.statusCode) else { throw SourceError.response(http.statusCode) }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw SourceError.malformed
+        }
+        return try playback(from: json, fallbackTitle: nil, poster: nil)
+    }
+
+    private func playback(from json: [String: Any], fallbackTitle: String?, poster: URL?) throws -> VideoPlayback {
+        let title = (json["title"] as? String) ?? fallbackTitle
+        let cover = poster
+            ?? mediaURL(json["cover_url"])
+            ?? mediaURL(json["thumbnail"])
+            ?? mediaURL(json["image_url"])
+        let ranks = ["FHD": 0, "HD": 1, "SD": 2, "LD": 3]
+        var best: (rank: Int, url: URL)?
+        for key in ["playlist", "playlist_v2"] {
+            guard let playlist = json[key] as? [String: Any] else { continue }
+            for (quality, value) in playlist {
+                guard let entry = value as? [String: Any],
+                      let raw = (entry["play_url"] as? String) ?? (entry["url"] as? String),
+                      let url = URL(string: raw) else { continue }
+                let rank = ranks[quality.uppercased()] ?? 4
+                if best == nil || rank < best!.rank { best = (rank, url) }
+            }
+        }
+        if let best { return VideoPlayback(url: best.url, title: title, poster: cover) }
+        throw SourceError.videoUnavailable
     }
 
     func collections(for item: ReadingItem) async throws -> [ReadingCollection] {
@@ -265,6 +338,7 @@ final class ZhihuSource: ReadingSource {
         item.avatarURL = mediaURL(author["avatar_url"])
         item.authorHeadline = author["headline"] as? String
         item.authorToken = author["url_token"] as? String
+        item.ipInfo = object["ip_info"] as? String
         item.contentHTML = object["content"] as? String
         item.upCount = object["voteup_count"] as? Int
         item.downCount = object["votedown_count"] as? Int
@@ -292,6 +366,11 @@ func parseReadingComments(_ entries: [[String: Any]], depth: Int = 0, parentAuth
         let rawParent = entry["reply_to_comment_id"] ?? entry["parent_comment_id"] ?? entry["in_reply_to_comment_id"]
         let explicitParent = (rawParent as? String) ?? (rawParent as? NSNumber)?.stringValue
         comment.parentID = explicitParent.flatMap { $0.isEmpty || $0 == "0" ? nil : $0 } ?? parentID
+        if let tags = entry["comment_tag"] as? [[String: Any]],
+           let ip = tags.first(where: { $0["type"] as? String == "ip_info" })?["text"] as? String,
+           !ip.isEmpty {
+            comment.ipInfo = ip
+        }
         let children = entry["child_comments"] as? [[String: Any]] ?? []
         comment.replyCount = entry["child_comment_count"] as? Int ?? entry["reply_count"] as? Int ?? children.count
         return [comment] + parseReadingComments(children, depth: depth + 1, parentAuthor: name, parentID: id)
@@ -563,6 +642,95 @@ private func htmlTagAttribute(_ name: String, in tag: String) -> String? {
           let found = expression.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
           let valueRange = Range(found.range(at: 1), in: tag) else { return nil }
     return String(tag[valueRange])
+}
+
+func expandedVideoHTML(_ html: String) -> String {
+    guard let anchor = try? NSRegularExpression(pattern: #"(?is)<a\b[^>]*>.*?</a\s*>"#) else { return html }
+    var result = html
+    let matches = anchor.matches(in: result, range: NSRange(result.startIndex..., in: result))
+    for match in matches.reversed() {
+        guard let range = Range(match.range, in: result) else { continue }
+        let tag = String(result[range])
+        guard let reference = videoReference(fromHTMLTag: tag) else { continue }
+        let poster = normalizedMediaURL(htmlTagAttribute("data-poster", in: tag))
+            ?? normalizedMediaURL(htmlImageSources(tag).first)
+        let title = (htmlTagAttribute("data-name", in: tag) ?? htmlTagAttribute("data-video-title", in: tag))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let posterHTML = poster.map {
+            "<img class=\"wize-video-poster\" loading=\"lazy\" decoding=\"async\" src=\"\(htmlEscapeAttribute($0.absoluteString))\" alt=\"\">"
+        } ?? ""
+        let titleHTML: String
+        if let title, !title.isEmpty {
+            let escaped = htmlEscapeAttribute(title)
+            titleHTML = "<span class=\"wize-video-title\">\(escaped)</span>"
+        } else {
+            titleHTML = ""
+        }
+        let card = """
+        <div class="wize-video" role="button" aria-label="播放视频" data-wize-video="\(htmlEscapeAttribute(reference.id))" data-wize-video-kind="\(reference.kind.rawValue)" data-wize-poster="\(htmlEscapeAttribute(poster?.absoluteString ?? ""))">\(posterHTML)<span class="wize-video-play"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6.4v11.2l9-5.6z"/></svg></span>\(titleHTML)</div>
+        """
+        result.replaceSubrange(range, with: card)
+    }
+    return result
+}
+
+func videoReference(fromHTMLTag tag: String) -> VideoReference? {
+    if let raw = htmlTagAttribute("data-lens-id", in: tag), let id = videoDigits(raw) {
+        return VideoReference(id: id, kind: .lens)
+    }
+    if let raw = htmlTagAttribute("data-zvideo-id", in: tag), let id = videoDigits(raw) {
+        return VideoReference(id: id, kind: .zvideo)
+    }
+    if let raw = htmlTagAttribute("data-video-id", in: tag), let id = videoDigits(raw) {
+        let isZVideo = tag.lowercased().contains("zvideo")
+        return VideoReference(id: id, kind: isZVideo ? .zvideo : .lens)
+    }
+    guard let raw = htmlTagAttribute("href", in: tag) else { return nil }
+    var value = raw.replacingOccurrences(of: "&amp;", with: "&")
+    if let components = URLComponents(string: value),
+       let target = components.queryItems?.first(where: { $0.name == "target" })?.value {
+        value = target
+    }
+    if value.hasPrefix("//") { value = "https:" + value }
+    guard let url = URL(string: value) else { return nil }
+    let path = url.path.lowercased()
+    let patterns = [
+        ("lens", #"/videos?/(\d+)"#),
+        ("zvideo", #"/zvideos?/(\d+)"#)
+    ]
+    for (kind, pattern) in patterns {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: path, range: NSRange(path.startIndex..., in: path)),
+              let idRange = Range(match.range(at: 1), in: path) else { continue }
+        let id = String(path[idRange])
+        return VideoReference(id: id, kind: kind == "zvideo" ? .zvideo : .lens)
+    }
+    if url.host?.lowercased() == "lens.zhihu.com" {
+        let components = path.split(separator: "/")
+        if let id = components.last, id.allSatisfy(\.isNumber), !id.isEmpty {
+            return VideoReference(id: String(id), kind: .lens)
+        }
+    }
+    return nil
+}
+
+private func videoDigits(_ value: String) -> String? {
+    let digits = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !digits.isEmpty && digits.allSatisfy(\.isNumber) ? digits : nil
+}
+
+private func normalizedMediaURL(_ value: String?) -> URL? {
+    guard var value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+    value = value.replacingOccurrences(of: "&amp;", with: "&")
+    if value.hasPrefix("//") { value = "https:" + value }
+    return mediaURL(value)
+}
+
+private func htmlEscapeAttribute(_ value: String) -> String {
+    value.replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "\"", with: "&quot;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
 }
 
 func expandedImageHTML(_ html: String) -> String {

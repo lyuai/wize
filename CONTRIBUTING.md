@@ -43,6 +43,7 @@ swift Tests/ReaderStyleTest.swift Wize/ReaderView.swift
 swift Tests/ReaderFocusTest.swift Wize/ReaderView.swift
 swiftc Wize/ZhihuSource.swift Tests/CommentFragmentsTest.swift -o /tmp/wize-comment-test && /tmp/wize-comment-test
 swiftc Wize/ZhihuSource.swift Tests/ReaderLinkTest.swift -o /tmp/wize-link-test && /tmp/wize-link-test Wize/ReaderView.swift
+swiftc Wize/ZhihuSource.swift Tests/VideoHTMLTest.swift -o /tmp/wize-video-test && /tmp/wize-video-test
 swiftc Wize/ZhihuSource.swift Wize/ReaderModel.swift Tests/ReaderModelTest.swift -o /tmp/wize-model-test && /tmp/wize-model-test
 ```
 

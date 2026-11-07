@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 import UIKit
 
@@ -338,5 +339,139 @@ actor RemoteImageLoader {
         }
         guard !frames.isEmpty else { return UIImage(data: data) }
         return UIImage.animatedImage(with: frames, duration: duration)
+    }
+}
+
+
+struct VideoPreviewItem: Identifiable {
+    let reference: VideoReference
+    let poster: URL?
+    var id: String { "\(reference.kind.rawValue):\(reference.id)" }
+}
+
+/// Native full-screen playback for embedded Zhihu videos. The HTML keeps a
+/// poster card; Lens zvideo/lens URLs are resolved here so the reader never
+/// leaves the app to watch a clip.
+struct VideoPlayerScreen: View {
+    let item: VideoPreviewItem
+    @Environment(\.dismiss) private var dismiss
+    @State private var player: AVPlayer?
+    @State private var errorMessage: String?
+    @State private var title: String?
+    @State private var posterImage: UIImage?
+    @State private var loadToken = 0
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let player {
+                VideoPlayer(player: player)
+                    .ignoresSafeArea()
+            } else if let errorMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "play.slash")
+                        .font(.system(size: 36, weight: .light))
+                        .foregroundStyle(.white.opacity(0.72))
+                    Text(errorMessage)
+                        .font(.footnote)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.white.opacity(0.65))
+                    HStack(spacing: 12) {
+                        Button("重试") { loadToken += 1 }
+                            .buttonStyle(.bordered)
+                            .tint(.white)
+                        Link("在浏览器打开", destination: webURL)
+                            .buttonStyle(.bordered)
+                            .tint(.white)
+                    }
+                }
+                .padding(32)
+            } else {
+                poster
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+                    .accessibilityLabel("正在加载视频")
+            }
+            chrome
+        }
+        .statusBarHidden()
+        .task(id: loadToken) { await load() }
+        .task(id: item.poster) {
+            guard let poster = item.poster else { return }
+            posterImage = await RemoteImageLoader.shared.image(for: poster)
+        }
+        .onDisappear {
+            player?.pause()
+        }
+    }
+
+    private var webURL: URL {
+        switch item.reference.kind {
+        case .lens:
+            return URL(string: "https://www.zhihu.com/video/\(item.reference.id)")!
+        case .zvideo:
+            return URL(string: "https://www.zhihu.com/zvideo/\(item.reference.id)")!
+        }
+    }
+
+    @ViewBuilder private var poster: some View {
+        if let posterImage {
+            Image(uiImage: posterImage)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(Color.black.opacity(0.3))
+                .ignoresSafeArea()
+        }
+    }
+
+    private var chrome: some View {
+        VStack {
+            HStack(spacing: 10) {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 38, height: 38)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(Circle().strokeBorder(.white.opacity(0.14), lineWidth: 0.5))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭视频")
+                if let title, !title.isEmpty {
+                    Text(title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 10)
+            Spacer(minLength: 0)
+        }
+    }
+
+    @MainActor
+    private func load() async {
+        errorMessage = nil
+        player?.pause()
+        player = nil
+        do {
+            let playback = try await ZhihuSource().videoPlayback(item.reference)
+            guard !Task.isCancelled else { return }
+            let player = AVPlayer(url: playback.url)
+            player.automaticallyWaitsToMinimizeStalling = true
+            self.title = playback.title
+            self.player = player
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try? AVAudioSession.sharedInstance().setActive(true)
+            player.play()
+        } catch {
+            guard !Task.isCancelled else { return }
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? "视频暂时无法播放，请稍后重试。"
+        }
     }
 }
