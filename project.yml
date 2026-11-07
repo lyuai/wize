@@ -18,8 +18,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lyuai.wize
         INFOPLIST_FILE: Wize/Info.plist
-        WIZE_RELEASE_DATE: '2026-11-05'
-        MARKETING_VERSION: '0.2.0'
-        CURRENT_PROJECT_VERSION: '2'
+        WIZE_RELEASE_DATE: '2026-11-07'
+        MARKETING_VERSION: '0.2.1'
+        CURRENT_PROJECT_VERSION: '3'
         SWIFT_VERSION: '5.0'
         TARGETED_DEVICE_FAMILY: '1,2'
