@@ -7,23 +7,28 @@ final class ImagePreviewPresenter {
     static let shared = ImagePreviewPresenter()
 
     private var window: UIWindow?
+    private weak var previousKeyWindow: UIWindow?
 
     func present(url: URL, sourceFrame: CGRect?) {
         guard window == nil else { return }
         guard let scene = Self.activeWindowScene() else { return }
+        previousKeyWindow = scene.keyWindow
+
         let window = UIWindow(windowScene: scene)
-        window.windowLevel = .alert + 1
+        window.frame = scene.coordinateSpace.bounds
+        window.windowLevel = .normal + 1
         window.backgroundColor = .clear
         let root = AnimatedImageViewer(
-            url: url,
+            model: ImagePreviewModel(url: url),
             sourceFrame: sourceFrame,
             onDismiss: { [weak self] in self?.dismiss() }
         )
         let controller = UIHostingController(rootView: root)
         controller.view.backgroundColor = .clear
         window.rootViewController = controller
-        window.isHidden = false
         self.window = window
+        window.isHidden = false
+        window.makeKeyAndVisible()
     }
 
     func dismiss() {
@@ -31,6 +36,8 @@ final class ImagePreviewPresenter {
         window.isHidden = true
         window.rootViewController = nil
         self.window = nil
+        previousKeyWindow?.makeKey()
+        previousKeyWindow = nil
     }
 
     private static func activeWindowScene() -> UIWindowScene? {
@@ -39,23 +46,64 @@ final class ImagePreviewPresenter {
     }
 }
 
+/// 负责加载与解码，和视图生命周期解耦：window 一创建就开始加载。
+@MainActor
+final class ImagePreviewModel: ObservableObject {
+    @Published private(set) var image: UIImage?
+    @Published private(set) var failed = false
+
+    private let url: URL
+    private var loading = false
+
+    init(url: URL) {
+        self.url = url
+        Task { await load() }
+    }
+
+    func retry() {
+        failed = false
+        Task { await load() }
+    }
+
+    private func load() async {
+        guard image == nil, !loading else { return }
+        loading = true
+        defer { loading = false }
+
+        let loaded = await withTaskGroup(of: UIImage?.self) { group in
+            group.addTask { await RemoteImageLoader.shared.image(for: self.url) }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(10))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        if let loaded {
+            image = loaded
+        } else {
+            failed = true
+        }
+    }
+}
+
 /// 放大动画显示在屏幕中央；点周边、单击图片、向下轻扫或点 X 都会缩回关闭。
 private struct AnimatedImageViewer: View {
-    let url: URL
+    @ObservedObject var model: ImagePreviewModel
     let sourceFrame: CGRect?
     let onDismiss: () -> Void
 
-    @State private var image: UIImage?
-    @State private var failed = false
-    @State private var loading = false
-    @State private var appeared = false
-    @State private var currentFrame: CGRect = .zero
-    @State private var targetFrame: CGRect = .zero
+    @State private var scale: CGFloat = 0.94
+    @State private var dimmed = true
 
     var body: some View {
         GeometryReader { geometry in
+            let inset: CGFloat = geometry.size.width > 700 ? 56 : 24
+            let available = CGSize(width: max(geometry.size.width - inset * 2, 80),
+                                   height: max(geometry.size.height - inset * 2, 80))
             ZStack {
-                Color.black.opacity(appeared ? 0.62 : 0)
+                Color.black.opacity(dimmed ? 0.62 : 0)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture { dismiss() }
@@ -65,23 +113,23 @@ private struct AnimatedImageViewer: View {
                         }
                     )
 
-                if let image {
+                if let image = model.image {
+                    let fitted = Self.fittedSize(for: image.size, in: available)
                     ZoomableImage(image: image, onSingleTap: { dismiss() })
-                        .frame(width: currentFrame.width, height: currentFrame.height)
+                        .frame(width: fitted.width, height: fitted.height)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: 14, style: .continuous)
                                 .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
                         )
-                        .shadow(color: .black.opacity(appeared ? 0.35 : 0), radius: 24, y: 10)
-                        .position(x: currentFrame.midX, y: currentFrame.midY)
-                        .opacity(appeared ? 1 : 0)
-                } else if failed {
+                        .shadow(color: .black.opacity(0.35), radius: 24, y: 10)
+                        .scaleEffect(scale)
+                } else if model.failed {
                     VStack(spacing: 14) {
                         Image(systemName: "photo.badge.exclamationmark")
                             .font(.system(size: 34, weight: .light))
                         Text("图片加载失败").font(.subheadline)
-                        Button("重试") { Task { await load() } }
+                        Button("重试") { model.retry() }
                             .buttonStyle(.borderedProminent)
                             .tint(.white.opacity(0.22))
                     }
@@ -106,7 +154,6 @@ private struct AnimatedImageViewer: View {
                                 .background(Color.black.opacity(0.55), in: Circle())
                         }
                         .accessibilityLabel("关闭图片")
-                        .opacity(appeared ? 1 : 0)
                     }
                     .padding(.horizontal, 18)
                     .padding(.top, 18)
@@ -114,49 +161,26 @@ private struct AnimatedImageViewer: View {
                 }
             }
             .onAppear {
-                targetFrame = Self.fittedFrame(in: geometry.size)
-                currentFrame = sourceFrame ?? targetFrame.insetBy(dx: targetFrame.width * 0.25, dy: targetFrame.height * 0.25)
-                withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) {
-                    appeared = true
-                    currentFrame = targetFrame
-                }
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) { scale = 1 }
             }
         }
     }
 
     private func dismiss() {
-        guard appeared else { return }
-        let shrinkFrame = sourceFrame ?? targetFrame.insetBy(dx: targetFrame.width * 0.2, dy: targetFrame.height * 0.2)
-        withAnimation(.easeInOut(duration: 0.22)) {
-            appeared = false
-            currentFrame = shrinkFrame
+        guard dimmed else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            scale = 0.9
+            dimmed = false
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { onDismiss() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { onDismiss() }
     }
 
-    private static func fittedFrame(in size: CGSize) -> CGRect {
-        let inset: CGFloat = size.width > 700 ? 56 : 24
-        let available = CGSize(width: max(size.width - inset * 2, 80), height: max(size.height - inset * 2, 80))
-        return CGRect(x: inset, y: (size.height - available.height) / 2 + max((available.height - min(available.height, available.width)) / 2, 0),
-                      width: available.width, height: available.height)
+    private static func fittedSize(for imageSize: CGSize, in available: CGSize) -> CGSize {
+        guard imageSize.width > 0, imageSize.height > 0 else { return available }
+        let scale = min(available.width / imageSize.width, available.height / imageSize.height)
+        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
     }
 
-    private func load() async {
-        failed = false
-        if let cached = RemoteImageLoader.shared.cachedImage(for: url) {
-            image = cached
-            return
-        }
-        guard !loading else { return }
-        loading = true
-        defer { loading = false }
-        let loaded = await RemoteImageLoader.shared.image(for: url)
-        if let loaded {
-            image = loaded
-        } else {
-            failed = true
-        }
-    }
 }
 
 /// 可缩放的图片容器（UIScrollView 的缩放语义比手势组合更稳定）。
@@ -241,31 +265,20 @@ private struct ZoomableImage: UIViewRepresentable {
 }
 
 /// 图片加载与 GIF 解码（正文与评论共用）。
-@MainActor
-final class RemoteImageLoader {
+/// 网络与解码都在后台执行，避免大图/长动图阻塞主线程造成「点了图片卡住」。
+actor RemoteImageLoader {
     static let shared = RemoteImageLoader()
 
     private let cache = NSCache<NSURL, UIImage>()
     private var pending: [URL: Task<UIImage?, Never>] = [:]
 
-    private init() { cache.countLimit = 80 }
-
-    func cachedImage(for url: URL) -> UIImage? {
-        cache.object(forKey: url as NSURL)
-    }
+    private init() { cache.countLimit = 60 }
 
     func image(for url: URL) async -> UIImage? {
         if let cached = cache.object(forKey: url as NSURL) { return cached }
         if let task = pending[url] { return await task.value }
-        let task = Task<UIImage?, Never> {
-            var request = URLRequest(url: url)
-            request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
-            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            request.timeoutInterval = 30
-            guard let (data, response) = try? await URLSession.shared.data(for: request),
-                  let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode) else { return nil }
-            return RemoteImageLoader.decode(data)
+        let task = Task<UIImage?, Never>.detached(priority: .userInitiated) {
+            await RemoteImageLoader.download(url)
         }
         pending[url] = task
         let image = await task.value
@@ -274,25 +287,54 @@ final class RemoteImageLoader {
         return image
     }
 
-    /// GIF 解码为可播放的动图；普通图片直接解码。
+    private static func download(_ url: URL) async -> UIImage? {
+        var request = URLRequest(url: url)
+        request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 30
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else { return nil }
+        return decode(data)
+    }
+
+    /// 解码时限制像素尺寸与动图帧数，避免高分辨率图片占用过多内存/主线程时间。
     nonisolated static func decode(_ data: Data) -> UIImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             return UIImage(data: data)
         }
         let count = CGImageSourceGetCount(source)
-        guard count > 1 else { return UIImage(data: data) }
+        if count <= 1 {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 2400,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ]
+            if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                return UIImage(cgImage: cgImage)
+            }
+            return UIImage(data: data)
+        }
 
         var frames: [UIImage] = []
         var duration: Double = 0
-        for index in 0..<count {
-            guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
+        let maxFrames = 48
+        let maxPixel = 640
+        for index in 0..<min(count, maxFrames) {
             let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
             let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
             let delay = (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double)
                 ?? (gif?[kCGImagePropertyGIFDelayTime] as? Double)
                 ?? 0.1
-            duration += max(delay, 0.03)
-            frames.append(UIImage(cgImage: cgImage))
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ]
+            if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary) {
+                duration += max(delay, 0.03)
+                frames.append(UIImage(cgImage: cgImage))
+            }
         }
         guard !frames.isEmpty else { return UIImage(data: data) }
         return UIImage.animatedImage(with: frames, duration: duration)
