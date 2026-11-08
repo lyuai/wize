@@ -373,6 +373,7 @@ struct VideoPlayerScreen: View {
     @State private var title: String?
     @State private var posterImage: UIImage?
     @State private var loadToken = 0
+    @State private var dragOffset: CGFloat = 0
 
     var body: some View {
         ZStack {
@@ -406,9 +407,13 @@ struct VideoPlayerScreen: View {
                     .tint(.white)
                     .accessibilityLabel("正在加载视频")
             }
+            topScrim
             chrome
         }
+        .offset(y: dragOffset)
+        .simultaneousGesture(closeGesture)
         .statusBarHidden()
+        .accessibilityAction(.escape) { dismiss() }
         .task(id: loadToken) { await load() }
         .task(id: item.poster) {
             guard let poster = item.poster else { return }
@@ -439,19 +444,42 @@ struct VideoPlayerScreen: View {
         }
     }
 
+    private var closeGesture: some Gesture {
+        DragGesture(minimumDistance: 18)
+            .onChanged { value in
+                let down = max(value.translation.height, 0)
+                dragOffset = down * 0.72
+            }
+            .onEnded { value in
+                let shouldClose = value.translation.height > 90
+                    || value.predictedEndTranslation.height > 160
+                if shouldClose {
+                    dismiss()
+                } else {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+                        dragOffset = 0
+                    }
+                }
+            }
+    }
+
+    private var topScrim: some View {
+        VStack {
+            LinearGradient(
+                colors: [Color.black.opacity(0.52), Color.black.opacity(0)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 170)
+            .ignoresSafeArea(edges: .top)
+            Spacer(minLength: 0)
+        }
+        .allowsHitTesting(false)
+    }
+
     private var chrome: some View {
         VStack {
-            HStack(spacing: 10) {
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 38, height: 38)
-                        .background(.ultraThinMaterial, in: Circle())
-                        .overlay(Circle().strokeBorder(.white.opacity(0.14), lineWidth: 0.5))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("关闭视频")
+            HStack(spacing: 12) {
                 if let title, !title.isEmpty {
                     Text(title)
                         .font(.subheadline.weight(.medium))
@@ -460,6 +488,21 @@ struct VideoPlayerScreen: View {
                         .truncationMode(.tail)
                 }
                 Spacer(minLength: 0)
+                Button { dismiss() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .bold))
+                        Text("关闭")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 15)
+                    .frame(height: 40)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(Capsule().strokeBorder(.white.opacity(0.16), lineWidth: 0.5))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭视频")
             }
             .padding(.horizontal, 18)
             .padding(.top, 10)
