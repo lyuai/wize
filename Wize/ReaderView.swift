@@ -384,8 +384,9 @@ struct ReaderView: View {
                 }
         }
         .sheet(isPresented: $model.showsComments) {
-            NavigationStack { commentList.simultaneousGesture(closeCommentsGesture) }
-                .simultaneousGesture(closeCommentsGesture)
+            // Let the system sheet own vertical detent drags; a custom drag
+            // here intercepts slow upward pushes and can dismiss the sheet.
+            NavigationStack { commentList }
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
