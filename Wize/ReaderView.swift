@@ -188,6 +188,15 @@ struct ReaderView: View {
         }
     }
 
+    /// Present the login sheet even when the comment sheet is currently up.
+    private func openLogin(dismissComments: Bool = false) {
+        guard dismissComments else { model.showsLogin = true; return }
+        model.showsComments = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            model.showsLogin = true
+        }
+    }
+
     private var wideLayout: some View {
         GeometryReader { geometry in
             ZStack(alignment: .trailing) {
@@ -570,17 +579,28 @@ struct ReaderView: View {
                     .ignoresSafeArea(.container, edges: usesWideLayout ? [] : .bottom)
                 }
                 else if let error = model.bodyError {
-                    VStack(spacing: 12) { Text(error); Button("重试") { model.selectAnswer(item) } }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ReaderStatusCard(
+                        message: error,
+                        isLoginRequired: requiresLogin(error),
+                        onRetry: { model.selectAnswer(item) },
+                        onLogin: { openLogin() }
+                    )
+                    .frame(maxWidth: 460)
+                    .padding(24)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else { LoadingSkeleton(kind: .body, label: "正在加载正文").frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top) }
                 if let error = model.streamError {
-                    HStack {
-                        Text(error).font(.footnote).foregroundStyle(.secondary)
-                        Spacer(minLength: 8)
-                        if !model.streamSearchExhausted {
-                            Button("重试") { model.retryStream() }.font(.footnote)
-                        }
-                    }.padding(8)
-                        .padding(.bottom, usesWideLayout ? 0 : 64)
+                    let needsLogin = requiresLogin(error)
+                    ReaderStatusCard(
+                        message: error,
+                        isLoginRequired: needsLogin,
+                        retryTitle: "重试",
+                        onRetry: model.streamSearchExhausted ? nil : { model.retryStream() },
+                        onLogin: { openLogin() }
+                    )
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .padding(.bottom, usesWideLayout ? 0 : 56)
                 }
             }
             .task(id: model.streamAnchor?.key) {
@@ -690,17 +710,28 @@ struct ReaderView: View {
                     }
                 }
             }
-            if model.commentError != nil {
-                Button { Task { await model.loadComments(reset: true) } } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+            if let error = model.commentError {
+                HStack(spacing: 22) {
+                    if requiresLogin(error) {
+                        Button { openLogin(dismissComments: true) } label: {
+                            Image(systemName: "person.crop.circle")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(ReaderPalette.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("登录知乎")
+                    }
+                    Button { Task { await model.loadComments(reset: true) } } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("重试加载评论")
                 }
-                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
                 .listRowSeparator(.hidden)
-                .accessibilityLabel("重试加载评论")
             } else if model.loadingComments {
                 ProgressView().frame(maxWidth: .infinity).listRowSeparator(.hidden)
             } else if model.canLoadMoreComments {
@@ -855,11 +886,77 @@ struct ReaderView: View {
     }
 
     private func retryRow(_ message: String, action: @escaping () async -> Void) -> some View {
-        VStack(alignment: .leading, spacing: 8) { Text(message).foregroundStyle(.secondary); Button("重试") { Task { await action() } } }.padding(.vertical, 8)
+        ReaderStatusCard(
+            message: message,
+            isLoginRequired: requiresLogin(message),
+            retryTitle: "重试",
+            onRetry: { Task { await action() } },
+            onLogin: { openLogin() }
+        )
+        .padding(.vertical, 8)
+    }
+
+    private func requiresLogin(_ message: String) -> Bool {
+        message.contains("登录") || message.contains("安全验证")
     }
 
 }
 
+
+/// Shared recovery card for loading errors. Authentication failures get a
+/// direct login action instead of a dead-end retry.
+private struct ReaderStatusCard: View {
+    let message: String
+    let isLoginRequired: Bool
+    var retryTitle: String = "重试"
+    var onRetry: (() -> Void)? = nil
+    var onLogin: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isLoginRequired ? "person.crop.circle" : "wifi.exclamationmark")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(ReaderPalette.accent)
+                    .frame(width: 30, height: 30)
+                    .background(ReaderPalette.accent.opacity(0.10), in: Circle())
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(isLoginRequired ? "需要登录知乎" : "暂时无法加载")
+                        .font(.subheadline.weight(.semibold))
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 10) {
+                if isLoginRequired, let onLogin {
+                    Button("登录知乎") { onLogin() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                }
+                if let onRetry {
+                    if isLoginRequired {
+                        Button(retryTitle) { onRetry() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    } else {
+                        Button(retryTitle) { onRetry() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(ReaderPalette.directory, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+    }
+}
 
 /// Floating reading chrome (reading settings / account). It fades out while the
 /// reader scrolls down so the page reads edge-to-edge, and comes back on scroll up
