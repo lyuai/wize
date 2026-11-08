@@ -52,18 +52,46 @@ final class ImagePreviewPresenter {
 final class ImagePreviewModel: ObservableObject {
     @Published private(set) var image: UIImage?
     @Published private(set) var failed = false
+    @Published private(set) var saving = false
+    @Published private(set) var saveNotice: String?
 
-    private let url: URL
+    let url: URL
     private var loading = false
 
     init(url: URL) {
         self.url = url
-        Task { await load() }
+        if let cached = RemoteImageLoader.shared.cachedImage(for: url) {
+            self.image = cached
+        } else {
+            Task { await load() }
+        }
     }
 
     func retry() {
         failed = false
         Task { await load() }
+    }
+
+    func saveToPhotos() async {
+        guard !saving else { return }
+        saving = true
+        let result = await PhotoImageSaver.save(url: url)
+        saving = false
+        let message: String
+        switch result {
+        case .success:
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            message = "已存储到照片"
+        case .denied:
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+            message = "没有照片写入权限"
+        case .failed:
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            message = "图片存储失败"
+        }
+        withAnimation(.easeOut(duration: 0.18)) { saveNotice = message }
+        try? await Task.sleep(for: .seconds(1.8))
+        withAnimation(.easeIn(duration: 0.2)) { saveNotice = nil }
     }
 
     private func load() async {
@@ -117,15 +145,14 @@ private struct AnimatedImageViewer: View {
 
                 if let image = model.image {
                     let fitted = Self.fittedSize(for: image.size, in: available)
-                    ZoomableImage(image: image, onSingleTap: { dismiss() })
-                        .frame(width: fitted.width, height: fitted.height)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
-                        )
-                        .shadow(color: .black.opacity(0.35), radius: 24, y: 10)
-                        .scaleEffect(scale)
+                    ZoomableImage(
+                        image: image,
+                        fittedSize: fitted,
+                        cornerRadius: horizontalInset > 0 ? 14 : 0,
+                        onSingleTap: { dismiss() }
+                    )
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .scaleEffect(scale)
                 } else if model.failed {
                     VStack(spacing: 14) {
                         Image(systemName: "photo.badge.exclamationmark")
@@ -146,8 +173,27 @@ private struct AnimatedImageViewer: View {
                 }
 
                 VStack {
-                    HStack {
+                    HStack(spacing: 10) {
                         Spacer()
+                        if model.image != nil {
+                            Button {
+                                Task { await model.saveToPhotos() }
+                            } label: {
+                                Group {
+                                    if model.saving {
+                                        ProgressView().tint(.white).controlSize(.small)
+                                    } else {
+                                        Image(systemName: "arrow.down.to.line")
+                                            .font(.system(size: 15, weight: .semibold))
+                                            .foregroundStyle(.white)
+                                    }
+                                }
+                                .frame(width: 34, height: 34)
+                                .background(Color.black.opacity(0.55), in: Circle())
+                            }
+                            .disabled(model.saving)
+                            .accessibilityLabel("存储到照片")
+                        }
                         Button { dismiss() } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 15, weight: .semibold))
@@ -160,6 +206,17 @@ private struct AnimatedImageViewer: View {
                     .padding(.horizontal, 18)
                     .padding(.top, 18)
                     Spacer()
+                    if let notice = model.saveNotice {
+                        Text(notice)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color.black.opacity(0.75), in: Capsule())
+                            .padding(.bottom, 28)
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                    }
                 }
             }
             .onAppear {
@@ -185,13 +242,15 @@ private struct AnimatedImageViewer: View {
 
 }
 
-/// 可缩放的图片容器（UIScrollView 的缩放语义比手势组合更稳定）。
+/// 可缩放的图片容器（UIScrollView 铺满全屏，初始按 fittedSize 居中，放大时铺满整个屏幕区域）。
 private struct ZoomableImage: UIViewRepresentable {
     let image: UIImage
+    let fittedSize: CGSize
+    var cornerRadius: CGFloat = 0
     var onSingleTap: () -> Void = {}
 
-    func makeUIView(context: Context) -> UIScrollView {
-        let scrollView = UIScrollView()
+    func makeUIView(context: Context) -> CenteringZoomScrollView {
+        let scrollView = CenteringZoomScrollView()
         scrollView.delegate = context.coordinator
         scrollView.minimumZoomScale = 1
         scrollView.maximumZoomScale = 4
@@ -200,13 +259,16 @@ private struct ZoomableImage: UIViewRepresentable {
         scrollView.showsVerticalScrollIndicator = false
         scrollView.contentInsetAdjustmentBehavior = .never
         scrollView.backgroundColor = .clear
+        scrollView.clipsToBounds = true
 
         let imageView = UIImageView(image: image)
         imageView.contentMode = .scaleAspectFit
-        imageView.frame = scrollView.bounds
-        imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        imageView.clipsToBounds = true
+        imageView.layer.cornerRadius = cornerRadius
+        imageView.layer.cornerCurve = .continuous
         imageView.tag = 91
         scrollView.addSubview(imageView)
+        scrollView.fittedSize = fittedSize
 
         let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
@@ -227,36 +289,101 @@ private struct ZoomableImage: UIViewRepresentable {
         return scrollView
     }
 
-    func updateUIView(_ scrollView: UIScrollView, context: Context) {
-        if let imageView = scrollView.viewWithTag(91) as? UIImageView, imageView.image !== image {
-            imageView.image = image
+    func updateUIView(_ scrollView: CenteringZoomScrollView, context: Context) {
+        context.coordinator.onSingleTap = onSingleTap
+        if let imageView = scrollView.viewWithTag(91) as? UIImageView {
+            if imageView.image !== image {
+                imageView.image = image
+            }
+            imageView.layer.cornerRadius = scrollView.zoomScale > 1.01 ? 0 : cornerRadius
         }
+        scrollView.fittedSize = fittedSize
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    final class CenteringZoomScrollView: UIScrollView {
+        var fittedSize: CGSize = .zero {
+            didSet {
+                if oldValue != fittedSize {
+                    applyFittedGeometry()
+                }
+            }
+        }
+        private var lastBoundsSize: CGSize = .zero
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            if bounds.size != lastBoundsSize {
+                lastBoundsSize = bounds.size
+                applyFittedGeometry()
+            } else {
+                centerImageView()
+            }
+        }
+
+        func applyFittedGeometry() {
+            guard bounds.width > 0, bounds.height > 0,
+                  fittedSize.width > 0, fittedSize.height > 0,
+                  let imageView = viewWithTag(91) else { return }
+            if zoomScale != 1 {
+                setZoomScale(1, animated: false)
+            }
+            imageView.transform = .identity
+            imageView.frame = CGRect(origin: .zero, size: fittedSize)
+            contentSize = fittedSize
+            centerImageView()
+        }
+
+        func centerImageView() {
+            guard let imageView = viewWithTag(91) else { return }
+            let offsetX = max((bounds.width - contentSize.width) * 0.5, 0)
+            let offsetY = max((bounds.height - contentSize.height) * 0.5, 0)
+            imageView.center = CGPoint(
+                x: contentSize.width * 0.5 + offsetX,
+                y: contentSize.height * 0.5 + offsetY
+            )
+        }
+    }
+
     final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
-        weak var scrollView: UIScrollView?
+        weak var scrollView: CenteringZoomScrollView?
         var onSingleTap: () -> Void = {}
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
             scrollView.viewWithTag(91)
         }
 
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            guard let zoomScrollView = scrollView as? CenteringZoomScrollView else { return }
+            zoomScrollView.centerImageView()
+            if let imageView = zoomScrollView.viewWithTag(91) {
+                imageView.layer.cornerRadius = zoomScrollView.zoomScale > 1.01 ? 0 : imageView.layer.cornerRadius
+            }
+        }
+
         @objc func handleSingleTap() { onSingleTap() }
-        @objc func handleSwipeDown() { onSingleTap() }
+
+        @objc func handleSwipeDown() {
+            guard let scrollView, scrollView.zoomScale <= 1.01 else { return }
+            onSingleTap()
+        }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
             true
         }
 
         @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
-            guard let scrollView else { return }
+            guard let scrollView, let imageView = scrollView.viewWithTag(91) else { return }
             guard scrollView.zoomScale <= 1.01 else {
                 scrollView.setZoomScale(1, animated: true)
                 return
             }
-            let point = gesture.location(in: scrollView.viewWithTag(91))
+            let rawPoint = gesture.location(in: imageView)
+            let point = CGPoint(
+                x: min(max(rawPoint.x, 0), imageView.bounds.width),
+                y: min(max(rawPoint.y, 0), imageView.bounds.height)
+            )
             let target: CGFloat = 2.5
             let width = scrollView.bounds.width / target
             let height = scrollView.bounds.height / target
@@ -271,10 +398,14 @@ private struct ZoomableImage: UIViewRepresentable {
 actor RemoteImageLoader {
     static let shared = RemoteImageLoader()
 
-    private let cache = NSCache<NSURL, UIImage>()
+    nonisolated(unsafe) private let cache = NSCache<NSURL, UIImage>()
     private var pending: [URL: Task<UIImage?, Never>] = [:]
 
-    private init() { cache.countLimit = 60 }
+    private init() { cache.countLimit = 80 }
+
+    nonisolated func cachedImage(for url: URL) -> UIImage? {
+        cache.object(forKey: url as NSURL)
+    }
 
     func image(for url: URL) async -> UIImage? {
         if let cached = cache.object(forKey: url as NSURL) { return cached }

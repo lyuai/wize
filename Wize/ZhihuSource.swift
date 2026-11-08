@@ -40,6 +40,36 @@ func zhihuWebURL(for item: ReadingItem) -> URL? {
     }
 }
 
+func zhihuShareTitle(for item: ReadingItem) -> String {
+    let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+    let author = item.author.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !author.isEmpty else { return title.isEmpty ? "知乎内容" : title }
+    switch item.kind {
+    case .answer:
+        return title.isEmpty ? "\(author)的回答" : "\(title) — \(author)的回答"
+    case .article:
+        return title.isEmpty ? author : "\(title) — \(author)"
+    case .question:
+        return title.isEmpty ? "知乎问题" : title
+    }
+}
+
+/// 清洗知乎不同接口返回的属地文案（如「IP 属地浙江」「IP属地：上海」或空值「IP 属地」），只保留纯地区名。
+func normalizedIPRegion(_ raw: String?) -> String? {
+    guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+        return nil
+    }
+    value = value.replacingOccurrences(
+        of: #"(?i)(?:ip[\s\u00A0]*属地|属地|发布于|编辑于)[\s\u00A0:：·\-]*"#,
+        with: "",
+        options: .regularExpression
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    if value.isEmpty || value == "未知" || value == "暂无" {
+        return nil
+    }
+    return value
+}
+
 enum AnswerVote: String { case up, down, neutral }
 
 struct AnswerVoteResult {
@@ -72,6 +102,7 @@ struct ReadingComment: Identifiable {
     var depth: Int = 0
     var replyCount: Int = 0
     var parentID: String? = nil
+    var isAuthor: Bool = false
 }
 
 struct Page<T> {
@@ -109,10 +140,12 @@ protocol ReadingSource {
     func setVote(answerID: String, vote: AnswerVote) async throws -> AnswerVoteResult
     func comments(_ item: ReadingItem, next: URL?) async throws -> Page<ReadingComment>
     func replies(to comment: ReadingComment, next: URL?) async throws -> Page<ReadingComment>
+    func answerRegion(answerID: String) async throws -> String?
 }
 
 extension ReadingSource {
     func replies(to comment: ReadingComment, next: URL?) async throws -> Page<ReadingComment> { throw SourceError.unsupported }
+    func answerRegion(answerID: String) async throws -> String? { nil }
 }
 
 // The source is intentionally isolated from reader state and presentation.
@@ -218,7 +251,7 @@ final class ZhihuSource: ReadingSource {
             updated.authorHeadline = author["headline"] as? String ?? item.authorHeadline
             updated.authorToken = author["url_token"] as? String ?? item.authorToken
         }
-        updated.ipInfo = (json["ip_info"] as? String) ?? item.ipInfo
+        updated.ipInfo = normalizedIPRegion(json["ip_info"] as? String) ?? normalizedIPRegion(item.ipInfo)
         updated.upCount = json["voteup_count"] as? Int ?? item.upCount
         updated.downCount = json["votedown_count"] as? Int ?? item.downCount
         updated.commentCount = json["comment_count"] as? Int ?? item.commentCount
@@ -313,6 +346,14 @@ final class ZhihuSource: ReadingSource {
         _ = try await request(url, method: "PUT", form: [add ? "add_collections" : "remove_collections": collection.id])
     }
 
+    /// 推荐流接口不返回地区，列表需要地区时按回答单独补一次轻量请求。
+    func answerRegion(answerID: String) async throws -> String? {
+        let json = try await request(url("/api/v4/answers/\(answerID)", [
+            .init(name: "include", value: "ip_info")
+        ]), prefetch: true)
+        return normalizedIPRegion(json["ip_info"] as? String)
+    }
+
     func comments(_ item: ReadingItem, next: URL? = nil) async throws -> Page<ReadingComment> {
         let category = item.kind == .article ? "articles" : "answers"
         let json = try await request(next ?? url("/api/v4/\(category)/\(item.id)/root_comments", [
@@ -356,7 +397,7 @@ final class ZhihuSource: ReadingSource {
         item.avatarURL = mediaURL(author["avatar_url"])
         item.authorHeadline = author["headline"] as? String
         item.authorToken = author["url_token"] as? String
-        item.ipInfo = object["ip_info"] as? String
+        item.ipInfo = normalizedIPRegion(object["ip_info"] as? String)
         item.contentHTML = object["content"] as? String
         item.upCount = object["voteup_count"] as? Int
         item.downCount = object["votedown_count"] as? Int
@@ -368,8 +409,9 @@ final class ZhihuSource: ReadingSource {
 }
 
 func parseReadingComments(_ entries: [[String: Any]], depth: Int = 0, parentAuthor: String? = nil, parentID: String? = nil) -> [ReadingComment] {
-    entries.flatMap { entry -> [ReadingComment] in
-        guard let rawID = entry["id"], let id = (rawID as? String) ?? (rawID as? NSNumber)?.stringValue else { return [] }
+    var parsed: [ReadingComment] = []
+    for entry in entries {
+        guard let rawID = entry["id"], let id = (rawID as? String) ?? (rawID as? NSNumber)?.stringValue else { continue }
         func member(_ value: Any?) -> [String: Any] {
             let object = value as? [String: Any] ?? [:]
             return object["member"] as? [String: Any] ?? object
@@ -377,22 +419,50 @@ func parseReadingComments(_ entries: [[String: Any]], depth: Int = 0, parentAuth
         let author = member(entry["author"])
         let name = author["name"] as? String ?? "知乎用户"
         let reply = member(entry["reply_to_author"] ?? entry["reply_to"])
+        let explicitReplyTo = (reply["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         var comment = ReadingComment(id: id, author: name, html: entry["content"] as? String ?? "", likes: entry["vote_count"] as? Int ?? 0)
         comment.avatarURL = mediaURL(author["avatar_url"])
-        comment.replyTo = (reply["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? parentAuthor
-        comment.depth = depth
-        let rawParent = entry["reply_to_comment_id"] ?? entry["parent_comment_id"] ?? entry["in_reply_to_comment_id"]
-        let explicitParent = (rawParent as? String) ?? (rawParent as? NSNumber)?.stringValue
-        comment.parentID = explicitParent.flatMap { $0.isEmpty || $0 == "0" ? nil : $0 } ?? parentID
-        if let tags = entry["comment_tag"] as? [[String: Any]],
-           let ip = tags.first(where: { $0["type"] as? String == "ip_info" })?["text"] as? String,
-           !ip.isEmpty {
-            comment.ipInfo = ip
+        comment.replyTo = explicitReplyTo ?? parentAuthor
+        let rawParent = entry["reply_to_comment_id"] ?? entry["reply_comment_id"] ?? entry["parent_comment_id"] ?? entry["in_reply_to_comment_id"]
+        let explicitParent = ((rawParent as? String) ?? (rawParent as? NSNumber)?.stringValue).flatMap { $0.isEmpty || $0 == "0" ? nil : $0 }
+        if let explicitParent {
+            comment.parentID = explicitParent
+            if let target = parsed.first(where: { $0.id == explicitParent }) {
+                comment.depth = target.depth + 1
+            } else {
+                comment.depth = depth
+            }
+        } else if let explicitReplyTo, explicitReplyTo != parentAuthor,
+                  let target = parsed.last(where: { $0.author == explicitReplyTo }) {
+            comment.parentID = target.id
+            comment.depth = target.depth + 1
+        } else {
+            comment.parentID = parentID
+            comment.depth = depth
+        }
+        if let tags = entry["comment_tag"] as? [[String: Any]] {
+            if let ip = normalizedIPRegion(tags.first(where: { $0["type"] as? String == "ip_info" })?["text"] as? String) {
+                comment.ipInfo = ip
+            }
+            if tags.contains(where: {
+                let type = ($0["type"] as? String)?.lowercased() ?? ""
+                let text = $0["text"] as? String ?? ""
+                return type == "author" || text == "作者"
+            }) {
+                comment.isAuthor = true
+            }
+        }
+        let rawAuthor = entry["author"] as? [String: Any] ?? [:]
+        let role = ((rawAuthor["role"] as? String) ?? (author["role"] as? String))?.lowercased()
+        if role == "author" || (entry["is_author"] as? Bool == true) || (author["is_author"] as? Bool == true) {
+            comment.isAuthor = true
         }
         let children = entry["child_comments"] as? [[String: Any]] ?? []
         comment.replyCount = entry["child_comment_count"] as? Int ?? entry["reply_count"] as? Int ?? children.count
-        return [comment] + parseReadingComments(children, depth: depth + 1, parentAuthor: name, parentID: id)
+        parsed.append(comment)
+        parsed.append(contentsOf: parseReadingComments(children, depth: comment.depth + 1, parentAuthor: name, parentID: id))
     }
+    return parsed
 }
 
 struct CommentTreeRow: Identifiable {
@@ -408,12 +478,29 @@ func commentTreeRows(_ comments: [ReadingComment], collapsed: Set<String>) -> [C
     var seen = Set<String>()
     for comment in comments where seen.insert(comment.id).inserted { unique.append(comment) }
     let ids = Set(unique.map(\.id))
+    let byID = Dictionary(uniqueKeysWithValues: unique.map { ($0.id, $0) })
+    var lastByAuthorInRoot: [String: [String: String]] = [:]
     var children: [String: [ReadingComment]] = [:]
     var roots: [ReadingComment] = []
     for comment in unique {
-        if let parent = comment.parentID, parent != comment.id, ids.contains(parent) {
+        if var parent = comment.parentID, parent != comment.id, ids.contains(parent) {
+            var rootID = parent
+            var seenAncestors = Set<String>()
+            while let next = byID[rootID]?.parentID, next != rootID, ids.contains(next), seenAncestors.insert(next).inserted {
+                rootID = next
+            }
+            if parent == rootID,
+               let replyTo = comment.replyTo,
+               replyTo != byID[rootID]?.author,
+               let siblingID = lastByAuthorInRoot[rootID]?[replyTo],
+               siblingID != comment.id {
+                parent = siblingID
+            }
+            lastByAuthorInRoot[rootID, default: [:]][comment.author] = comment.id
             children[parent, default: []].append(comment)
-        } else { roots.append(comment) }
+        } else {
+            roots.append(comment)
+        }
     }
     var result: [CommentTreeRow] = []
     var visited = Set<String>()
@@ -482,81 +569,37 @@ enum CommentHTMLFragment {
     case image(URL)
 }
 
-enum CommentTextFragment {
+enum CommentTextFragment: Equatable {
     case text(String)
     case emoji(label: String, url: URL)
 }
 
+enum CommentInlineSegment: Equatable {
+    case text(String)
+    case emoji(label: String, url: URL)
+    case link(label: String, url: URL)
+}
+
 // Common Zhihu emoticons are returned as literal placeholders in comment text.
-// Load their images from Zhihu rather than bundling the artwork in the app.
+// Prefer Zhihu's own CDN (`pic*.zhimg.com`) for fast domestic loading and keep
+// jsDelivr as the fallback mirror.
 private let commentEmojiURLs: [String: String] = [
     "感谢": "https://pic1.zhimg.com/v2-694cac2ec9f3c63f774e723f77d8c840.png",
     "哇": "https://picx.zhimg.com/v2-6a766571a6d6d3a4d8d16f433e5b284c.png",
     "打招呼": "https://picx.zhimg.com/v2-95c560d0c9c0491f6ef404cc010878fc.png",
-    "握手": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_42.png",
+    "握手": "https://pic2.zhimg.com/v2-f5aa165e86b5c9ed3b7bee821da59365.png",
     "知乎益蜂": "https://pica.zhimg.com/v2-11d9b8b6edaae71e992f95007c777446.png",
     "百分百赞": "https://picx.zhimg.com/v2-27521d5ba23dfc1ea58fd9ebb220e304.png",
     "为爱发乎": "https://pic1.zhimg.com/v2-609b1f168acfa22d59fa09d3cb0846ee.png",
     "脑爆": "https://pica.zhimg.com/v2-b6f53e9726998343e7713f564a422575.png",
     "暗中学习": "https://pica.zhimg.com/v2-5dc88b4f8cbc58d7597e2134a384e392.png",
     "匿了": "https://pic1.zhimg.com/v2-c1e799b8357888525ec45793e8270306.png",
-    "谢邀": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_1.png",
-    "赞同": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_2.png",
-    "蹲": "https://pic4.zhimg.com/v2-66e5de3da039ac969d3b9d4dc5ef3536.png",
-    "爱": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_3.png",
-    "耶": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_13.png",
-    "惊喜": "https://pic1.zhimg.com/v2-5c9b7521eb16507c9d2f747f3a32a813.png",
-    "思考": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_6.png",
-    "酷": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_7.png",
-    "大笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_8.png",
-    "微笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_9.png",
-    "捂脸": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_10.png",
-    "捂嘴": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_11.png",
-    "飙泪笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_12.png",
-    "害羞": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_4.png",
-    "可怜": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_14.png",
-    "好奇": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_5.png",
-    "流泪": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_16.png",
-    "大哭": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_17.png",
-    "生气": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_18.png",
-    "惊讶": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_19.png",
-    "调皮": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_20.png",
-    "衰": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_21.png",
-    "发呆": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_22.png",
-    "机智": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_23.png",
-    "嘘": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_24.png",
-    "尴尬": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_25.png",
-    "小情绪": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_26.png",
-    "为难": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_27.png",
-    "吃瓜": "https://pic4.zhimg.com/v2-74ecc4b114fce67b6b42b7f602c3b1d6.png",
-    "语塞": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_29.png",
-    "看看你": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_30.png",
-    "撇嘴": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_31.png",
-    "魔性笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_32.png",
-    "潜水": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_33.png",
-    "口罩": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_34.png",
-    "开心": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_35.png",
-    "滑稽": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_36.png",
-    "笑哭": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_37.png",
-    "白眼": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_38.png",
-    "红心": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_39.png",
-    "柠檬": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_40.png",
-    "拜托": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_41.png",
-    "赞": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_43.png",
-    "发火": "https://pic1.zhimg.com/v2-d5c0ed511a09bf5ceb633387178e0d30.png",
-    "不抬杠": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_45.png",
-    "种草": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_46.png",
-    "抱抱": "https://pic2.zhimg.com/v2-b2e3fa9e0b6f431bd18d4a9d5d3c6596.png",
-    "doge": "https://pic4.zhimg.com/v2-501ff2e1fb7cf3f9326ec5348dc8d84f.png",
-]
-
-/// 表情图主地址不可用时使用的知乎 CDN 备用地址。
-private let commentEmojiFallbackURLs: [String: String] = [
-    "握手": "https://pic2.zhimg.com/v2-f5aa165e86b5c9ed3b7bee821da59365.png",
     "谢邀": "https://pic2.zhimg.com/v2-6fe2283baa639ae1d7c024487f1d68c7.png",
     "赞同": "https://pic2.zhimg.com/v2-419a1a3ed02b7cfadc20af558aabc897.png",
+    "蹲": "https://pic4.zhimg.com/v2-66e5de3da039ac969d3b9d4dc5ef3536.png",
     "爱": "https://pic1.zhimg.com/v2-0942128ebfe78f000e84339fbb745611.png",
     "耶": "https://pic2.zhimg.com/v2-f3b3b8756af8b42bd3cb534cbfdbe741.png",
+    "惊喜": "https://pic1.zhimg.com/v2-5c9b7521eb16507c9d2f747f3a32a813.png",
     "思考": "https://pic4.zhimg.com/v2-bffb2bf11422c5ef7d8949788114c2ab.png",
     "酷": "https://pic4.zhimg.com/v2-c96dd18b15beb196b2daba95d26d9b1c.png",
     "大笑": "https://pic1.zhimg.com/v2-3ac403672728e5e91f5b2d3c095e415a.png",
@@ -579,6 +622,7 @@ private let commentEmojiFallbackURLs: [String: String] = [
     "尴尬": "https://pic3.zhimg.com/v2-b779f7eb3eac05cce39cc33e12774890.png",
     "小情绪": "https://pic1.zhimg.com/v2-c65aaaa25730c59f5097aca04e606d88.png",
     "为难": "https://pic1.zhimg.com/v2-132ab52908934f6c3cd9166e51b99f47.png",
+    "吃瓜": "https://pic4.zhimg.com/v2-74ecc4b114fce67b6b42b7f602c3b1d6.png",
     "语塞": "https://pic2.zhimg.com/v2-58e3ec448b58054fde642914ebb850f9.png",
     "看看你": "https://pic3.zhimg.com/v2-4e4870fc6e57bb76e7e5924375cb20b6.png",
     "撇嘴": "https://pic2.zhimg.com/v2-1043b00a7b5776e2e6e1b0af2ab7445d.png",
@@ -593,8 +637,58 @@ private let commentEmojiFallbackURLs: [String: String] = [
     "柠檬": "https://pic4.zhimg.com/v2-a8f46a21217d58d2b4cdabc4568fde15.png",
     "拜托": "https://pic2.zhimg.com/v2-3e36d546a9454c8964fbc218f0db1ff8.png",
     "赞": "https://pic1.zhimg.com/v2-c71427010ca7866f9b08c37ec20672e0.png",
+    "发火": "https://pic1.zhimg.com/v2-d5c0ed511a09bf5ceb633387178e0d30.png",
     "不抬杠": "https://pic4.zhimg.com/v2-395d272d5635143119b1dbc0b51e05e4.png",
     "种草": "https://pic2.zhimg.com/v2-cb191a92f1296e33308b2aa16f61bfb9.png",
+    "抱抱": "https://pic2.zhimg.com/v2-b2e3fa9e0b6f431bd18d4a9d5d3c6596.png",
+    "doge": "https://pic4.zhimg.com/v2-501ff2e1fb7cf3f9326ec5348dc8d84f.png",
+]
+
+/// 表情图主地址不可用时使用的镜像备用地址。
+private let commentEmojiFallbackURLs: [String: String] = [
+    "握手": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_42.png",
+    "谢邀": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_1.png",
+    "赞同": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_2.png",
+    "爱": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_3.png",
+    "耶": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_13.png",
+    "思考": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_6.png",
+    "酷": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_7.png",
+    "大笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_8.png",
+    "微笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_9.png",
+    "捂脸": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_10.png",
+    "捂嘴": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_11.png",
+    "飙泪笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_12.png",
+    "害羞": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_4.png",
+    "可怜": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_14.png",
+    "好奇": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_5.png",
+    "流泪": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_16.png",
+    "大哭": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_17.png",
+    "生气": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_18.png",
+    "惊讶": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_19.png",
+    "调皮": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_20.png",
+    "衰": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_21.png",
+    "发呆": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_22.png",
+    "机智": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_23.png",
+    "嘘": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_24.png",
+    "尴尬": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_25.png",
+    "小情绪": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_26.png",
+    "为难": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_27.png",
+    "语塞": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_29.png",
+    "看看你": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_30.png",
+    "撇嘴": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_31.png",
+    "魔性笑": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_32.png",
+    "潜水": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_33.png",
+    "口罩": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_34.png",
+    "开心": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_35.png",
+    "滑稽": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_36.png",
+    "笑哭": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_37.png",
+    "白眼": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_38.png",
+    "红心": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_39.png",
+    "柠檬": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_40.png",
+    "拜托": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_41.png",
+    "赞": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_43.png",
+    "不抬杠": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_45.png",
+    "种草": "https://cdn.jsdelivr.net/gh/Dao1023/zhihu-emoji@main/zhihu/emoji_46.png",
 ]
 
 enum CommentEmoji {
@@ -602,9 +696,25 @@ enum CommentEmoji {
         commentEmojiURLs[name].flatMap(URL.init(string:))
     }
 
+    /// 所有内置表情图地址，供启动时预载，避免评论区先显示文字再替换成图片。
+    static var allURLs: [URL] {
+        commentEmojiURLs.values.compactMap(URL.init(string:))
+    }
+
+    /// 从评论 HTML/纯文本中提取用到的表情图地址。
+    static func urls(in text: String) -> [URL] {
+        guard let expression = try? NSRegularExpression(pattern: #"\[([^\[\]\n]{1,12})\]"#) else { return [] }
+        return expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
+            guard let nameRange = Range(match.range(at: 1), in: text),
+                  let value = commentEmojiURLs[String(text[nameRange])] else { return nil }
+            return URL(string: value)
+        }
+    }
+
     static func fallbackURL(for url: URL) -> URL? {
-        commentEmojiFallbackURLs.first { $0.value == url.absoluteString }
-            .flatMap { URL(string: $0.value) }
+        guard let name = commentEmojiURLs.first(where: { $0.value == url.absoluteString })?.key,
+              let fallback = commentEmojiFallbackURLs[name] else { return nil }
+        return URL(string: fallback)
     }
 }
 
@@ -621,6 +731,109 @@ func commentTextFragments(_ text: String) -> [CommentTextFragment] {
     }
     if position < text.endIndex { result.append(.text(String(text[position...]))) }
     return result
+}
+
+func normalizedCommentLinkURL(_ rawHref: String) -> URL? {
+    var value = rawHref.trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "&amp;", with: "&")
+    if value.hasPrefix("//") { value = "https:" + value }
+    if let components = URLComponents(string: value),
+       let host = components.host?.lowercased(),
+       (host == "link.zhihu.com" || host.hasSuffix(".zhihu.com")),
+       let target = components.queryItems?.first(where: { $0.name == "target" })?.value,
+       !target.isEmpty {
+        value = target
+        if value.hasPrefix("//") { value = "https:" + value }
+    }
+    guard let url = URL(string: value),
+          let scheme = url.scheme?.lowercased(),
+          scheme == "http" || scheme == "https" else { return nil }
+    return url
+}
+
+private func plainCommentText(_ html: String, trim: Bool) -> String {
+    var text = html.replacingOccurrences(of: "(?i)<br\\s*/?>|</(?:p|div|li)\\s*>", with: "\n", options: .regularExpression)
+    text = text.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
+    let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'"]
+    for (entity, value) in entities { text = text.replacingOccurrences(of: entity, with: value) }
+    return trim ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
+}
+
+/// 将评论 HTML 片段解析为文字、内置表情与可点击链接，供 `CommentInlineText` 原生混排。
+func commentInlineSegments(_ html: String) -> [CommentInlineSegment] {
+    let trimmedHTML = html.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedHTML.isEmpty else { return [] }
+    guard let anchorRegex = try? NSRegularExpression(pattern: #"(?is)<a\b([^>]*)>(.*?)</a\s*>"#) else {
+        let plain = plainCommentText(trimmedHTML, trim: true)
+        guard !plain.isEmpty else { return [] }
+        return commentTextFragments(plain).map {
+            switch $0 {
+            case .text(let s): return .text(s)
+            case .emoji(let l, let u): return .emoji(label: l, url: u)
+            }
+        }
+    }
+    let matches = anchorRegex.matches(in: trimmedHTML, range: NSRange(trimmedHTML.startIndex..., in: trimmedHTML))
+    if matches.isEmpty {
+        let plain = plainCommentText(trimmedHTML, trim: true)
+        guard !plain.isEmpty else { return [] }
+        return commentTextFragments(plain).map {
+            switch $0 {
+            case .text(let s): return .text(s)
+            case .emoji(let l, let u): return .emoji(label: l, url: u)
+            }
+        }
+    }
+    var segments: [CommentInlineSegment] = []
+    var position = trimmedHTML.startIndex
+    func appendPlainChunk(_ chunk: String) {
+        let cleaned = plainCommentText(chunk, trim: false)
+        guard !cleaned.isEmpty else { return }
+        for fragment in commentTextFragments(cleaned) {
+            switch fragment {
+            case .text(let s) where !s.isEmpty:
+                segments.append(.text(s))
+            case .emoji(let label, let url):
+                segments.append(.emoji(label: label, url: url))
+            default:
+                break
+            }
+        }
+    }
+    for match in matches {
+        guard let fullRange = Range(match.range, in: trimmedHTML),
+              let attrRange = Range(match.range(at: 1), in: trimmedHTML),
+              let innerRange = Range(match.range(at: 2), in: trimmedHTML) else { continue }
+        if position < fullRange.lowerBound {
+            appendPlainChunk(String(trimmedHTML[position..<fullRange.lowerBound]))
+        }
+        let attrs = String(trimmedHTML[attrRange])
+        let inner = String(trimmedHTML[innerRange])
+        let label = plainCommentText(inner, trim: true)
+        if let rawHref = htmlTagAttribute("href", in: "<a " + attrs + ">"),
+           let url = normalizedCommentLinkURL(rawHref) {
+            let displayLabel = label.isEmpty ? (url.host ?? url.absoluteString) : label
+            segments.append(.link(label: displayLabel, url: url))
+        } else if !label.isEmpty {
+            appendPlainChunk(inner)
+        }
+        position = fullRange.upperBound
+    }
+    if position < trimmedHTML.endIndex {
+        appendPlainChunk(String(trimmedHTML[position...]))
+    }
+    // Trim leading/trailing whitespace on the outer text segments
+    if case .text(let first) = segments.first {
+        let trimmed = first.replacingOccurrences(of: #"^\s+"#, with: "", options: .regularExpression)
+        if trimmed.isEmpty { segments.removeFirst() }
+        else { segments[0] = .text(trimmed) }
+    }
+    if case .text(let last) = segments.last {
+        let trimmed = last.replacingOccurrences(of: #"\s+$"#, with: "", options: .regularExpression)
+        if trimmed.isEmpty { segments.removeLast() }
+        else { segments[segments.count - 1] = .text(trimmed) }
+    }
+    return segments
 }
 
 // Preserve the source order and repeated images instead of collecting every image at the end.
@@ -641,7 +854,7 @@ func commentHTMLFragments(_ html: String) -> [CommentHTMLFragment] {
             if value.hasPrefix("//") { value = "https:" + value }
             if let url = mediaURL(value), let host = url.host?.lowercased(),
                host == "zhimg.com" || host.hasSuffix(".zhimg.com"),
-               tag.contains("图片") || tag.contains("动图") || tag.lowercased().contains("comment_img") || tag.lowercased().contains("comment_sticker") {
+               tag.contains("图片") || tag.contains("动图") || tag.contains("表情") || tag.lowercased().contains("comment_img") || tag.lowercased().contains("comment_sticker") {
                 imageURL = url
             }
         }
@@ -763,10 +976,22 @@ func expandedImageHTML(_ html: String) -> String {
         let tag = String(result[range])
         guard let url = htmlImageSources(tag).first else { continue }
         let escaped = url.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "\"", with: "&quot;")
-        let newTag = tag.replacingOccurrences(of: #"(?i)(?:^|\s)src\s*=\s*["'][^"']*["']"#, with: "", options: .regularExpression)
+        // 行内表情与贴纸必须立即加载、且不能带 alt/title：否则 WebKit 会先显示
+        // alt 里的「[感谢]」文本再被图片替换，阅读时能看到明显的文字变图过程。
+        let isEmoji = tag.range(of: "ztext-emoji", options: .caseInsensitive) != nil
+            || tag.range(of: "emojione", options: .caseInsensitive) != nil
+            || tag.range(of: "sticker", options: .caseInsensitive) != nil
+            || tag.range(of: #"alt\s*=\s*["']?\[[^\]]+\]"#, options: .regularExpression) != nil
+        var newTag = tag.replacingOccurrences(of: #"(?i)(?:^|\s)src\s*=\s*["'][^"']*["']"#, with: "", options: .regularExpression)
             .replacingOccurrences(of: #"(?i)(?:^|\s)loading\s*=\s*["'][^"']*["']"#, with: "", options: .regularExpression)
-        var attributes = "loading=\"lazy\" decoding=\"async\" src=\"\(escaped)\""
-        if htmlTagAttribute("width", in: newTag) == nil, htmlTagAttribute("height", in: newTag) == nil,
+        if isEmoji {
+            newTag = newTag.replacingOccurrences(of: #"(?i)(?:^|\s)alt\s*=\s*(?:["'][^"']*["']|[^\s>]+)"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?i)(?:^|\s)title\s*=\s*(?:["'][^"']*["']|[^\s>]+)"#, with: "", options: .regularExpression)
+        }
+        var attributes = isEmoji
+            ? "alt=\"\" loading=\"eager\" decoding=\"async\" src=\"\(escaped)\""
+            : "loading=\"lazy\" decoding=\"async\" src=\"\(escaped)\""
+        if !isEmoji, htmlTagAttribute("width", in: newTag) == nil, htmlTagAttribute("height", in: newTag) == nil,
            let rawWidth = htmlTagAttribute("data-rawwidth", in: tag).flatMap(Int.init), rawWidth > 0,
            let rawHeight = htmlTagAttribute("data-rawheight", in: tag).flatMap(Int.init), rawHeight > 0 {
             attributes += " width=\"\(rawWidth)\" height=\"\(rawHeight)\""

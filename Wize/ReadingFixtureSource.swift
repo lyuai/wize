@@ -23,7 +23,7 @@ final class ReadingFixtureSource: ReadingSource {
         """
         func answer(_ id: String, _ author: String, _ html: String, _ excerpt: String, _ votes: Int, _ comments: Int) -> ReadingItem {
             var item = ReadingItem(id: id, kind: .answer, title: question.title, excerpt: excerpt, author: author, questionID: question.id, contentHTML: html, upCount: votes, commentCount: comments)
-            item.ipInfo = "北京"
+            item.ipInfo = id == "sample-long" ? "浙江" : (id == "sample-short" ? "上海" : "北京")
             if id == "sample-long" {
                 item.imageURL = URL(string: "https://picx.zhimg.com/v2-f08ce62b9adca0db656dc08963d71541_720w.jpg?source=ccfced1a")
             }

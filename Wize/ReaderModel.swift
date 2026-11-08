@@ -63,6 +63,7 @@ final class ReaderModel: ObservableObject {
     private var detailCache: [String: CachedDetail] = [:]
     private var detailTasks: [String: (id: UUID, task: Task<ReadingItem, Error>)] = [:]
     private var prefetchingKeys: Set<String> = []
+    private var feedRegionTask: Task<Void, Never>?
     private var detailCacheGeneration = 0
     private var voteRevisions: [String: Int] = [:]
     private struct CachedComments { let page: Page<ReadingComment>; let date: Date }
@@ -174,8 +175,29 @@ final class ReaderModel: ObservableObject {
             let keys = Set(existing.map(\.key))
             feeds[current] = existing + page.items.filter { !keys.contains($0.key) }
             feedNext[current] = page.next
+            enrichFeedRegions(channel: current, generation: generation)
         } catch {
             if generation == feedGeneration { feedError = error.localizedDescription }
+        }
+    }
+
+    /// 推荐流接口不带地区，进入列表后静默补齐首屏回答的地区；失败则保持无地区。
+    private func enrichFeedRegions(channel: Channel, generation: Int) {
+        guard channel == .recommend else { return }
+        feedRegionTask?.cancel()
+        let targets = (feeds[channel] ?? []).filter { item in
+            item.kind == .answer && (item.ipInfo ?? "").isEmpty
+        }.prefix(10)
+        feedRegionTask = Task { [weak self] in
+            for item in targets {
+                guard !Task.isCancelled, let self else { return }
+                guard let region = try? await self.source.answerRegion(answerID: item.id),
+                      !region.isEmpty else { continue }
+                guard !Task.isCancelled, self.feedGeneration == generation else { return }
+                if let index = self.feeds[channel]?.firstIndex(where: { $0.key == item.key }) {
+                    self.feeds[channel]?[index].ipInfo = region
+                }
+            }
         }
     }
 
