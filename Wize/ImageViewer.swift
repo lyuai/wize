@@ -1,4 +1,3 @@
-import AVKit
 import Photos
 import SwiftUI
 import UIKit
@@ -101,9 +100,10 @@ private struct AnimatedImageViewer: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let inset: CGFloat = geometry.size.width > 700 ? 56 : 24
-            let available = CGSize(width: max(geometry.size.width - inset * 2, 80),
-                                   height: max(geometry.size.height - inset * 2, 80))
+            let horizontalInset: CGFloat = geometry.size.width > 700 ? 56 : 0
+            let verticalInset: CGFloat = geometry.size.width > 700 ? 56 : 0
+            let available = CGSize(width: max(geometry.size.width - horizontalInset * 2, 80),
+                                   height: max(geometry.size.height - verticalInset * 2, 80))
             ZStack {
                 Color.black.opacity(dimmed ? 0.62 : 0)
                     .ignoresSafeArea()
@@ -355,182 +355,6 @@ actor RemoteImageLoader {
     }
 }
 
-
-struct VideoPreviewItem: Identifiable {
-    let reference: VideoReference
-    let poster: URL?
-    var id: String { "\(reference.kind.rawValue):\(reference.id)" }
-}
-
-/// Native full-screen playback for embedded Zhihu videos. The HTML keeps a
-/// poster card; Lens zvideo/lens URLs are resolved here so the reader never
-/// leaves the app to watch a clip.
-struct VideoPlayerScreen: View {
-    let item: VideoPreviewItem
-    @Environment(\.dismiss) private var dismiss
-    @State private var player: AVPlayer?
-    @State private var errorMessage: String?
-    @State private var title: String?
-    @State private var posterImage: UIImage?
-    @State private var loadToken = 0
-    @State private var dragOffset: CGFloat = 0
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if let player {
-                VideoPlayer(player: player)
-                    .ignoresSafeArea()
-            } else if let errorMessage {
-                VStack(spacing: 16) {
-                    Image(systemName: "play.slash")
-                        .font(.system(size: 36, weight: .light))
-                        .foregroundStyle(.white.opacity(0.72))
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.white.opacity(0.65))
-                    HStack(spacing: 12) {
-                        Button("重试") { loadToken += 1 }
-                            .buttonStyle(.bordered)
-                            .tint(.white)
-                        Link("在浏览器打开", destination: webURL)
-                            .buttonStyle(.bordered)
-                            .tint(.white)
-                    }
-                }
-                .padding(32)
-            } else {
-                poster
-                ProgressView()
-                    .controlSize(.large)
-                    .tint(.white)
-                    .accessibilityLabel("正在加载视频")
-            }
-            topScrim
-            chrome
-        }
-        .offset(y: dragOffset)
-        .simultaneousGesture(closeGesture)
-        .statusBarHidden()
-        .accessibilityAction(.escape) { dismiss() }
-        .task(id: loadToken) { await load() }
-        .task(id: item.poster) {
-            guard let poster = item.poster else { return }
-            posterImage = await RemoteImageLoader.shared.image(for: poster)
-        }
-        .onDisappear {
-            player?.pause()
-        }
-    }
-
-    private var webURL: URL {
-        switch item.reference.kind {
-        case .lens:
-            return URL(string: "https://www.zhihu.com/video/\(item.reference.id)")!
-        case .zvideo:
-            return URL(string: "https://www.zhihu.com/zvideo/\(item.reference.id)")!
-        }
-    }
-
-    @ViewBuilder private var poster: some View {
-        if let posterImage {
-            Image(uiImage: posterImage)
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(Color.black.opacity(0.3))
-                .ignoresSafeArea()
-        }
-    }
-
-    private var closeGesture: some Gesture {
-        DragGesture(minimumDistance: 18)
-            .onChanged { value in
-                let down = max(value.translation.height, 0)
-                dragOffset = down * 0.72
-            }
-            .onEnded { value in
-                let shouldClose = value.translation.height > 90
-                    || value.predictedEndTranslation.height > 160
-                if shouldClose {
-                    dismiss()
-                } else {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
-                        dragOffset = 0
-                    }
-                }
-            }
-    }
-
-    private var topScrim: some View {
-        VStack {
-            LinearGradient(
-                colors: [Color.black.opacity(0.52), Color.black.opacity(0)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: 170)
-            .ignoresSafeArea(edges: .top)
-            Spacer(minLength: 0)
-        }
-        .allowsHitTesting(false)
-    }
-
-    private var chrome: some View {
-        VStack {
-            HStack(spacing: 12) {
-                if let title, !title.isEmpty {
-                    Text(title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                Spacer(minLength: 0)
-                Button { dismiss() } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 12, weight: .bold))
-                        Text("关闭")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 15)
-                    .frame(height: 40)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .overlay(Capsule().strokeBorder(.white.opacity(0.16), lineWidth: 0.5))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("关闭视频")
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 10)
-            Spacer(minLength: 0)
-        }
-    }
-
-    @MainActor
-    private func load() async {
-        errorMessage = nil
-        player?.pause()
-        player = nil
-        do {
-            let playback = try await ZhihuSource().videoPlayback(item.reference)
-            guard !Task.isCancelled else { return }
-            let player = AVPlayer(url: playback.url)
-            player.automaticallyWaitsToMinimizeStalling = true
-            self.title = playback.title
-            self.player = player
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-            try? AVAudioSession.sharedInstance().setActive(true)
-            player.play()
-        } catch {
-            guard !Task.isCancelled else { return }
-            errorMessage = (error as? LocalizedError)?.errorDescription ?? "视频暂时无法播放，请稍后重试。"
-        }
-    }
-}
 
 enum PhotoSaveResult {
     case success

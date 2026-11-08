@@ -33,7 +33,6 @@ struct ReaderView: View {
     @State private var profileItem: ReadingItem?
     @State private var collectionItem: ReadingItem?
     @State private var webLink: ReaderWebLink?
-    @State private var videoPreview: VideoPreviewItem?
     @State private var imageMenu: ReaderImageMenuTarget?
     @State private var imageNotice: String?
     @State private var collectedKeys: Set<String> = []
@@ -75,9 +74,6 @@ struct ReaderView: View {
         }
         .fullScreenCover(isPresented: $showsFeedbackThanks) {
             FeedbackThanksView(name: model.accountName) { showsFeedbackThanks = false }
-        }
-        .fullScreenCover(item: $videoPreview) { item in
-            VideoPlayerScreen(item: item)
         }
         .sheet(item: $profileItem) { AuthorProfileView(item: $0) }
         .sheet(item: $webLink) { link in
@@ -572,9 +568,6 @@ struct ReaderView: View {
                         onNearEnd: { Task { await model.loadMoreStream() } },
                         onOpenLink: openWebLink,
                         onOpenImage: { url, frame in imageMenu = ReaderImageMenuTarget(url: url, frame: frame) },
-                        onOpenVideo: { reference, poster, _ in
-                            videoPreview = VideoPreviewItem(reference: reference, poster: poster)
-                        }
                     )
                     .id(model.streamAnchor?.key ?? item.key)
                     .ignoresSafeArea(.container, edges: usesWideLayout ? [] : .bottom)
@@ -610,25 +603,29 @@ struct ReaderView: View {
             .background(readingBackground.ignoresSafeArea(edges: .bottom))
             .overlay(alignment: .trailing) {
                 if usesWideLayout, !model.showsComments, model.bodyHTML != nil {
-                    ReaderActionOverlay(focus: focus, model: model, layout: .trailing,
-                                        collectedKeys: collectedKeys,
-                                        onProfile: { profileItem = $0 },
-                                        onCollect: { collectionItem = $0 })
-                        .readerGlassCapsule()
-                        .padding(.trailing, 12)
+                    ReaderChromeVisibility(chrome: chrome) {
+                        ReaderActionOverlay(focus: focus, model: model, layout: .trailing,
+                                            collectedKeys: collectedKeys,
+                                            onProfile: { profileItem = $0 },
+                                            onCollect: { collectionItem = $0 })
+                            .readerGlassCapsule()
+                            .padding(.trailing, 12)
+                    }
                 }
             }
             .overlay(alignment: .bottom) {
                 if !usesWideLayout, model.bodyHTML != nil {
-                    ReaderActionOverlay(focus: focus, model: model, layout: .bottom,
-                                        collectedKeys: collectedKeys,
-                                        onProfile: { profileItem = $0 },
-                                        onCollect: { collectionItem = $0 })
-                        .frame(maxWidth: 260)
-                        .readerGlassCapsule()
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 8)
-                        .frame(maxWidth: .infinity)
+                    ReaderChromeVisibility(chrome: chrome) {
+                        ReaderActionOverlay(focus: focus, model: model, layout: .bottom,
+                                            collectedKeys: collectedKeys,
+                                            onProfile: { profileItem = $0 },
+                                            onCollect: { collectionItem = $0 })
+                            .frame(maxWidth: 260)
+                            .readerGlassCapsule()
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 8)
+                            .frame(maxWidth: .infinity)
+                    }
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
@@ -962,6 +959,24 @@ private struct ReaderStatusCard: View {
 /// Floating reading chrome (reading settings / account). It fades out while the
 /// reader scrolls down so the page reads edge-to-edge, and comes back on scroll up
 /// or when the page is at the top. Only this capsule observes the visibility store.
+private struct ReaderChromeVisibility<Content: View>: View {
+    @ObservedObject var chrome: ReadingChrome
+    let content: Content
+
+    init(chrome: ReadingChrome, @ViewBuilder content: () -> Content) {
+        self.chrome = chrome
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .opacity(chrome.showsControls ? 1 : 0)
+            .allowsHitTesting(chrome.showsControls)
+            .accessibilityHidden(!chrome.showsControls)
+            .animation(.easeInOut(duration: 0.18), value: chrome.showsControls)
+    }
+}
+
 private struct ReaderChromeCapsule<Content: View>: View {
     @ObservedObject var chrome: ReadingChrome
     let content: Content
@@ -1674,7 +1689,6 @@ private struct HTMLReader: UIViewRepresentable {
     var onNearEnd: () -> Void = {}
     var onOpenLink: (URL) -> Void = { _ in }
     var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
-    var onOpenVideo: (VideoReference, URL?, CGRect) -> Void = { _, _, _ in }
     @ObservedObject private var fontManager = ReadingFontManager.shared
     @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
     @AppStorage("reading.lineHeight") private var lineHeight = 1.8
@@ -1683,7 +1697,10 @@ private struct HTMLReader: UIViewRepresentable {
     @AppStorage("reading.font") private var font = "system"
     @AppStorage("reading.theme") private var theme = "system"
     func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration(); config.defaultWebpagePreferences.allowsContentJavaScript = false
+        let config = WKWebViewConfiguration()
+        config.defaultWebpagePreferences.allowsContentJavaScript = false
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
         let initialPositionScript = WKUserScript(
             source: """
             (() => {
@@ -1798,7 +1815,6 @@ private struct HTMLReader: UIViewRepresentable {
         context.coordinator.onNearEnd = onNearEnd
         context.coordinator.onOpenLink = onOpenLink
         context.coordinator.onOpenImage = onOpenImage
-        context.coordinator.onOpenVideo = onOpenVideo
         context.coordinator.onChromeVisibility = onChromeVisibility
         context.coordinator.streamEnabled = !stream.isEmpty
         // Scrolling only changes the active answer, never the stream contents. Skip the
@@ -1839,6 +1855,11 @@ private struct HTMLReader: UIViewRepresentable {
         .wize-video-play { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:linear-gradient(180deg,rgba(0,0,0,.02),rgba(0,0,0,.28)); }
         .wize-video-play svg { width:54px; height:54px; padding:11px; border-radius:50%; background:rgba(255,255,255,.94); fill:#1b1f1d; box-shadow:0 6px 20px rgba(0,0,0,.24); }
         .wize-video-title { position:absolute; left:14px; right:14px; bottom:12px; color:#fff; font:500 13px -apple-system,sans-serif; line-height:1.35; text-shadow:0 1px 4px rgba(0,0,0,.55); }
+        .wize-video video { display:block; width:100%; height:auto; background:#000; }
+        .wize-video.is-playing { aspect-ratio:auto; }
+        .wize-video[data-loading="1"] .wize-video-play svg { animation: wize-video-pulse 1s ease-in-out infinite; }
+        @keyframes wize-video-pulse { 50% { transform:scale(.86); opacity:.55; } }
+        .wize-video-error { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:16px; color:#fff; font:500 13px -apple-system,sans-serif; text-align:center; background:rgba(0,0,0,.6); }
         main blockquote { margin: 1.2em 0; padding-left: 1em; border-left: 2px dotted rgba(128,128,128,.42); color: inherit; opacity: .82; }
         main img.emojione, main img.ztext-emoji { display: inline-block; vertical-align: -0.18em; margin: 0 .06em; border-radius: 0; }
         main hr { border: 0; height: 0; border-top: 1.5px dotted color-mix(in srgb, currentColor 36%, transparent); margin: 2em 0; }
@@ -1977,14 +1998,116 @@ private struct HTMLReader: UIViewRepresentable {
         private var lastInspection = Date.distantPast
         private var lastNearEnd = Date.distantPast
         private var chromeVisible = true
+        private var chromeRevealWorkItem: DispatchWorkItem?
         private var lastScrollOffsetY: CGFloat = 0
         private var scrollAccum: CGFloat = 0
         private weak var webView: WKWebView?
         var onOpenLink: (URL) -> Void = { _ in }
         var onOpenImage: (URL, CGRect) -> Void = { _, _ in }
-        var onOpenVideo: (VideoReference, URL?, CGRect) -> Void = { _, _, _ in }
 
         func attach(_ webView: WKWebView) { self.webView = webView }
+
+        private var inlineVideoTask: Task<Void, Never>?
+        private var lastVideoPauseCheck = Date.distantPast
+
+        private func playInlineVideo(_ reference: VideoReference, poster: URL?, in webView: WKWebView) {
+            inlineVideoTask?.cancel()
+            let id = reference.id
+            let loading = """
+            (() => {
+                const card = document.querySelector('[data-wize-video="\(id)"]');
+                if (!card) return false;
+                card.removeAttribute('data-error');
+                const error = card.querySelector('.wize-video-error');
+                if (error) error.remove();
+                card.setAttribute('data-loading', '1');
+                return true;
+            })()
+            """
+            webView.evaluateJavaScript(loading)
+            inlineVideoTask = Task { @MainActor [weak self, weak webView] in
+                guard let self, let webView else { return }
+                do {
+                    let playback = try await ZhihuSource().videoPlayback(reference)
+                    guard !Task.isCancelled else { return }
+                    self.injectInlineVideo(playback, poster: poster ?? playback.poster, reference: reference, in: webView)
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    self.showInlineVideoError(in: webView, id: id)
+                }
+            }
+        }
+
+        private func injectInlineVideo(_ playback: VideoPlayback, poster: URL?, reference: VideoReference, in webView: WKWebView) {
+            guard let urlData = try? JSONEncoder().encode(playback.url.absoluteString),
+                  let urlJSON = String(data: urlData, encoding: .utf8) else { return }
+            let posterJSON: String
+            if let poster,
+               let data = try? JSONEncoder().encode(poster.absoluteString),
+               let value = String(data: data, encoding: .utf8) {
+                posterJSON = value
+            } else {
+                posterJSON = "\"\""
+            }
+            let script = """
+            (() => {
+                const card = document.querySelector('[data-wize-video="\(reference.id)"]');
+                if (!card) return false;
+                document.querySelectorAll('.wize-video video').forEach(v => v.pause());
+                card.classList.add('is-playing');
+                card.removeAttribute('data-loading');
+                card.removeAttribute('data-error');
+                card.innerHTML = '';
+                const video = document.createElement('video');
+                video.src = \(urlJSON);
+                video.controls = true;
+                video.playsInline = true;
+                video.setAttribute('playsinline', '');
+                video.setAttribute('webkit-playsinline', '');
+                video.preload = 'auto';
+                const poster = \(posterJSON);
+                if (poster) video.setAttribute('poster', poster);
+                card.appendChild(video);
+                const start = () => video.play().catch(() => {});
+                video.addEventListener('loadedmetadata', start, { once: true });
+                if (video.readyState >= 1) start();
+                return true;
+            })()
+            """
+            webView.evaluateJavaScript(script)
+        }
+
+        private func showInlineVideoError(in webView: WKWebView, id: String) {
+            let script = """
+            (() => {
+                const card = document.querySelector('[data-wize-video="\(id)"]');
+                if (!card) return false;
+                card.removeAttribute('data-loading');
+                card.setAttribute('data-error', '1');
+                let error = card.querySelector('.wize-video-error');
+                if (!error) {
+                    error = document.createElement('span');
+                    error.className = 'wize-video-error';
+                    card.appendChild(error);
+                }
+                error.textContent = '视频加载失败，点按重试';
+                return true;
+            })()
+            """
+            webView.evaluateJavaScript(script)
+        }
+
+        private func pauseOffscreenVideos(in webView: WKWebView) {
+            let script = """
+            (() => {
+                document.querySelectorAll('.wize-video video').forEach(v => {
+                    const r = v.getBoundingClientRect();
+                    if (r.bottom < 24 || r.top > innerHeight - 24) v.pause();
+                });
+            })()
+            """
+            webView.evaluateJavaScript(script)
+        }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
             true
@@ -2000,6 +2123,7 @@ private struct HTMLReader: UIViewRepresentable {
                 const el = document.elementFromPoint(\(point.x), \(point.y));
                 const video = el && el.closest ? el.closest('[data-wize-video]') : null;
                 if (video) {
+                    if (video.querySelector('video') || video.getAttribute('data-loading') === '1') return null;
                     const rect = video.getBoundingClientRect();
                     return { video: video.getAttribute('data-wize-video') || '', kind: video.getAttribute('data-wize-video-kind') || 'lens', poster: video.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
                 }
@@ -2020,7 +2144,7 @@ private struct HTMLReader: UIViewRepresentable {
                 if let id = info["video"] as? String, !id.isEmpty {
                     let kind = VideoKind(rawValue: info["kind"] as? String ?? "") ?? .lens
                     let poster = (info["poster"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) }
-                    DispatchQueue.main.async { self.onOpenVideo(VideoReference(id: id, kind: kind), poster, frame) }
+                    self.playInlineVideo(VideoReference(id: id, kind: kind), poster: poster, in: webView)
                     return
                 }
                 guard let src = info["src"] as? String,
@@ -2040,6 +2164,7 @@ private struct HTMLReader: UIViewRepresentable {
                 const el = document.elementFromPoint(\(point.x), \(point.y));
                 const video = el && el.closest ? el.closest('[data-wize-video]') : null;
                 if (!video) return null;
+                if (video.querySelector('video') || video.getAttribute('data-loading') === '1') return null;
                 const rect = video.getBoundingClientRect();
                 return { id: video.getAttribute('data-wize-video') || '', kind: video.getAttribute('data-wize-video-kind') || 'lens', poster: video.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
             })()
@@ -2049,16 +2174,12 @@ private struct HTMLReader: UIViewRepresentable {
                       let id = info["id"] as? String, !id.isEmpty else { return }
                 let kind = VideoKind(rawValue: info["kind"] as? String ?? "") ?? .lens
                 let poster = (info["poster"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) }
-                let rect = CGRect(x: info["x"] as? Double ?? 0,
-                                  y: info["y"] as? Double ?? 0,
-                                  width: info["width"] as? Double ?? 0,
-                                  height: info["height"] as? Double ?? 0)
-                let frame = webView.convert(rect, to: nil)
-                DispatchQueue.main.async { self.onOpenVideo(VideoReference(id: id, kind: kind), poster, frame) }
+                self.playInlineVideo(VideoReference(id: id, kind: kind), poster: poster, in: webView)
             }
         }
 
         func cancelPendingAppends() {
+            inlineVideoTask?.cancel()
             documentGeneration += 1
             pendingAppends.removeAll()
             appending = false
@@ -2165,6 +2286,7 @@ private struct HTMLReader: UIViewRepresentable {
             self.webView = webView
             loadingDocument = false
             chromeVisible = true
+            chromeRevealWorkItem?.cancel()
             lastScrollOffsetY = 0
             scrollAccum = 0
             onChromeVisibility(true)
@@ -2199,6 +2321,10 @@ private struct HTMLReader: UIViewRepresentable {
             if scrollView.contentOffset.x != 0 {
                 scrollView.setContentOffset(CGPoint(x: 0, y: scrollView.contentOffset.y), animated: false)
             }
+            if let webView, Date().timeIntervalSince(lastVideoPauseCheck) > 0.2 {
+                lastVideoPauseCheck = Date()
+                pauseOffscreenVideos(in: webView)
+            }
             guard streamEnabled, !loadingDocument, pendingAnchorID == nil, !restoringAnchor,
                   scrollView.contentSize.height > 0, let webView else { return }
             if userHasScrolled {
@@ -2206,6 +2332,7 @@ private struct HTMLReader: UIViewRepresentable {
                 let delta = y - lastScrollOffsetY
                 lastScrollOffsetY = y
                 if y <= 16 {
+                    chromeRevealWorkItem?.cancel()
                     if !chromeVisible {
                         chromeVisible = true
                         onChromeVisibility(true)
@@ -2217,13 +2344,16 @@ private struct HTMLReader: UIViewRepresentable {
                         chromeVisible = false
                         scrollAccum = 0
                         onChromeVisibility(false)
+                        scheduleChromeReveal()
                     } else if scrollAccum < -40, !chromeVisible {
+                        chromeRevealWorkItem?.cancel()
                         chromeVisible = true
                         scrollAccum = 0
                         onChromeVisibility(true)
                     } else if abs(scrollAccum) > 160 {
                         scrollAccum = 0
                     }
+                    if !chromeVisible { scheduleChromeReveal() }
                 }
             } else {
                 // Keep the baseline in step with programmatic scrolling (anchor restore).
@@ -2238,10 +2368,26 @@ private struct HTMLReader: UIViewRepresentable {
             if userHasScrolled, Date().timeIntervalSince(lastInspection) > 0.2 { inspect(webView) }
         }
         func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-            if !decelerate, let webView, streamEnabled { inspect(webView) }
+            if !decelerate {
+                if let webView, streamEnabled { inspect(webView) }
+                scheduleChromeReveal(after: 0.3)
+            }
         }
         func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
             if let webView, streamEnabled { inspect(webView) }
+            scheduleChromeReveal(after: 0.3)
+        }
+
+        private func scheduleChromeReveal(after delay: TimeInterval = 0.55) {
+            guard !chromeVisible else { return }
+            chromeRevealWorkItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                guard let self, !self.chromeVisible else { return }
+                self.chromeVisible = true
+                self.onChromeVisibility(true)
+            }
+            chromeRevealWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
         func inspectAfterLayout(_ webView: WKWebView) {
             guard streamEnabled, !loadingDocument else { return }
