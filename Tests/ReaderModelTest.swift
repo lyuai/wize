@@ -16,13 +16,21 @@ final class FixtureSource: ReadingSource {
     var detailDelay: UInt64 = 0
     var anchorPage: Int?
     var answerRequests = 0
+    var feedRequests = 0
+    var recommendFeedItems: [ReadingItem] = []
+    var hotFeedItems: [ReadingItem] = []
     init() {
         func item(_ id: String) -> ReadingItem {
             ReadingItem(id: id, kind: .answer, title: "问题", excerpt: "", author: id, questionID: "q", contentHTML: "<p>\(id)</p>")
         }
         first = item("first"); middle = item("middle"); last = item("last")
     }
-    func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem> { Page(items: [], next: nil) }
+    func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem> {
+        feedRequests += 1
+        let items = hot ? hotFeedItems : recommendFeedItems
+        let nextURL = items.isEmpty ? nil : URL(string: "https://example.invalid/feed-next")
+        return Page(items: items, next: nextURL)
+    }
     func currentUser() async throws -> (name: String, avatar: URL?, headline: String?, token: String?) { ("读者", nil, "爱阅读", "test-reader") }
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {
         answerRequests += 1
@@ -262,6 +270,49 @@ struct ReaderModelTest {
         precondition(streamSource.detailRequests == requestsBeforeSwitch, "Switching the visible answer must not refetch the detail")
         precondition(streamModel.selected?.id == "last", "The visible answer must follow the reading focus")
 
-        print("PASS: sorting, current answer, comment ownership, stale responses and on-demand fonts")
+        // Automatic background refresh & non-disruptive pending feed staging
+        var now = Date(timeIntervalSince1970: 1_700_000_000)
+        let refreshSource = FixtureSource()
+        refreshSource.recommendFeedItems = [refreshSource.first, refreshSource.middle]
+        refreshSource.hotFeedItems = [refreshSource.last]
+        let refreshModel = ReaderModel(source: refreshSource, nowProvider: { now })
+        await refreshModel.loadFeed()
+        precondition(refreshModel.feeds[.recommend]?.map(\.id) == ["first", "middle"], "Initial feed must load")
+        precondition(!refreshModel.isFeedStale(for: .recommend), "Freshly loaded feed must not be stale")
+        let initialFeedRequests = refreshSource.feedRequests
+        let skippedRefresh = await refreshModel.autoRefreshFeedIfNeeded(for: .recommend, applyImmediately: true)
+        precondition(!skippedRefresh && refreshSource.feedRequests == initialFeedRequests, "Auto refresh must not fire before staleness interval")
+
+        // Switching to .hot loads .hot; switching back to .recommend while fresh must NOT re-fetch or paginate
+        await refreshModel.activateChannel(.hot, applyImmediately: true)
+        precondition(refreshModel.feeds[.hot]?.map(\.id) == ["last"], "Switching to hot must load hot feed")
+        let requestsAfterHot = refreshSource.feedRequests
+        await refreshModel.activateChannel(.recommend, applyImmediately: true)
+        precondition(refreshSource.feedRequests == requestsAfterHot, "Switching back to a fresh channel must not trigger pagination or reload")
+
+        // Advance clock past autoRefreshInterval (10 min): background refresh while reading / scrolled stages into pendingFeeds
+        now = now.addingTimeInterval(ReaderModel.autoRefreshInterval + 5)
+        precondition(refreshModel.isFeedStale(for: .recommend), "Feed must become stale after autoRefreshInterval")
+        let freshItem = ReadingItem(id: "fresh-1", kind: .answer, title: "新问题", excerpt: "", author: "新作者", questionID: "q2", contentHTML: "<p>fresh</p>")
+        refreshSource.recommendFeedItems = [freshItem, refreshSource.first]
+        let staged = await refreshModel.autoRefreshFeedIfNeeded(for: .recommend, applyImmediately: false)
+        precondition(staged && refreshModel.hasPendingFeed(for: .recommend), "Stale refresh with applyImmediately=false must stage pending feed")
+        precondition(refreshModel.pendingNewItemCount(for: .recommend) == 1, "Pending count must report only novel items")
+        precondition(refreshModel.feeds[.recommend]?.map(\.id) == ["first", "middle"], "Visible feed must stay untouched until pending feed is applied")
+
+        // Applying pending feed prepends new items without duplicating existing ones
+        refreshModel.applyPendingFeed(for: .recommend)
+        precondition(!refreshModel.hasPendingFeed(for: .recommend), "Applying pending feed must clear pending state")
+        precondition(refreshModel.feeds[.recommend]?.map(\.id) == ["fresh-1", "first", "middle"], "Applied pending feed must prepend novel items and keep existing items")
+
+        // Immediate auto-refresh at top of list updates in place without leaving pending banner
+        now = now.addingTimeInterval(ReaderModel.autoRefreshInterval + 5)
+        let freshItem2 = ReadingItem(id: "fresh-2", kind: .answer, title: "新问题2", excerpt: "", author: "新作者2", questionID: "q3", contentHTML: "<p>fresh2</p>")
+        refreshSource.recommendFeedItems = [freshItem2, freshItem]
+        let appliedDirect = await refreshModel.autoRefreshFeedIfNeeded(for: .recommend, applyImmediately: true)
+        precondition(appliedDirect && !refreshModel.hasPendingFeed(for: .recommend), "Immediate auto-refresh must apply directly without pending banner")
+        precondition(refreshModel.feeds[.recommend]?.first?.id == "fresh-2", "Immediate auto-refresh must place newest item at top")
+
+        print("PASS: sorting, current answer, comment ownership, stale responses, on-demand fonts and auto background refresh")
     }
 }

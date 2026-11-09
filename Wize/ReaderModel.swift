@@ -47,10 +47,23 @@ final class ReaderModel: ObservableObject {
     @Published var accountAvatarURL: URL?
     @Published var accountHeadline: String?
     @Published var accountToken: String?
+    /// 自动刷新阈值：距离上次该频道首屏刷新满 10 分钟后允许自动静默刷新。
+    nonisolated static let autoRefreshInterval: TimeInterval = 600
+    /// 后台静默拉取到但尚未合入主列表的新内容（当用户正在阅读正文或已向下滚动列表时暂存）。
+    @Published private(set) var pendingFeeds: [Channel: Page<ReadingItem>] = [:]
     private let source: any ReadingSource
-    init() { self.source = ZhihuSource() }
-    init(source: any ReadingSource) { self.source = source }
+    private let nowProvider: () -> Date
+    init() {
+        self.source = ZhihuSource()
+        self.nowProvider = { Date() }
+    }
+    init(source: any ReadingSource, nowProvider: @escaping () -> Date = { Date() }) {
+        self.source = source
+        self.nowProvider = nowProvider
+    }
     private var feedNext: [Channel: URL] = [:]
+    private var feedRefreshedAt: [Channel: Date] = [:]
+    private var backgroundRefreshInFlight: Set<Channel> = []
     private var commentsNext: URL?
     private var feedGeneration = 0
     private var bodyGeneration = 0
@@ -162,6 +175,7 @@ final class ReaderModel: ObservableObject {
     func loadFeed(reset: Bool = false) async {
         guard !loadingFeed || reset else { return }
         let current = channel
+        let isFirstPage = reset || feeds[current] == nil
         let next = reset ? nil : feedNext[current]
         if !reset && feeds[current] != nil && next == nil { return }
         feedGeneration += 1
@@ -175,9 +189,150 @@ final class ReaderModel: ObservableObject {
             let keys = Set(existing.map(\.key))
             feeds[current] = existing + page.items.filter { !keys.contains($0.key) }
             feedNext[current] = page.next
+            if isFirstPage {
+                feedRefreshedAt[current] = nowProvider()
+                pendingFeeds.removeValue(forKey: current)
+            }
             enrichFeedRegions(channel: current, generation: generation)
         } catch {
             if generation == feedGeneration { feedError = error.localizedDescription }
+        }
+    }
+
+    /// 判断目标频道是否已超过自动刷新时间间隔（默认 10 分钟）或尚未加载。
+    func isFeedStale(for targetChannel: Channel? = nil) -> Bool {
+        let ch = targetChannel ?? channel
+        guard let items = feeds[ch], !items.isEmpty,
+              let refreshedAt = feedRefreshedAt[ch] else {
+            return true
+        }
+        return nowProvider().timeIntervalSince(refreshedAt) >= Self.autoRefreshInterval
+    }
+
+    func hasPendingFeed(for targetChannel: Channel? = nil) -> Bool {
+        let ch = targetChannel ?? channel
+        return !(pendingFeeds[ch]?.items.isEmpty ?? true)
+    }
+
+    func pendingNewItemCount(for targetChannel: Channel? = nil) -> Int {
+        let ch = targetChannel ?? channel
+        guard let pending = pendingFeeds[ch]?.items, !pending.isEmpty else { return 0 }
+        let existingKeys = Set((feeds[ch] ?? []).map(\.key))
+        let novelCount = pending.filter { !existingKeys.contains($0.key) }.count
+        return novelCount > 0 ? novelCount : pending.count
+    }
+
+    /// 将后台暂存的新内容应用到当前频道列表顶部。
+    func applyPendingFeed(for targetChannel: Channel? = nil) {
+        let ch = targetChannel ?? channel
+        guard let page = pendingFeeds.removeValue(forKey: ch), !page.items.isEmpty else { return }
+        if ch == .hot {
+            feeds[ch] = page.items
+            feedNext[ch] = page.next
+        } else {
+            let existing = feeds[ch] ?? []
+            let newKeys = Set(page.items.map(\.key))
+            feeds[ch] = page.items + existing.filter { !newKeys.contains($0.key) }
+            if let next = page.next {
+                feedNext[ch] = next
+            }
+        }
+        feedRefreshedAt[ch] = nowProvider()
+        feedGeneration += 1
+        enrichFeedRegions(channel: ch, generation: feedGeneration)
+    }
+
+    /// 自动静默刷新：
+    /// - 当 `applyImmediately == true`（处于列表顶部且未在阅读）时直接静默更新；
+    /// - 当 `applyImmediately == false`（正在阅读正文或已向下滚动列表）时暂存到 `pendingFeeds`，由列表顶部的轻量胶囊提示用户。
+    @discardableResult
+    func autoRefreshFeedIfNeeded(
+        for targetChannel: Channel? = nil,
+        force: Bool = false,
+        applyImmediately: Bool
+    ) async -> Bool {
+        let ch = targetChannel ?? channel
+        if applyImmediately, hasPendingFeed(for: ch) {
+            applyPendingFeed(for: ch)
+            if !force && !isFeedStale(for: ch) { return true }
+        }
+        if feeds[ch] == nil || (feeds[ch]?.isEmpty == true && !loadingFeed) {
+            if ch == channel {
+                await loadFeed(reset: true)
+                return !(feeds[ch] ?? []).isEmpty
+            }
+        }
+        guard force || isFeedStale(for: ch) else { return false }
+        guard !loadingFeed, !backgroundRefreshInFlight.contains(ch) else { return false }
+        backgroundRefreshInFlight.insert(ch)
+        defer { backgroundRefreshInFlight.remove(ch) }
+        do {
+            var page = try await source.feed(hot: ch == .hot, next: nil)
+            guard !page.items.isEmpty else { return false }
+            feedRefreshedAt[ch] = nowProvider()
+            let existingByKey = Dictionary(uniqueKeysWithValues: (feeds[ch] ?? []).map { ($0.key, $0) })
+            page = Page(
+                items: page.items.map { item in
+                    var merged = item
+                    if let old = existingByKey[item.key] {
+                        if (merged.ipInfo ?? "").isEmpty { merged.ipInfo = old.ipInfo }
+                        if merged.vote == nil { merged.vote = old.vote }
+                    }
+                    return merged
+                },
+                next: page.next
+            )
+            let currentTopKeys = Array((feeds[ch] ?? []).prefix(page.items.count)).map(\.key)
+            let incomingKeys = page.items.map(\.key)
+            if incomingKeys == currentTopKeys, !(feeds[ch] ?? []).isEmpty {
+                let incomingByKey = Dictionary(uniqueKeysWithValues: page.items.map { ($0.key, $0) })
+                feeds[ch] = (feeds[ch] ?? []).map { existing in
+                    guard var fresh = incomingByKey[existing.key] else { return existing }
+                    if (fresh.ipInfo ?? "").isEmpty { fresh.ipInfo = existing.ipInfo }
+                    if fresh.vote == nil { fresh.vote = existing.vote }
+                    return fresh
+                }
+                pendingFeeds.removeValue(forKey: ch)
+                return false
+            }
+            for topItem in page.items.filter({ $0.kind != .question }).prefix(2) {
+                await prefetchDetail(topItem)
+            }
+            if applyImmediately || (feeds[ch] ?? []).isEmpty {
+                pendingFeeds[ch] = page
+                applyPendingFeed(for: ch)
+            } else {
+                pendingFeeds[ch] = page
+                if ch == .recommend {
+                    await enrichPendingFeedRegions(channel: ch)
+                }
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// iOS 系统后台刷新（BGAppRefreshTask）入口：预取当前频道最新内容与前两条正文详情。
+    @discardableResult
+    func performBackgroundAppRefresh(applyImmediately: Bool = false) async -> Bool {
+        await autoRefreshFeedIfNeeded(for: channel, force: true, applyImmediately: applyImmediately)
+    }
+
+    private func enrichPendingFeedRegions(channel: Channel) async {
+        guard channel == .recommend, let items = pendingFeeds[channel]?.items else { return }
+        let targets = items.filter { $0.kind == .answer && ($0.ipInfo ?? "").isEmpty }.prefix(10)
+        for item in targets {
+            guard !Task.isCancelled, pendingFeeds[channel] != nil else { return }
+            guard let region = try? await source.answerRegion(answerID: item.id),
+                  !region.isEmpty else { continue }
+            guard var currentPending = pendingFeeds[channel] else { return }
+            if let index = currentPending.items.firstIndex(where: { $0.key == item.key }) {
+                var updated = currentPending.items
+                updated[index].ipInfo = region
+                currentPending = Page(items: updated, next: currentPending.next)
+                pendingFeeds[channel] = currentPending
+            }
         }
     }
 
@@ -205,6 +360,16 @@ final class ReaderModel: ObservableObject {
         guard value != channel else { return }
         feedGeneration += 1; loadingFeed = false; refreshingFeed = false; feedError = nil
         channel = value; question = nil; leaveReading()
+    }
+
+    /// 切换栏目时：若首次进入则加载首屏；若已有数据则仅在超时或存在暂存新内容时自动刷新，避免误触发分页加载。
+    func activateChannel(_ value: Channel, applyImmediately: Bool = true) async {
+        changeChannel(value)
+        if feeds[value] == nil || (feeds[value]?.isEmpty == true && feedError == nil) {
+            await loadFeed()
+        } else {
+            _ = await autoRefreshFeedIfNeeded(for: value, applyImmediately: applyImmediately)
+        }
     }
 
     func leaveReading() {

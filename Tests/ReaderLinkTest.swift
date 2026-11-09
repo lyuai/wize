@@ -57,8 +57,8 @@ struct ReaderLinkTest {
                          "sharing should include default WeChat and Moments share activities")
             precondition(!reader.contains("ShareLink("),
                          "action bar should not embed ShareLink directly")
-            precondition(reader.contains("ReaderImageContextMenuOverlay(") && reader.contains("onOpenImage: { url, frame, touchPoint in"),
-                         "long-pressing a content image should immediately open the finger-anchored context menu")
+            precondition(reader.contains("UIContextMenuInteraction") && reader.contains("放大查看"),
+                         "holding a content image should open the system context menu while the finger is still down")
             precondition(!reader.contains("onTapImage:"),
                          "body images should not respond to single tap")
             precondition(reader.contains("ReaderBottomChromeCapsule(chrome: chrome)"),

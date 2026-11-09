@@ -1,4 +1,15 @@
 import SwiftUI
+import BackgroundTasks
+
+enum BackgroundFeedRefresh {
+    static let identifier = "com.lyuai.wize.feed-refresh"
+
+    static func scheduleNext() {
+        let request = BGAppRefreshTaskRequest(identifier: identifier)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: ReaderModel.autoRefreshInterval)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+}
 
 @main
 struct WizeApp: App {
@@ -16,5 +27,9 @@ struct WizeApp: App {
     }
     var body: some Scene {
         WindowGroup { ReaderView().environmentObject(reader) }
+            .backgroundTask(.appRefresh(BackgroundFeedRefresh.identifier)) {
+                BackgroundFeedRefresh.scheduleNext()
+                await reader.performBackgroundAppRefresh()
+            }
     }
 }

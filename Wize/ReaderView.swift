@@ -24,7 +24,9 @@ final class ReadingChrome: ObservableObject {
 struct ReaderView: View {
     @EnvironmentObject private var model: ReaderModel
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.scenePhase) private var scenePhase
     @State private var phonePath: [PhonePage] = []
+    @State private var feedAtTop: [ReaderModel.Channel: Bool] = [.recommend: true, .hot: true]
     @State private var availableWidth: CGFloat = ReaderWindowMetrics.width
     @State private var chrome = ReadingChrome()
     @State private var showsReadingSettings = false
@@ -37,7 +39,6 @@ struct ReaderView: View {
     @State private var profileItem: ReadingItem?
     @State private var collectionItem: ReadingItem?
     @State private var webLink: ReaderWebLink?
-    @State private var imageMenu: ReaderImageMenuTarget?
     @State private var imageNotice: String?
     @State private var collectedKeys: Set<String> = []
     @State private var readKeys: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "reading.readKeys") ?? [])
@@ -57,6 +58,16 @@ struct ReaderView: View {
         // 744pt is iPad mini portrait, a normal full-screen width, so it stays
         // two columns. Only a genuinely narrow window falls back to one column.
         UIDevice.current.userInterfaceIdiom == .pad && sizeClass == .regular && availableWidth >= 700
+    }
+
+    /// 判断当前是否处于列表顶部且未深入阅读，从而决定后台拉取到的新内容是直接静默合入还是暂存提示。
+    private func canApplyFeedImmediately(for channel: ReaderModel.Channel) -> Bool {
+        guard feedAtTop[channel, default: true] else { return false }
+        if usesWideLayout {
+            return model.question == nil && readingOffset <= 10
+        } else {
+            return phonePath.isEmpty
+        }
     }
 
     private func markRead(_ item: ReadingItem?) {
@@ -112,6 +123,32 @@ struct ReaderView: View {
         }
         .task { async let account: Void = model.loadAccount(); await model.loadFeed(); selectInitialContentIfNeeded(); await account }
         .task { await CommentEmojiLoader.shared.preloadAll() }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(180)) } catch { return }
+                guard !Task.isCancelled else { return }
+                _ = await model.autoRefreshFeedIfNeeded(
+                    for: model.channel,
+                    applyImmediately: canApplyFeedImmediately(for: model.channel)
+                )
+            }
+        }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .active:
+                Task {
+                    _ = await model.autoRefreshFeedIfNeeded(
+                        for: model.channel,
+                        applyImmediately: canApplyFeedImmediately(for: model.channel)
+                    )
+                }
+            case .background:
+                BackgroundFeedRefresh.scheduleNext()
+            default:
+                break
+            }
+        }
         .task(id: model.selected?.key) {
             guard let item = model.selected else { return }
             do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
@@ -161,25 +198,6 @@ struct ReaderView: View {
                 if model.question != nil { path.append(.question) }
                 if model.selected != nil { path.append(.answer) }
                 phonePath = path
-            }
-        }
-        .overlay {
-            if let target = imageMenu {
-                ReaderImageContextMenuOverlay(
-                    target: target,
-                    onZoom: {
-                        withAnimation(.easeOut(duration: 0.14)) { imageMenu = nil }
-                        ImagePreviewPresenter.shared.present(url: target.url, sourceFrame: target.frame)
-                    },
-                    onSave: {
-                        withAnimation(.easeOut(duration: 0.14)) { imageMenu = nil }
-                        Task { await saveImage(target.url) }
-                    },
-                    onDismiss: {
-                        withAnimation(.easeOut(duration: 0.14)) { imageMenu = nil }
-                    }
-                )
-                .transition(.opacity)
             }
         }
         .overlay(alignment: .bottom) {
@@ -340,7 +358,10 @@ struct ReaderView: View {
     private var channelPicker: some View {
         Picker("栏目", selection: Binding(
             get: { model.channel },
-            set: { channel in model.changeChannel(channel); Task { await model.loadFeed() } }
+            set: { channel in
+                let applyNow = feedAtTop[channel, default: true]
+                Task { await model.activateChannel(channel, applyImmediately: applyNow) }
+            }
         )) {
             Text("推荐").tag(ReaderModel.Channel.recommend)
             Text("热榜").tag(ReaderModel.Channel.hot)
@@ -448,7 +469,10 @@ struct ReaderView: View {
     private var phoneFeedTabs: some View {
         TabView(selection: Binding(
             get: { model.channel },
-            set: { channel in model.changeChannel(channel); Task { await model.loadFeed() } }
+            set: { channel in
+                let applyNow = feedAtTop[channel, default: true]
+                Task { await model.activateChannel(channel, applyImmediately: applyNow) }
+            }
         )) {
             feedList(for: .recommend).tag(ReaderModel.Channel.recommend)
             feedList(for: .hot).tag(ReaderModel.Channel.hot)
@@ -470,56 +494,111 @@ struct ReaderView: View {
     }
 
     private func feedList(for channel: ReaderModel.Channel) -> some View {
-        List {
-            ForEach(Array((model.feeds[channel] ?? []).enumerated()), id: \.element.key) { index, item in
-                Button {
-                    markRead(item)
-                    model.open(item)
-                    if !usesWideLayout { phonePath.append(item.kind == .question ? .question : .answer) }
-                } label: {
-                    ItemRow(
-                        item: item,
-                        isHot: channel == .hot,
-                        hotRank: channel == .hot ? index + 1 : nil,
-                        isRead: readKeys.contains(item.key)
-                    )
+        ScrollViewReader { scrollProxy in
+            List {
+                ForEach(Array((model.feeds[channel] ?? []).enumerated()), id: \.element.key) { index, item in
+                    Button {
+                        markRead(item)
+                        model.open(item)
+                        if !usesWideLayout { phonePath.append(item.kind == .question ? .question : .answer) }
+                    } label: {
+                        ItemRow(
+                            item: item,
+                            isHot: channel == .hot,
+                            hotRank: channel == .hot ? index + 1 : nil,
+                            isRead: readKeys.contains(item.key)
+                        )
+                    }
+                    .buttonStyle(DirectoryRowButtonStyle())
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                    .listRowBackground(directoryRowBackground(
+                        selected: usesWideLayout && (model.selected?.key == item.key || model.question?.key == item.key)
+                    ))
+                    .onAppear {
+                        guard index == 0 else { return }
+                        let wasScrolled = feedAtTop[channel] == false
+                        feedAtTop[channel] = true
+                        if wasScrolled, model.hasPendingFeed(for: channel) {
+                            withAnimation(.snappy(duration: 0.25)) {
+                                model.applyPendingFeed(for: channel)
+                            }
+                        }
+                    }
+                    .onDisappear {
+                        guard index == 0, !(model.feeds[channel] ?? []).isEmpty else { return }
+                        feedAtTop[channel] = false
+                    }
+                    .task {
+                        guard channel == model.channel else { return }
+                        let upcoming = Array((model.feeds[channel] ?? []).dropFirst(index).prefix(6))
+                        async let avatars: Void = AvatarCache.shared.prefetch(upcoming.compactMap(\.avatarURL) + upcoming.compactMap(\.imageURL))
+                        async let detail: Void = model.prefetchDetail(item)
+                        if index >= max((model.feeds[channel]?.count ?? 0) - 4, 0) { await model.loadFeed() }
+                        await detail
+                        await avatars
+                    }
                 }
-                .buttonStyle(DirectoryRowButtonStyle())
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
-                .listRowBackground(directoryRowBackground(
-                    selected: usesWideLayout && (model.selected?.key == item.key || model.question?.key == item.key)
-                ))
-                .task {
-                    guard channel == model.channel else { return }
-                    let upcoming = Array((model.feeds[channel] ?? []).dropFirst(index).prefix(6))
-                    async let avatars: Void = AvatarCache.shared.prefetch(upcoming.compactMap(\.avatarURL) + upcoming.compactMap(\.imageURL))
-                    async let detail: Void = model.prefetchDetail(item)
-                    if index >= max((model.feeds[channel]?.count ?? 0) - 4, 0) { await model.loadFeed() }
-                    await detail
-                    await avatars
+                if channel == model.channel, let error = model.feedError { retryRow(error) { await model.loadFeed() }.listRowBackground(Color.clear) }
+                else if channel == model.channel, model.loadingFeed, (model.feeds[channel] ?? []).isEmpty {
+                    ForEach(0..<5, id: \.self) { _ in LoadingSkeleton(kind: .feed, label: "正在加载内容").listRowSeparator(.hidden).listRowBackground(Color.clear) }
+                }
+                else if channel == model.channel, model.loadingFeed, !model.refreshingFeed {
+                    LoadingSkeleton(kind: .feed, label: "正在加载更多")
+                        .listRowSeparator(.hidden).listRowBackground(Color.clear)
+                }
+                else if channel == model.channel, !model.loadingFeed, model.feeds[channel]?.isEmpty == true {
+                    ContentUnavailableView("暂无内容", systemImage: "text.book.closed", description: Text("下拉刷新，看看有没有新的内容。"))
+                        .listRowBackground(Color.clear)
                 }
             }
-            if channel == model.channel, let error = model.feedError { retryRow(error) { await model.loadFeed() }.listRowBackground(Color.clear) }
-            else if channel == model.channel, model.loadingFeed, (model.feeds[channel] ?? []).isEmpty {
-                ForEach(0..<5, id: \.self) { _ in LoadingSkeleton(kind: .feed, label: "正在加载内容").listRowSeparator(.hidden).listRowBackground(Color.clear) }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(ReaderPalette.directory.ignoresSafeArea(edges: .bottom))
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(usesWideLayout ? .hidden : .automatic, for: .navigationBar)
+            .refreshable {
+                if channel == model.channel {
+                    await model.loadFeed(reset: true)
+                    feedAtTop[channel] = true
+                }
             }
-            else if channel == model.channel, model.loadingFeed, !model.refreshingFeed {
-                LoadingSkeleton(kind: .feed, label: "正在加载更多")
-                    .listRowSeparator(.hidden).listRowBackground(Color.clear)
+            .overlay(alignment: .top) {
+                if channel == model.channel, model.hasPendingFeed(for: channel) {
+                    let count = model.pendingNewItemCount(for: channel)
+                    Button {
+                        let targetKey = model.pendingFeeds[channel]?.items.first?.key
+                        withAnimation(.snappy(duration: 0.25)) {
+                            model.applyPendingFeed(for: channel)
+                        }
+                        feedAtTop[channel] = true
+                        if let targetKey = targetKey ?? model.feeds[channel]?.first?.key {
+                            withAnimation(.snappy(duration: 0.25)) {
+                                scrollProxy.scrollTo(targetKey, anchor: .top)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 11, weight: .bold))
+                            Text(count > 0 ? "有 \(count) 条新内容" : "有新内容")
+                                .font(.footnote.weight(.medium))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(ReaderPalette.accent, in: Capsule())
+                        .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .accessibilityLabel("加载新内容")
+                }
             }
-            else if channel == model.channel, !model.loadingFeed, model.feeds[channel]?.isEmpty == true {
-                ContentUnavailableView("暂无内容", systemImage: "text.book.closed", description: Text("下拉刷新，看看有没有新的内容。"))
-                    .listRowBackground(Color.clear)
-            }
+            .animation(.snappy(duration: 0.25), value: model.hasPendingFeed(for: channel))
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .background(ReaderPalette.directory.ignoresSafeArea(edges: .bottom))
-        .navigationTitle("")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(usesWideLayout ? .hidden : .automatic, for: .navigationBar)
-        .refreshable { if channel == model.channel { await model.loadFeed(reset: true) } }
     }
 
     private var answerList: some View {
@@ -628,11 +707,10 @@ struct ReaderView: View {
                         },
                         onNearEnd: { Task { await model.loadMoreStream() } },
                         onOpenLink: openWebLink,
-                        onOpenImage: { url, frame, touchPoint in
-                            withAnimation(.spring(response: 0.22, dampingFraction: 0.84)) {
-                                imageMenu = ReaderImageMenuTarget(url: url, frame: frame, touchPoint: touchPoint)
-                            }
+                        onZoomImage: { url, frame in
+                            ImagePreviewPresenter.shared.present(url: url, sourceFrame: frame)
                         },
+                        onSaveImage: { url in Task { await saveImage(url) } },
                         onCompactTitle: { chrome.showsCompactTitle = $0 },
                         restoreOffset: readingOffsetAnchor == (model.streamAnchor?.id ?? item.id) ? readingOffset : 0,
                         onReadingOffset: { offset in
@@ -2605,94 +2683,18 @@ private struct ReaderWebLink: Identifiable {
     var id: String { url.absoluteString }
 }
 
-private struct ReaderImageMenuTarget: Identifiable {
-    let url: URL
-    let frame: CGRect
-    let touchPoint: CGPoint
-    var id: String { "\(url.absoluteString)|\(Int(touchPoint.x))|\(Int(touchPoint.y))" }
-}
+private final class ImagePressProbe: UIGestureRecognizer {
+    var onPress: ((CGPoint) -> Void)?
 
-/// 长按正文图片时在手指按下瞬间立即在手指附近弹出的浮动菜单（无须松开手指）。
-private struct ReaderImageContextMenuOverlay: View {
-    let target: ReaderImageMenuTarget
-    let onZoom: () -> Void
-    let onSave: () -> Void
-    let onDismiss: () -> Void
-
-    private let menuWidth: CGFloat = 168
-    private let menuHeight: CGFloat = 92
-
-    var body: some View {
-        GeometryReader { proxy in
-            let globalOrigin = proxy.frame(in: .global).origin
-            let localTouch = CGPoint(
-                x: target.touchPoint.x - globalOrigin.x,
-                y: target.touchPoint.y - globalOrigin.y
-            )
-            let clampedX = min(
-                max(localTouch.x, menuWidth * 0.5 + 16),
-                max(proxy.size.width - menuWidth * 0.5 - 16, menuWidth * 0.5 + 16)
-            )
-            // 默认显示在手指正上方，避免手指遮挡菜单；若靠近顶部则显示在手指正下方。
-            let prefersAbove = localTouch.y - 70 - menuHeight * 0.5 >= 56
-            let rawY = prefersAbove ? (localTouch.y - 68) : (localTouch.y + 68)
-            let clampedY = min(
-                max(rawY, menuHeight * 0.5 + 56),
-                max(proxy.size.height - menuHeight * 0.5 - 40, menuHeight * 0.5 + 56)
-            )
-
-            ZStack {
-                Color.black.opacity(0.14)
-                    .ignoresSafeArea()
-                    .contentShape(Rectangle())
-                    .onTapGesture { onDismiss() }
-
-                VStack(spacing: 0) {
-                    Button(action: onZoom) {
-                        HStack {
-                            Text("放大查看")
-                                .font(.system(size: 15, weight: .medium))
-                            Spacer()
-                            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.horizontal, 16)
-                        .frame(height: 45)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    Divider()
-
-                    Button(action: onSave) {
-                        HStack {
-                            Text("存储到照片")
-                                .font(.system(size: 15, weight: .medium))
-                            Spacer()
-                            Image(systemName: "square.and.arrow.down")
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.horizontal, 16)
-                        .frame(height: 45)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-                .foregroundStyle(.primary)
-                .frame(width: menuWidth)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5)
-                )
-                .shadow(color: .black.opacity(0.22), radius: 18, y: 8)
-                .position(x: clampedX, y: clampedY)
-            }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        if let point = touches.first?.location(in: view) {
+            onPress?(point)
         }
-        .ignoresSafeArea()
+        state = .failed
     }
+
+    override func canPrevent(_ prevented: UIGestureRecognizer) -> Bool { false }
 }
 
 private struct SafariView: UIViewControllerRepresentable {
@@ -2718,7 +2720,8 @@ private struct HTMLReader: UIViewRepresentable {
     var onVisibleAnswer: (String) -> Void = { _ in }
     var onNearEnd: () -> Void = {}
     var onOpenLink: (URL) -> Void = { _ in }
-    var onOpenImage: (URL, CGRect, CGPoint) -> Void = { _, _, _ in }
+    var onZoomImage: (URL, CGRect) -> Void = { _, _ in }
+    var onSaveImage: (URL) -> Void = { _ in }
     var onCompactTitle: (Bool) -> Void = { _ in }
     var restoreOffset: CGFloat = 0
     var onReadingOffset: (CGFloat) -> Void = { _ in }
@@ -2776,13 +2779,16 @@ private struct HTMLReader: UIViewRepresentable {
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
         view.scrollView.delegate = context.coordinator
-        // 单击不再打开查看器：阅读时点击图片不应打断滚动；长按按下瞬间即在手指附近弹出菜单。
-        let imageLongPress = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(HTMLReader.Coordinator.handleImageLongPress(_:)))
-        imageLongPress.minimumPressDuration = 0.35
-        imageLongPress.allowableMovement = 14
-        imageLongPress.cancelsTouchesInView = false
-        imageLongPress.delegate = context.coordinator
-        view.addGestureRecognizer(imageLongPress)
+        // 系统长按菜单：按住时就抬起图片并弹出操作，手指滑到项目上松开即选中。
+        view.allowsLinkPreview = false
+        view.addInteraction(UIContextMenuInteraction(delegate: context.coordinator))
+        let imagePress = ImagePressProbe()
+        imagePress.cancelsTouchesInView = false
+        imagePress.delegate = context.coordinator
+        imagePress.onPress = { [weak coordinator = context.coordinator] point in
+            coordinator?.prefetchPressedImage(at: point)
+        }
+        view.addGestureRecognizer(imagePress)
         // 视频卡片保持单击播放；只有点中视频才响应，图片仍然走长按菜单。
         let videoTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(HTMLReader.Coordinator.handleVideoTap(_:)))
         videoTap.cancelsTouchesInView = false
@@ -2850,7 +2856,8 @@ private struct HTMLReader: UIViewRepresentable {
         context.coordinator.onVisibleAnswer = onVisibleAnswer
         context.coordinator.onNearEnd = onNearEnd
         context.coordinator.onOpenLink = onOpenLink
-        context.coordinator.onOpenImage = onOpenImage
+        context.coordinator.onZoomImage = onZoomImage
+        context.coordinator.onSaveImage = onSaveImage
         context.coordinator.onChromeVisibility = onChromeVisibility
         context.coordinator.onCompactTitle = onCompactTitle
         context.coordinator.restoreOffset = restoreOffset
@@ -3017,7 +3024,7 @@ private struct HTMLReader: UIViewRepresentable {
         return hasher.finalize()
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate {
         var lastHTML = ""
         var lastDocumentKey: Int?
         var previousCount = 0
@@ -3054,7 +3061,8 @@ private struct HTMLReader: UIViewRepresentable {
         private var scrollAccum: CGFloat = 0
         private weak var webView: WKWebView?
         var onOpenLink: (URL) -> Void = { _ in }
-        var onOpenImage: (URL, CGRect, CGPoint) -> Void = { _, _, _ in }
+        var onZoomImage: (URL, CGRect) -> Void = { _, _ in }
+        var onSaveImage: (URL) -> Void = { _ in }
         var onCompactTitle: (Bool) -> Void = { _ in }
         var restoreOffset: CGFloat = 0
         var onReadingOffset: (CGFloat) -> Void = { _ in }
@@ -3207,54 +3215,127 @@ private struct HTMLReader: UIViewRepresentable {
             true
         }
 
-        /// 阅读区长按图片时在手指按下瞬间立即在手指附近弹出「放大查看 / 存储到照片」菜单；头像、行内表情与小图标不触发。
-        @objc func handleImageLongPress(_ gesture: UILongPressGestureRecognizer) {
-            guard gesture.state == .began, let webView else { return }
-            let point = gesture.location(in: webView)
-            let touchPoint = gesture.location(in: nil)
+        private final class PressedImage {
+            let url: URL
+            let frame: CGRect
+            let date: Date
+            var snapshot: UIImage?
+            init(url: URL, frame: CGRect, date: Date) {
+                self.url = url
+                self.frame = frame
+                self.date = date
+            }
+        }
+        private var pressedImage: PressedImage?
+        private var liftView: UIImageView?
+        private var pressGeneration = 0
+
+        /// 手指刚落下就问页面按下的是不是正文图片。系统菜单约半秒后才来取结果，这时答案已经在手边。
+        func prefetchPressedImage(at point: CGPoint) {
+            guard let webView else { return }
+            pressGeneration += 1
+            if let hit = pressedImage, !hit.frame.insetBy(dx: -20, dy: -20).contains(point) {
+                pressedImage = nil
+            }
+            let generation = pressGeneration
             let script = """
             (() => {
                 const el = document.elementFromPoint(\(point.x), \(point.y));
                 const video = el && el.closest ? el.closest('[data-wize-video]') : null;
-                if (video) {
-                    if (video.querySelector('video') || video.getAttribute('data-loading') === '1') return null;
-                    const rect = video.getBoundingClientRect();
-                    return { video: video.getAttribute('data-wize-video') || '', kind: video.getAttribute('data-wize-video-kind') || 'lens', poster: video.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
-                }
+                if (video) return { kind: 'video' };
                 const img = el && el.closest ? el.closest('img') : null;
                 if (!img) return null;
                 const rect = img.getBoundingClientRect();
-                return { src: img.currentSrc || img.src || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top, cls: String(img.className || '') };
+                return { kind: 'image', src: img.currentSrc || img.src || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top, cls: String(img.className || '') };
             })()
             """
             webView.evaluateJavaScript(script) { [weak self] result, _ in
-                guard let self, let info = result as? [String: Any] else { return }
-                let width = info["width"] as? Double ?? 0
-                let rect = CGRect(x: info["x"] as? Double ?? 0,
-                                  y: info["y"] as? Double ?? 0,
-                                  width: width,
-                                  height: info["height"] as? Double ?? width)
-                let frame = webView.convert(rect, to: nil)
-                if let id = info["video"] as? String, !id.isEmpty {
-                    let kind = VideoKind(rawValue: info["kind"] as? String ?? "") ?? .lens
-                    let poster = (info["poster"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) }
-                    self.playInlineVideo(VideoReference(id: id, kind: kind), poster: poster, in: webView)
+                guard let self, generation == self.pressGeneration else { return }
+                guard let info = result as? [String: Any], info["kind"] as? String == "image",
+                      let src = info["src"] as? String, let url = URL(string: src),
+                      let className = info["cls"] as? String else {
+                    self.pressedImage = nil
                     return
                 }
-                guard let src = info["src"] as? String,
-                      let url = URL(string: src),
-                      let className = info["cls"] as? String else { return }
-                // 跳过头像、行内表情和其他小图；只放大正文里的图片。
-                guard width >= 60, !className.contains("avatar") else { return }
-                DispatchQueue.main.async {
-                    // 取消 scrollView 当前手势追踪，确保手指无需松开即可立即显示浮动菜单且不带动页面滚动。
-                    webView.scrollView.panGestureRecognizer.isEnabled = false
-                    webView.scrollView.panGestureRecognizer.isEnabled = true
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    self.onOpenImage(url, frame, touchPoint)
+                let width = info["width"] as? Double ?? 0
+                guard width >= 60, !className.contains("avatar") else {
+                    self.pressedImage = nil
+                    return
+                }
+                let frame = CGRect(x: info["x"] as? Double ?? 0,
+                                   y: info["y"] as? Double ?? 0,
+                                   width: width,
+                                   height: info["height"] as? Double ?? width)
+                let hit = PressedImage(url: url, frame: frame, date: Date())
+                self.pressedImage = hit
+                let snapshot = WKSnapshotConfiguration()
+                snapshot.rect = frame
+                webView.takeSnapshot(with: snapshot) { [weak self, weak hit] image, _ in
+                    guard let self, let hit, generation == self.pressGeneration, self.pressedImage === hit else { return }
+                    hit.snapshot = image
                 }
             }
         }
+
+        func contextMenuInteraction(_ interaction: UIContextMenuInteraction, configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+            guard let webView, let hit = pressedImage,
+                  Date().timeIntervalSince(hit.date) < 2,
+                  hit.frame.insetBy(dx: -16, dy: -16).contains(location) else { return nil }
+            let url = hit.url
+            let frame = webView.convert(hit.frame, to: nil)
+            return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
+                UIMenu(children: [
+                    UIAction(title: "放大查看", image: UIImage(systemName: "arrow.up.left.and.arrow.down.right")) { _ in
+                        self?.onZoomImage(url, frame)
+                    },
+                    UIAction(title: "存储到照片", image: UIImage(systemName: "square.and.arrow.down")) { _ in
+                        self?.onSaveImage(url)
+                    }
+                ])
+            }
+        }
+
+        func contextMenuInteraction(_ interaction: UIContextMenuInteraction, previewForHighlightingMenuWithConfiguration configuration: UIContextMenuConfiguration) -> UITargetedPreview? {
+            imagePreview()
+        }
+
+        func contextMenuInteraction(_ interaction: UIContextMenuInteraction, previewForDismissingMenuWithConfiguration configuration: UIContextMenuConfiguration) -> UITargetedPreview? {
+            imagePreview()
+        }
+
+        func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willEndFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
+            let host = liftView
+            liftView = nil
+            host?.removeFromSuperview()
+            animator?.addCompletion {
+                host?.removeFromSuperview()
+                DispatchQueue.main.async { host?.removeFromSuperview() }
+            }
+        }
+
+        /// 只抬起照片本身，而且这张图不放进阅读区。放进去的话，菜单结束后系统会把它留在页面上。
+        private func imagePreview() -> UITargetedPreview? {
+            guard let webView, let hit = pressedImage else { return nil }
+            let host: UIImageView
+            if let liftView {
+                host = liftView
+            } else {
+                let view = UIImageView(image: hit.snapshot)
+                view.bounds = CGRect(origin: .zero, size: hit.frame.size)
+                view.contentMode = .scaleAspectFill
+                view.clipsToBounds = true
+                view.backgroundColor = .clear
+                view.isUserInteractionEnabled = false
+                liftView = view
+                host = view
+            }
+            let parameters = UIPreviewParameters()
+            parameters.backgroundColor = .clear
+            parameters.visiblePath = UIBezierPath(roundedRect: host.bounds, cornerRadius: 8)
+            let target = UIPreviewTarget(container: webView, center: CGPoint(x: hit.frame.midX, y: hit.frame.midY))
+            return UITargetedPreview(view: host, parameters: parameters, target: target)
+        }
+
         /// 未播放的视频卡片点按后开始播放；已经在播的视频点按只暂停或继续，不唤起系统控制层。
         @objc func handleVideoTap(_ gesture: UITapGestureRecognizer) {
             guard let webView else { return }
