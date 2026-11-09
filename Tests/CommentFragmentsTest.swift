@@ -75,6 +75,8 @@ struct CommentFragmentsTest {
             precondition(visibleCommentLines.contains("startsAtAvatar ? topPadding + 26 : 0"), "Parent comment thread line should start right beneath the replied-to avatar")
             precondition(visibleCommentLines.contains("LoadingSkeleton(kind: .comment"), "Initial comment loading should display comment skeletons")
             precondition(visibleCommentLines.contains("CommentAuthorBadge()"), "Comments by the answer author should display an author badge")
+            precondition(!readerViewSource.contains("mappin.and.ellipse"), "RegionBadge should use clean inverted teardrop icon instead of pushpin SF Symbol")
+            precondition(readerViewSource.contains("TeardropPinShape()"), "RegionBadge should render TeardropPinShape")
         }
 
         let withIP = parseReadingComments([[

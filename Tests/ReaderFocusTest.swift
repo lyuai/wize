@@ -30,10 +30,13 @@ let script = String(line.trimmingCharacters(in: .whitespaces).dropFirst("let scr
 func current() -> String? { (evaluate(script) as? [String: Any])?["id"] as? String }
 _ = evaluate("window.scrollTo(0, 100)")
 precondition(current() == "old", "The first answer should own actions while the reading focus is within it")
+precondition((evaluate("document.querySelector('section.current')?.getAttribute('data-wize-answer')") as? String) == "old", "The reading focus should mark the current answer")
 let loading = evaluate("Array.from(document.querySelectorAll('img')).map(i => i.loading).join(',')") as? String
 precondition(loading == "eager,eager,lazy", "Only the current and next answer should have their images prepared")
 _ = evaluate("window.scrollTo(0, 440)")
 precondition(current() == "old2", "A small remnant at the top should not own actions when the reading focus is in the next answer")
+precondition((evaluate("document.querySelectorAll('section.current').length") as? NSNumber)?.intValue == 1, "Only one answer should be marked current")
+precondition((evaluate("document.querySelector('section.current')?.getAttribute('data-wize-answer')") as? String) == "old2", "The current mark should follow the reading focus")
 _ = evaluate("window.scrollTo(0, 320)")
 precondition(current() == "old", "Scrolling back should restore the previous answer")
 

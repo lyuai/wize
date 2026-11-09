@@ -17,13 +17,15 @@ final class ReadingFocus: ObservableObject {
 @MainActor
 final class ReadingChrome: ObservableObject {
     @Published var showsControls = true
+    /// Single-line question title, shown only after the large title has left the page.
+    @Published var showsCompactTitle = false
 }
 
 struct ReaderView: View {
     @EnvironmentObject private var model: ReaderModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var phonePath: [PhonePage] = []
-    @State private var availableWidth: CGFloat = 0
+    @State private var availableWidth: CGFloat = ReaderWindowMetrics.width
     @State private var chrome = ReadingChrome()
     @State private var showsReadingSettings = false
     @State private var showsAccountMenu = false
@@ -39,6 +41,8 @@ struct ReaderView: View {
     @State private var imageNotice: String?
     @State private var collectedKeys: Set<String> = []
     @State private var readKeys: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "reading.readKeys") ?? [])
+    @State private var readingOffset: CGFloat = 0
+    @State private var readingOffsetAnchor = ""
     // A reference type kept in @State on purpose: `@StateObject` would make this
     // screen observe every reading-focus change and bring the per-switch rebuild
     // back. Only the floating actions observe the store.
@@ -50,7 +54,9 @@ struct ReaderView: View {
     private enum AccountDestination { case settings, login, about, feedback }
 
     private var usesWideLayout: Bool {
-        UIDevice.current.userInterfaceIdiom == .pad && sizeClass == .regular && availableWidth >= 760
+        // 744pt is iPad mini portrait, a normal full-screen width, so it stays
+        // two columns. Only a genuinely narrow window falls back to one column.
+        UIDevice.current.userInterfaceIdiom == .pad && sizeClass == .regular && availableWidth >= 700
     }
 
     private func markRead(_ item: ReadingItem?) {
@@ -131,6 +137,11 @@ struct ReaderView: View {
         .onChange(of: model.selected?.key) { _ in
             focus.item = model.selected
             markRead(model.selected)
+        }
+        .onChange(of: model.streamAnchor?.key) { _ in
+            chrome.showsCompactTitle = false
+            readingOffset = 0
+            readingOffsetAnchor = ""
         }
         .onChange(of: model.question?.key) { _ in
             markRead(model.question)
@@ -274,13 +285,20 @@ struct ReaderView: View {
                 .ignoresSafeArea(edges: .vertical)
                 .allowsHitTesting(false)
                 if model.showsComments {
-                    Color.black.opacity(0.001)
+                    Color(uiColor: UIColor { traits in
+                        traits.userInterfaceStyle == .dark
+                            ? UIColor.black.withAlphaComponent(0.46)
+                            : UIColor.black.withAlphaComponent(0.18)
+                    })
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
                         .onTapGesture { model.showsComments = false }
-                    NavigationStack { commentList.simultaneousGesture(closeCommentsGesture) }
+                        .transition(.opacity)
+                        .accessibilityLabel("关闭评论")
+                        .accessibilityAddTraits(.isButton)
+                    NavigationStack { commentList }
                         .environment(\.openURL, OpenURLAction { url in openWebLink(url); return .handled })
-                        .simultaneousGesture(closeCommentsGesture)
+                        .background(CommentSwipeDismiss { model.showsComments = false })
                         .frame(width: min(max(geometry.size.width * 0.38, 360), 480))
                         .frame(maxHeight: .infinity)
                         .background(Color(uiColor: .systemBackground))
@@ -324,8 +342,8 @@ struct ReaderView: View {
             get: { model.channel },
             set: { channel in model.changeChannel(channel); Task { await model.loadFeed() } }
         )) {
-            Label("推荐", systemImage: "sparkles").tag(ReaderModel.Channel.recommend)
-            Label("热榜", systemImage: "flame").tag(ReaderModel.Channel.hot)
+            Text("推荐").tag(ReaderModel.Channel.recommend)
+            Text("热榜").tag(ReaderModel.Channel.hot)
         }
         .pickerStyle(.segmented)
         .labelsHidden()
@@ -410,10 +428,9 @@ struct ReaderView: View {
                 }
         }
         .sheet(isPresented: $model.showsComments) {
-            // Let the system sheet own vertical detent drags; a custom drag
-            // here intercepts slow upward pushes and can dismiss the sheet.
             NavigationStack { commentList }
                 .environment(\.openURL, OpenURLAction { url in openWebLink(url); return .handled })
+                .background(CommentSwipeDismiss { model.showsComments = false })
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -439,7 +456,7 @@ struct ReaderView: View {
         .tabViewStyle(.page(indexDisplayMode: .never))
         .safeAreaInset(edge: .top, spacing: 0) {
             HStack(spacing: 14) {
-                channelPicker.frame(width: 160)
+                channelPicker.frame(width: 176)
                 Spacer(minLength: 0)
                 accountMenu.frame(width: 44, height: 44).contentShape(Rectangle())
             }
@@ -454,7 +471,7 @@ struct ReaderView: View {
 
     private func feedList(for channel: ReaderModel.Channel) -> some View {
         List {
-            ForEach(Array((channel == model.channel && model.refreshingFeed ? [] : (model.feeds[channel] ?? [])).enumerated()), id: \.element.key) { index, item in
+            ForEach(Array((model.feeds[channel] ?? []).enumerated()), id: \.element.key) { index, item in
                 Button {
                     markRead(item)
                     model.open(item)
@@ -467,10 +484,12 @@ struct ReaderView: View {
                         isRead: readKeys.contains(item.key)
                     )
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(DirectoryRowButtonStyle())
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
-                .listRowBackground(usesWideLayout && (model.selected?.key == item.key || model.question?.key == item.key) ? ReaderPalette.selection : Color.clear)
+                .listRowBackground(directoryRowBackground(
+                    selected: usesWideLayout && (model.selected?.key == item.key || model.question?.key == item.key)
+                ))
                 .task {
                     guard channel == model.channel else { return }
                     let upcoming = Array((model.feeds[channel] ?? []).dropFirst(index).prefix(6))
@@ -482,13 +501,12 @@ struct ReaderView: View {
                 }
             }
             if channel == model.channel, let error = model.feedError { retryRow(error) { await model.loadFeed() }.listRowBackground(Color.clear) }
-            else if channel == model.channel, model.loadingFeed, !model.refreshingFeed,
-                    !(model.feeds[channel] ?? []).isEmpty {
+            else if channel == model.channel, model.loadingFeed, (model.feeds[channel] ?? []).isEmpty {
+                ForEach(0..<5, id: \.self) { _ in LoadingSkeleton(kind: .feed, label: "正在加载内容").listRowSeparator(.hidden).listRowBackground(Color.clear) }
+            }
+            else if channel == model.channel, model.loadingFeed, !model.refreshingFeed {
                 LoadingSkeleton(kind: .feed, label: "正在加载更多")
                     .listRowSeparator(.hidden).listRowBackground(Color.clear)
-            }
-            else if channel == model.channel, model.loadingFeed, model.refreshingFeed || (model.feeds[channel] ?? []).isEmpty {
-                ForEach(0..<5, id: \.self) { _ in LoadingSkeleton(kind: .feed, label: "正在加载内容").listRowSeparator(.hidden).listRowBackground(Color.clear) }
             }
             else if channel == model.channel, !model.loadingFeed, model.feeds[channel]?.isEmpty == true {
                 ContentUnavailableView("暂无内容", systemImage: "text.book.closed", description: Text("下拉刷新，看看有没有新的内容。"))
@@ -520,10 +538,10 @@ struct ReaderView: View {
                 } label: {
                     ItemRow(item: item, showsTitle: false, isRead: readKeys.contains(item.key))
                 }
-                    .buttonStyle(.plain)
+                    .buttonStyle(DirectoryRowButtonStyle())
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
-                    .listRowBackground(usesWideLayout && model.selected?.key == item.key ? ReaderPalette.selection : Color.clear)
+                    .listRowBackground(directoryRowBackground(selected: usesWideLayout && model.selected?.key == item.key))
                     .task {
                         async let avatars: Void = AvatarCache.shared.prefetch(Array(model.answers.dropFirst(index).prefix(6)).compactMap(\.avatarURL))
                         async let detail: Void = model.prefetchDetail(item)
@@ -548,10 +566,6 @@ struct ReaderView: View {
             .background(ReaderPalette.directory.ignoresSafeArea(edges: .bottom))
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .simultaneousGesture(DragGesture(minimumDistance: 40).onEnded { value in
-                guard abs(value.translation.width) > abs(value.translation.height) * 1.5 else { return }
-                model.answerSort = value.translation.width < 0 ? "updated" : "default"
-            })
             .toolbar { if usesWideLayout { ToolbarItem(placement: .navigationBarLeading) {
                 Button("返回列表") { model.question = nil }
             } } }
@@ -618,6 +632,12 @@ struct ReaderView: View {
                             withAnimation(.spring(response: 0.22, dampingFraction: 0.84)) {
                                 imageMenu = ReaderImageMenuTarget(url: url, frame: frame, touchPoint: touchPoint)
                             }
+                        },
+                        onCompactTitle: { chrome.showsCompactTitle = $0 },
+                        restoreOffset: readingOffsetAnchor == (model.streamAnchor?.id ?? item.id) ? readingOffset : 0,
+                        onReadingOffset: { offset in
+                            readingOffset = offset
+                            readingOffsetAnchor = model.streamAnchor?.id ?? item.id
                         }
                     )
                     .id(model.streamAnchor?.key ?? item.key)
@@ -652,6 +672,15 @@ struct ReaderView: View {
                 await AvatarCache.shared.prefetch(Array(model.streamItems.prefix(6)).compactMap(\.avatarURL))
             }
             .background(readingBackground.ignoresSafeArea(edges: .bottom))
+            .overlay(alignment: .topLeading) {
+                if usesWideLayout, model.bodyHTML != nil {
+                    ReaderCompactTitle(chrome: chrome, title: item.title, floating: true)
+                        .padding(.leading, 18)
+                        .padding(.top, 10)
+                        .padding(.trailing, 168)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
             .overlay(alignment: .trailing) {
                 if usesWideLayout, !model.showsComments, model.bodyHTML != nil {
                     ReaderChromeVisibility(chrome: chrome) {
@@ -686,8 +715,7 @@ struct ReaderView: View {
             .toolbar {
                 if !usesWideLayout {
                     ToolbarItem(placement: .principal) {
-                        Text(item.title).font(.subheadline.weight(.medium))
-                            .lineLimit(1).truncationMode(.tail)
+                        ReaderCompactTitle(chrome: chrome, title: item.title, floating: false)
                     }
                     ToolbarItem(placement: .navigationBarTrailing) {
                         readingSettingsButton
@@ -702,13 +730,100 @@ struct ReaderView: View {
         }
     }
 
-    /// A horizontal swipe closes the comment panel on both iPhone and iPad,
-    /// instead of requiring a scroll to the top before pulling the sheet down.
-    private var closeCommentsGesture: some Gesture {
-        DragGesture(minimumDistance: 24).onEnded { value in
-            let dx = value.translation.width
-            guard abs(dx) > 56, abs(dx) > abs(value.translation.height) * 1.2 else { return }
-            model.showsComments = false
+    /// 横向滑动关闭评论栏。识别器只有在滑动明显偏横向时才开始，
+    /// 竖向的列表滚动和 iPhone 抽屉档位拖动不会被抢走。
+    private struct CommentSwipeDismiss: UIViewRepresentable {
+        var onDismiss: () -> Void
+
+        func makeCoordinator() -> Coordinator { Coordinator(onDismiss: onDismiss) }
+
+        func makeUIView(context: Context) -> InstallerView {
+            let view = InstallerView()
+            view.isUserInteractionEnabled = false
+            view.coordinator = context.coordinator
+            return view
+        }
+
+        func updateUIView(_ uiView: InstallerView, context: Context) {
+            context.coordinator.onDismiss = onDismiss
+            uiView.coordinator = context.coordinator
+            uiView.installIfNeeded()
+        }
+
+        final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+            var onDismiss: () -> Void
+            let pan = UIPanGestureRecognizer()
+
+            init(onDismiss: @escaping () -> Void) {
+                self.onDismiss = onDismiss
+                super.init()
+                pan.addTarget(self, action: #selector(handle))
+                pan.delegate = self
+                pan.cancelsTouchesInView = false
+                pan.maximumNumberOfTouches = 1
+            }
+
+            func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+                let velocity = pan.velocity(in: pan.view)
+                return abs(velocity.x) > max(abs(velocity.y) * 1.5, 80)
+            }
+
+            func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+                other.view is UIScrollView
+            }
+
+            @objc private func handle(_ gesture: UIPanGestureRecognizer) {
+                guard gesture.state == .ended else { return }
+                let translation = gesture.translation(in: gesture.view)
+                let velocity = gesture.velocity(in: gesture.view)
+                let crossed = abs(translation.x) > 56 && abs(translation.x) > abs(translation.y) * 1.2
+                let flicked = abs(velocity.x) > 900 && abs(velocity.x) > abs(velocity.y) * 1.4
+                guard crossed || flicked else { return }
+                onDismiss()
+            }
+        }
+
+        final class InstallerView: UIView {
+            weak var coordinator: Coordinator?
+
+            override func didMoveToWindow() {
+                super.didMoveToWindow()
+                installIfNeeded()
+            }
+
+            func installIfNeeded() {
+                guard let coordinator else { return }
+                guard window != nil, let host = panelView() else {
+                    coordinator.pan.view?.removeGestureRecognizer(coordinator.pan)
+                    return
+                }
+                guard coordinator.pan.view !== host else { return }
+                coordinator.pan.view?.removeGestureRecognizer(coordinator.pan)
+                host.addGestureRecognizer(coordinator.pan)
+            }
+
+            /// 挂到评论栏自己的导航视图上，这样列表和标题栏都能左滑关闭，
+            /// 又不会接到背后的正文或整页抽屉容器。
+            private func panelView() -> UIView? {
+                var responder: UIResponder? = self
+                var nearest: UIView?
+                while let next = responder?.next {
+                    if let navigation = next as? UINavigationController {
+                        return navigation.view
+                    }
+                    if let controller = next as? UIViewController, nearest == nil {
+                        nearest = controller.view
+                    }
+                    responder = next
+                }
+                return nearest
+            }
+
+            deinit {
+                if let coordinator {
+                    coordinator.pan.view?.removeGestureRecognizer(coordinator.pan)
+                }
+            }
         }
     }
 
@@ -752,27 +867,15 @@ struct ReaderView: View {
                 }
             }
             if let error = model.commentError {
-                HStack(spacing: 22) {
-                    if requiresLogin(error) {
-                        Button { openLogin(dismissComments: true) } label: {
-                            Image(systemName: "person.crop.circle")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(ReaderPalette.accent)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("登录知乎")
-                    }
-                    Button { Task { await model.loadComments(reset: true) } } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("重试加载评论")
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
+                ReaderStatusCard(
+                    message: error,
+                    isLoginRequired: requiresLogin(error),
+                    onRetry: { Task { await model.loadComments(reset: true) } },
+                    onLogin: { openLogin(dismissComments: true) }
+                )
+                .padding(.vertical, 8)
                 .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
             } else if model.loadingComments {
                 ForEach(0..<(rows.isEmpty ? 5 : 1), id: \.self) { _ in
                     LoadingSkeleton(kind: .comment, label: "正在加载")
@@ -807,11 +910,7 @@ struct ReaderView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .principal) {
-                    let count = model.commentTarget?.commentCount ?? model.comments.count
-                    compactCount("bubble.right", count: count)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("\(displayCount(count)) 条评论")
+                    commentPanelTitle
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { model.showsComments = false } label: { Image(systemName: "xmark") }
@@ -875,7 +974,8 @@ struct ReaderView: View {
             let loaded = model.commentReplies[comment.id] != nil
             let collapsed = collapsedComments.contains(comment.id)
             let hasMore = loaded && !collapsed && model.replyNext[comment.id] != nil
-            let indicator: String = (!loaded || collapsed) ? "chevron.down" : (hasMore ? "ellipsis" : "chevron.up")
+            let failed = model.replyErrors[comment.id] != nil
+            let indicator: String = failed ? "exclamationmark.circle" : ((!loaded || collapsed) ? "chevron.down" : (hasMore ? "ellipsis" : "chevron.up"))
             Button {
                 toggleReplies(comment)
             } label: {
@@ -889,7 +989,7 @@ struct ReaderView: View {
                 .fixedSize(horizontal: true, vertical: false)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(!loaded ? "查看 \(comment.replyCount) 条回复" : collapsed ? "展开 \(comment.replyCount) 条回复" : hasMore ? "加载更多回复" : "收起 \(comment.replyCount) 条回复")
+            .accessibilityLabel(failed ? "回复没有载入，点按再试一次" : (!loaded ? "查看 \(comment.replyCount) 条回复" : collapsed ? "展开 \(comment.replyCount) 条回复" : hasMore ? "加载更多回复" : "收起 \(comment.replyCount) 条回复"))
         }
     }
 
@@ -945,6 +1045,42 @@ struct ReaderView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }.padding(.vertical, 2)
+    }
+
+    /// 评论浮层锁定打开时的那条回答：头像和作者一直留在标题上，不跟着后面的滚动换人。
+    private var commentPanelTitle: some View {
+        let count = model.commentTarget?.commentCount ?? model.comments.count
+        let author = model.commentTarget?.author.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let name = author.isEmpty ? "匿名用户" : author
+        return HStack(spacing: 8) {
+            if let target = model.commentTarget {
+                AvatarView(url: target.avatarURL, size: 22)
+                Text(name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            compactCount("bubble.right", count: count)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+                .layoutPriority(1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(model.commentTarget == nil ? "\(displayCount(count)) 条评论" : "\(name)，\(displayCount(count)) 条评论")
+    }
+
+    private func directoryRowBackground(selected: Bool) -> some View {
+        ZStack(alignment: .leading) {
+            Color.clear
+            if selected {
+                ReaderPalette.selection
+                Capsule()
+                    .fill(ReaderPalette.accent)
+                    .frame(width: 3)
+                    .padding(.vertical, 14)
+                    .padding(.leading, 7)
+            }
+        }
     }
 
     private func retryRow(_ message: String, action: @escaping () async -> Void) -> some View {
@@ -1023,6 +1159,57 @@ private struct ReaderStatusCard: View {
 /// Floating reading chrome (reading settings / account). It fades out while the
 /// reader scrolls down so the page reads edge-to-edge, and comes back on scroll up
 /// or when the page is at the top. Only this capsule observes the visibility store.
+private enum ReaderWindowMetrics {
+    static var width: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        if let width = scene?.keyWindow?.bounds.width, width > 1 { return width }
+        if let width = scene?.screen.bounds.width, width > 1 { return width }
+        return 390
+    }
+}
+
+private struct DirectoryRowButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? Color.primary.opacity(0.055) : Color.clear)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+/// The large title stays in the article. This single line takes over only after that
+/// title has scrolled away, so the question is never shown twice at the top.
+private struct ReaderCompactTitle: View {
+    @ObservedObject var chrome: ReadingChrome
+    let title: String
+    var floating: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let label = Text(title)
+            .font(.subheadline.weight(.medium))
+            .lineLimit(1)
+            .truncationMode(.tail)
+        return Group {
+            if floating {
+                if chrome.showsCompactTitle {
+                    label
+                        .frame(maxWidth: 320, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .readerGlassCapsule()
+                        .transition(.opacity)
+                }
+            } else {
+                label.opacity(chrome.showsCompactTitle ? 1 : 0)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(!chrome.showsCompactTitle)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: chrome.showsCompactTitle)
+    }
+}
+
 private struct ReaderChromeVisibility<Content: View>: View {
     @ObservedObject var chrome: ReadingChrome
     let content: Content
@@ -1681,7 +1868,7 @@ private enum ReaderPalette {
             ? UIColor(red: 0.098, green: 0.110, blue: 0.106, alpha: 1)
             : UIColor(red: 0.984, green: 0.980, blue: 0.969, alpha: 1)
     })
-    static let selection = accent.opacity(0.13)
+    static let selection = accent.opacity(0.18)
     /// The reading sheet rests on the directory, so its leading edge casts a
     /// soft shadow onto the directory's trailing edge. Dark mode needs extra
     /// weight: a black-on-black shadow all but disappears without it.
@@ -1695,6 +1882,32 @@ private enum ReaderPalette {
 private enum ReadingDefaults {
     static var fontSize: Double { UIDevice.current.userInterfaceIdiom == .phone ? 17 : 18 }
     static var width: Int { UIDevice.current.userInterfaceIdiom == .pad ? 800 : 680 }
+}
+
+/// The reader's chosen size stays the base. System text size scales it, and a
+/// cap keeps accessibility sizes from blowing the column apart.
+private enum ReaderTypography {
+    static func appliedSize(base: Double, dynamicType: DynamicTypeSize) -> Double {
+        min(40, max(15, base * scale(for: dynamicType)))
+    }
+
+    static func scale(for dynamicType: DynamicTypeSize) -> Double {
+        switch dynamicType {
+        case .xSmall: return 0.82
+        case .small: return 0.88
+        case .medium: return 0.94
+        case .large: return 1
+        case .xLarge: return 1.12
+        case .xxLarge: return 1.23
+        case .xxxLarge: return 1.35
+        case .accessibility1: return 1.64
+        case .accessibility2: return 1.94
+        case .accessibility3: return 2.35
+        case .accessibility4: return 2.76
+        case .accessibility5: return 3.12
+        @unknown default: return 1
+        }
+    }
 }
 
 private struct AuthorProfileView: View {
@@ -1769,7 +1982,7 @@ private struct CollectionPickerView: View {
                         Button("重试") { Task { await load() } }
                     }
                 } else if collections.isEmpty {
-                    Text("没有可用的收藏夹，请先在知乎创建。 ").foregroundStyle(.secondary)
+                    Text("没有可用的收藏夹，请先在知乎创建。").foregroundStyle(.secondary)
                 } else {
                     ForEach(collections) { collection in
                         Button {
@@ -1846,13 +2059,50 @@ private struct CommentAuthorBadge: View {
     }
 }
 
+/// 倒水滴定位图标：与阅读正文 HTML 内的 SVG 路径保持同一几何造型，替代 SF Symbols 的图钉图标。
+private struct TeardropPinShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let scale = min(rect.width, rect.height) / 24.0
+        let ox = rect.midX - 12.0 * scale
+        let oy = rect.midY - 12.0 * scale
+        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: ox + x * scale, y: oy + y * scale)
+        }
+        var path = Path()
+        path.move(to: pt(12.0, 21.2))
+        path.addCurve(
+            to: pt(18.6, 10.1),
+            control1: pt(16.3, 16.8),
+            control2: pt(18.6, 13.3)
+        )
+        path.addArc(
+            center: pt(12.0, 10.1),
+            radius: 6.6 * scale,
+            startAngle: .degrees(0),
+            endAngle: .degrees(180),
+            clockwise: true
+        )
+        path.addCurve(
+            to: pt(12.0, 21.2),
+            control1: pt(5.4, 13.3),
+            control2: pt(7.7, 16.8)
+        )
+        path.closeSubpath()
+        let r = 2.2 * scale
+        let c = pt(12.0, 9.9)
+        path.addEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
+        return path
+    }
+}
+
 /// 列表中与评论区内统一的统计徽标：地区、赞同、回复。
 private struct RegionBadge: View {
     let ip: String
     var body: some View {
         HStack(spacing: 3) {
-            Image(systemName: "mappin.and.ellipse")
-                .font(.system(size: 10, weight: .medium))
+            TeardropPinShape()
+                .stroke(style: StrokeStyle(lineWidth: 1.35, lineCap: .round, lineJoin: .round))
+                .frame(width: 12, height: 12)
             Text(ip).lineLimit(1)
         }
         .font(.caption)
@@ -1881,6 +2131,9 @@ private struct ItemRow: View {
     var hotRank: Int? = nil
     var showsTitle: Bool = true
     var isRead: Bool = false
+    @ScaledMetric(relativeTo: .headline) private var titleSize: CGFloat = 16
+    @ScaledMetric(relativeTo: .subheadline) private var excerptSize: CGFloat = 14
+    @ScaledMetric(relativeTo: .body) private var rankSize: CGFloat = 15
 
     /// Counts and the author's region sit on the author line, right-aligned,
     /// matching the reading header. The thumbnail shares the whole text block.
@@ -1894,18 +2147,18 @@ private struct ItemRow: View {
         HStack(alignment: .top, spacing: 10) {
             if let hotRank {
                 Text(String(format: "%02d", hotRank))
-                    .font(.system(size: 15, weight: hotRank <= 3 ? .bold : .semibold, design: .rounded))
+                    .font(.system(size: rankSize, weight: hotRank <= 3 ? .bold : .semibold, design: .rounded))
                     .monospacedDigit()
-                    .foregroundStyle(hotRank <= 3 ? ReaderPalette.accent : Color.secondary.opacity(0.52))
-                    .frame(width: 24, alignment: .leading)
+                    .foregroundStyle(hotRank <= 3 ? ReaderPalette.accent : Color.secondary)
+                    .frame(minWidth: 24, alignment: .leading)
                     .padding(.top, 2)
                     .accessibilityLabel("热榜第 \(hotRank) 名")
             }
             VStack(alignment: .leading, spacing: 8) {
                 if showsTitle {
                     Text(item.title)
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(isRead ? Color.primary.opacity(0.58) : Color.primary)
+                        .font(.system(size: titleSize, weight: .semibold))
+                        .foregroundStyle(isRead ? Color.primary.opacity(0.72) : Color.primary)
                         .lineSpacing(4)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1932,7 +2185,7 @@ private struct ItemRow: View {
                 }
                 if !item.excerpt.isEmpty {
                     Text(htmlText(item.excerpt))
-                        .font(.system(size: 14))
+                        .font(.system(size: excerptSize))
                         .foregroundStyle(isRead ? Color.secondary.opacity(0.72) : Color.secondary)
                         .lineSpacing(3)
                         .lineLimit(2)
@@ -2466,6 +2719,10 @@ private struct HTMLReader: UIViewRepresentable {
     var onNearEnd: () -> Void = {}
     var onOpenLink: (URL) -> Void = { _ in }
     var onOpenImage: (URL, CGRect, CGPoint) -> Void = { _, _, _ in }
+    var onCompactTitle: (Bool) -> Void = { _ in }
+    var restoreOffset: CGFloat = 0
+    var onReadingOffset: (CGFloat) -> Void = { _ in }
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ObservedObject private var fontManager = ReadingFontManager.shared
     @AppStorage("reading.fontSize") private var fontSize = ReadingDefaults.fontSize
     @AppStorage("reading.lineHeight") private var lineHeight = 1.8
@@ -2494,6 +2751,7 @@ private struct HTMLReader: UIViewRepresentable {
                     }
                 }
                 const active = target || sections.find(e => e.getAttribute('data-wize-answer') === id) || sections[0];
+                sections.forEach(section => section.classList.remove('current'));
                 if (active) active.classList.add('current');
                 const index = sections.indexOf(active);
                 if (index >= 0) {
@@ -2551,6 +2809,7 @@ private struct HTMLReader: UIViewRepresentable {
         let fontFamily = selectedFont.cssFamily
         let fontFaceCSS = fontManager.fontFaceCSS[selectedFont.id] ?? ""
         let fontFaceKey = "\(selectedFont.id):\(fontFaceCSS.count)"
+        let appliedFontSize = ReaderTypography.appliedSize(base: fontSize, dynamicType: dynamicTypeSize)
         let paperColor: String
         switch theme {
         case "paper": paperColor = "#fbf7ef"
@@ -2560,7 +2819,7 @@ private struct HTMLReader: UIViewRepresentable {
         }
         let cardCSS = paperCards ? """
         body { padding-left: 16px; padding-right: 16px; }
-        .answer { background: \(paperColor); border: 1px solid rgba(128,128,128,.12); border-radius: 12px; padding: 26px 22px 28px; box-shadow: 0 5px 18px rgba(0,0,0,.08); }
+        .answer { background: \(paperColor); border: 1px solid rgba(128,128,128,.12); border-radius: 12px; padding: 26px 72px 28px 22px; box-shadow: 0 5px 18px rgba(0,0,0,.08); }
         .answer + .answer { border-top: 1px dotted rgba(128,128,128,.28); margin-top: 18px; padding-top: 26px; }
         """ : ""
         let phoneGapColor: String
@@ -2587,12 +2846,15 @@ private struct HTMLReader: UIViewRepresentable {
         """ : ""
         let title = htmlEscape(item.title)
         let parts = stream.isEmpty ? [item] : stream
-        let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(fontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
+        let presentationKey = "\(colors.0)|\(colors.1)|\(colors.2)|\(fontFamily)|\(appliedFontSize)|\(lineHeight)|\(readingWidth)|\(paragraphSpacing)|\(title)|\(cardCSS)|\(previewCSS)"
         context.coordinator.onVisibleAnswer = onVisibleAnswer
         context.coordinator.onNearEnd = onNearEnd
         context.coordinator.onOpenLink = onOpenLink
         context.coordinator.onOpenImage = onOpenImage
         context.coordinator.onChromeVisibility = onChromeVisibility
+        context.coordinator.onCompactTitle = onCompactTitle
+        context.coordinator.restoreOffset = restoreOffset
+        context.coordinator.onReadingOffset = onReadingOffset
         context.coordinator.streamEnabled = !stream.isEmpty
         // Scrolling only changes the active answer, never the stream contents. Skip the
         // expensive document build (every answer's HTML is scanned for images) unless
@@ -2624,8 +2886,8 @@ private struct HTMLReader: UIViewRepresentable {
         let sections = sectionList.joined()
         let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
-        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; } body { box-sizing: border-box; font: \(fontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(23px, 6vw, 27px); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; -webkit-touch-callout: none; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
-        .byline { opacity: 1; margin-bottom: 20px; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .counts { margin:0 0 0 auto; flex-shrink:0; gap:12px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts .ip { max-width:9em; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; }
+        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; animation: wize-reveal .01s linear .7s forwards; } @keyframes wize-reveal { to { opacity: 1; } } body { box-sizing: border-box; font: \(appliedFontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(1.28em, 3.2vw, 1.5em); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; -webkit-touch-callout: none; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
+        .byline { opacity: 1; margin-bottom: 20px; transition: border-color .18s ease; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer.current .byline { border-left-color: var(--wize-link); } .counts { margin:0 0 0 auto; flex-shrink:0; gap:12px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts .ip { max-width:9em; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; } @media (prefers-reduced-motion: reduce) { .byline { transition: none; } }
         .wize-video { position:relative; display:block; margin:1.1em 0; border-radius:8px; overflow:hidden; background:#111; }
         .wize-video-poster { display:block; width:100%; height:auto; margin:0; border-radius:0; }
         .wize-video:not(:has(.wize-video-poster)) { aspect-ratio:16/9; background:linear-gradient(135deg,#2d3833,#111); }
@@ -2634,6 +2896,10 @@ private struct HTMLReader: UIViewRepresentable {
         .wize-video-title { position:absolute; left:14px; right:14px; bottom:12px; color:#fff; font:500 13px -apple-system,sans-serif; line-height:1.35; text-shadow:0 1px 4px rgba(0,0,0,.55); }
         .wize-video video { display:block; width:100%; height:auto; background:#000; }
         .wize-video.is-playing { aspect-ratio:auto; }
+        .wize-video-toggle { position:absolute; left:50%; top:50%; width:54px; height:54px; margin:-27px 0 0 -27px; display:none; align-items:center; justify-content:center; border-radius:50%; background:rgba(255,255,255,.94); box-shadow:0 6px 20px rgba(0,0,0,.24); pointer-events:none; }
+        .wize-video-toggle svg { width:22px; height:22px; fill:#1b1f1d; }
+        .wize-video.is-paused .wize-video-toggle { display:flex; }
+        video::-webkit-media-controls-overlay-enclosure, video::-webkit-media-controls-start-playback-button { display:none !important; -webkit-appearance:none; }
         .wize-video[data-loading="1"] .wize-video-play svg { animation: wize-video-pulse 1s ease-in-out infinite; }
         @keyframes wize-video-pulse { 50% { transform:scale(.86); opacity:.55; } }
         .wize-video-error { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:16px; color:#fff; font:500 13px -apple-system,sans-serif; text-align:center; background:rgba(0,0,0,.6); }
@@ -2690,6 +2956,7 @@ private struct HTMLReader: UIViewRepresentable {
             coordinator.sections = sectionList
             coordinator.cancelPendingAppends()
             coordinator.userHasScrolled = false
+            coordinator.noteCompactTitle(false)
             if context.coordinator.lastHTML.isEmpty, parts.first?.id != item.id,
                parts.contains(where: { $0.id == item.id }) {
                 context.coordinator.pendingAnchorID = item.id
@@ -2713,6 +2980,8 @@ private struct HTMLReader: UIViewRepresentable {
             context.coordinator.lastDocumentKey = documentKey
             coordinator.fontFaceKey = fontFaceKey
             coordinator.loadingDocument = true
+            coordinator.didRestoreOffset = false
+            coordinator.lastRestoreExtent = -1
             let initialHTML = fontFaceCSS.isEmpty
                 ? document
                 : document.replacingOccurrences(of: "<style id=\"wize-font-face\"></style>", with: "<style id=\"wize-font-face\">\(fontFaceCSS)</style>")
@@ -2786,6 +3055,14 @@ private struct HTMLReader: UIViewRepresentable {
         private weak var webView: WKWebView?
         var onOpenLink: (URL) -> Void = { _ in }
         var onOpenImage: (URL, CGRect, CGPoint) -> Void = { _, _, _ in }
+        var onCompactTitle: (Bool) -> Void = { _ in }
+        var restoreOffset: CGFloat = 0
+        var onReadingOffset: (CGFloat) -> Void = { _ in }
+        var didRestoreOffset = false
+        var lastRestoreExtent: CGFloat = -1
+        private var compactTitleVisible = false
+        private var lastOffsetSave = Date.distantPast
+        private var lastTitleCheck = Date.distantPast
 
         func attach(_ webView: WKWebView) { self.webView = webView }
 
@@ -2842,17 +3119,52 @@ private struct HTMLReader: UIViewRepresentable {
                 card.innerHTML = '';
                 const video = document.createElement('video');
                 video.src = \(urlJSON);
-                video.controls = true;
+                video.controls = false;
                 video.playsInline = true;
                 video.setAttribute('playsinline', '');
                 video.setAttribute('webkit-playsinline', '');
                 video.preload = 'auto';
                 const poster = \(posterJSON);
                 if (poster) video.setAttribute('poster', poster);
+                const toggle = document.createElement('span');
+                toggle.className = 'wize-video-toggle';
+                toggle.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6.4v11.2l9-5.6z"/></svg>';
                 card.appendChild(video);
-                const start = () => video.play().catch(() => {});
+                card.appendChild(toggle);
+                const sync = () => {
+                    const paused = video.paused || video.ended;
+                    card.classList.toggle('is-paused', paused);
+                    card.setAttribute('aria-label', paused ? '播放视频' : '暂停视频');
+                };
+                video.addEventListener('play', sync);
+                video.addEventListener('pause', sync);
+                video.addEventListener('ended', sync);
+                const start = () => {
+                    const attempt = video.play();
+                    if (attempt && attempt.catch) attempt.catch(() => sync());
+                };
                 video.addEventListener('loadedmetadata', start, { once: true });
                 if (video.readyState >= 1) start();
+                return true;
+            })()
+            """
+            webView.evaluateJavaScript(script)
+        }
+
+        /// 播放中的视频不再铺系统控制遮罩。点一下只在暂停和继续之间切换，暂停时只留一枚播放钮。
+        private func toggleInlineVideo(id: String, in webView: WKWebView) {
+            let script = """
+            (() => {
+                const card = document.querySelector('[data-wize-video="\(id)"]');
+                const video = card && card.querySelector('video');
+                if (!video) return false;
+                if (video.paused || video.ended) {
+                    document.querySelectorAll('.wize-video video').forEach(v => { if (v !== video) v.pause(); });
+                    const attempt = video.play();
+                    if (attempt && attempt.catch) attempt.catch(() => {});
+                } else {
+                    video.pause();
+                }
                 return true;
             })()
             """
@@ -2943,23 +3255,29 @@ private struct HTMLReader: UIViewRepresentable {
                 }
             }
         }
-        /// 阅读区点击视频卡片时直接播放；图片不再响应单击。
+        /// 未播放的视频卡片点按后开始播放；已经在播的视频点按只暂停或继续，不唤起系统控制层。
         @objc func handleVideoTap(_ gesture: UITapGestureRecognizer) {
             guard let webView else { return }
             let point = gesture.location(in: webView)
             let script = """
             (() => {
                 const el = document.elementFromPoint(\(point.x), \(point.y));
-                const video = el && el.closest ? el.closest('[data-wize-video]') : null;
-                if (!video) return null;
-                if (video.querySelector('video') || video.getAttribute('data-loading') === '1') return null;
-                const rect = video.getBoundingClientRect();
-                return { id: video.getAttribute('data-wize-video') || '', kind: video.getAttribute('data-wize-video-kind') || 'lens', poster: video.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
+                const card = el && el.closest ? el.closest('[data-wize-video]') : null;
+                if (!card || card.getAttribute('data-loading') === '1') return null;
+                if (card.querySelector('video')) {
+                    return { action: 'toggle', id: card.getAttribute('data-wize-video') || '' };
+                }
+                const rect = card.getBoundingClientRect();
+                return { action: 'start', id: card.getAttribute('data-wize-video') || '', kind: card.getAttribute('data-wize-video-kind') || 'lens', poster: card.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
             })()
             """
             webView.evaluateJavaScript(script) { [weak self] result, _ in
                 guard let self, let info = result as? [String: Any],
                       let id = info["id"] as? String, !id.isEmpty else { return }
+                if info["action"] as? String == "toggle" {
+                    self.toggleInlineVideo(id: id, in: webView)
+                    return
+                }
                 let kind = VideoKind(rawValue: info["kind"] as? String ?? "") ?? .lens
                 let poster = (info["poster"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) }
                 self.playInlineVideo(VideoReference(id: id, kind: kind), poster: poster, in: webView)
@@ -3074,6 +3392,7 @@ private struct HTMLReader: UIViewRepresentable {
             self.webView = webView
             loadingDocument = false
             chromeVisible = true
+            noteCompactTitle(false)
             chromeRevealWorkItem?.cancel()
             lastScrollOffsetY = 0
             scrollAccum = 0
@@ -3090,7 +3409,9 @@ private struct HTMLReader: UIViewRepresentable {
                 webView.evaluateJavaScript(script) { [weak self, weak webView] _, _ in
                     guard let self, let webView else { return }
                     self.restoringAnchor = false
+                    self.restoreReadingOffset(in: webView)
                     self.inspect(webView)
+                    self.updateCompactTitle(in: webView, force: true)
                 }
                 return
             } else if let offset = pendingOffset {
@@ -3101,6 +3422,8 @@ private struct HTMLReader: UIViewRepresentable {
                 webView.scrollView.setContentOffset(CGPoint(x: 0, y: min(fraction, 1) * extent), animated: false)
             }
             inspect(webView)
+            restoreReadingOffset(in: webView)
+            updateCompactTitle(in: webView, force: true)
         }
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
             userHasScrolled = true
@@ -3148,6 +3471,10 @@ private struct HTMLReader: UIViewRepresentable {
                 // Keep the baseline in step with programmatic scrolling (anchor restore).
                 lastScrollOffsetY = scrollView.contentOffset.y
             }
+            if userHasScrolled {
+                updateCompactTitle(in: webView)
+                saveReadingOffset(of: scrollView)
+            }
             guard streamEnabled else { return }
             if remaining < scrollView.bounds.height * 1.3,
                Date().timeIntervalSince(lastNearEnd) > 0.6 {
@@ -3167,6 +3494,48 @@ private struct HTMLReader: UIViewRepresentable {
             scheduleChromeReveal(after: 0.3)
         }
 
+        private func saveReadingOffset(of scrollView: UIScrollView) {
+            let now = Date()
+            guard now.timeIntervalSince(lastOffsetSave) > 0.25 else { return }
+            lastOffsetSave = now
+            onReadingOffset(max(0, scrollView.contentOffset.y))
+        }
+
+        private func restoreReadingOffset(in webView: WKWebView) {
+            guard !didRestoreOffset, !loadingDocument, restoreOffset > 1 else { return }
+            let scrollView = webView.scrollView
+            let extent = scrollView.contentSize.height - scrollView.bounds.height
+            guard extent > 1 else { return }
+            // Wait until the page is tall enough for the saved place. Images still
+            // decoding would otherwise clamp us to a short document and stick there.
+            let settled = abs(extent - lastRestoreExtent) < 1
+            lastRestoreExtent = extent
+            guard restoreOffset <= extent + 8 || settled else { return }
+            didRestoreOffset = true
+            let y = min(restoreOffset, max(0, extent))
+            guard abs(scrollView.contentOffset.y - y) > 1 else { return }
+            scrollView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+        }
+
+        func noteCompactTitle(_ visible: Bool) {
+            guard visible != compactTitleVisible else { return }
+            compactTitleVisible = visible
+            onCompactTitle(visible)
+        }
+
+        private func updateCompactTitle(in webView: WKWebView, force: Bool = false) {
+            guard !loadingDocument else { return }
+            let now = Date()
+            if !force, now.timeIntervalSince(lastTitleCheck) < 0.12 { return }
+            lastTitleCheck = now
+            let showing = compactTitleVisible ? "true" : "false"
+            let script = "(() => { const header = document.querySelector('header h1'); if (!header) return false; const bottom = header.getBoundingClientRect().bottom; const showing = \(showing); return showing ? bottom < 36 : bottom < 2; })()"
+            webView.evaluateJavaScript(script) { [weak self] result, _ in
+                guard let self else { return }
+                self.noteCompactTitle((result as? Bool) ?? false)
+            }
+        }
+
         private func scheduleChromeReveal(after delay: TimeInterval = 0.55) {
             guard !chromeVisible else { return }
             chromeRevealWorkItem?.cancel()
@@ -3179,6 +3548,7 @@ private struct HTMLReader: UIViewRepresentable {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
         func inspectAfterLayout(_ webView: WKWebView) {
+            restoreReadingOffset(in: webView)
             guard streamEnabled, !loadingDocument else { return }
             flushAppends(in: webView)
             // Content size also changes while lazy images decode; do not round-trip to
@@ -3196,7 +3566,7 @@ private struct HTMLReader: UIViewRepresentable {
             guard streamEnabled, !loadingDocument, pendingAnchorID == nil, !restoringAnchor else { return }
             lastInspection = Date()
             // Tie edge actions to the answer at the reading focus, not a sliver at the top.
-            let script = "(() => { const answers = Array.from(document.querySelectorAll('section[data-wize-answer]')); const focus = Math.min(innerHeight * .35, innerHeight - 1); const answer = answers.find(e => e.getBoundingClientRect().bottom > focus) || answers.find(e => e.getBoundingClientRect().bottom > 0); const index = answers.indexOf(answer); if (index >= 0) answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager')); return { id: answer?.getAttribute('data-wize-answer') || null }; })()"
+            let script = "(() => { const answers = Array.from(document.querySelectorAll('section[data-wize-answer]')); const focus = Math.min(innerHeight * .35, innerHeight - 1); const answer = answers.find(e => e.getBoundingClientRect().bottom > focus) || answers.find(e => e.getBoundingClientRect().bottom > 0); const index = answers.indexOf(answer); if (index >= 0) answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager')); answers.forEach(section => section.classList.toggle('current', section === answer)); return { id: answer?.getAttribute('data-wize-answer') || null }; })()"
             webView.evaluateJavaScript(script) { [weak self] result, _ in
                 guard let self, let result = result as? [String: Any] else { return }
                 if self.userHasScrolled, let id = result["id"] as? String { self.onVisibleAnswer(id) }
