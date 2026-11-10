@@ -18,6 +18,7 @@ struct ReadingItem: Identifiable, Hashable {
     var upCount: Int? = nil
     var downCount: Int? = nil
     var commentCount: Int? = nil
+    var heatText: String? = nil
     var vote: AnswerVote? = nil
     var key: String { "\(kind.rawValue):\(id)" }
 }
@@ -383,7 +384,17 @@ final class ZhihuSource: ReadingSource {
     }
     private func parseFeed(_ entry: [String: Any]) -> ReadingItem? {
         let target = entry["target"] as? [String: Any] ?? entry
-        return parseObject(target, fallbackQuestionID: nil)
+        guard var item = parseObject(target, fallbackQuestionID: nil) else { return nil }
+        if let detailText = (entry["detail_text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !detailText.isEmpty {
+            item.heatText = detailText
+        }
+        if item.imageURL == nil,
+           let children = entry["children"] as? [[String: Any]],
+           let childThumb = children.lazy.compactMap({ mediaURL($0["thumbnail"]) }).first {
+            item.imageURL = childThumb
+        }
+        return item
     }
     private func parseObject(_ object: [String: Any], fallbackQuestionID: String?) -> ReadingItem? {
         guard let id = identifier(object["id"]) else { return nil }

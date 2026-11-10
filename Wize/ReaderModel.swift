@@ -365,6 +365,9 @@ final class ReaderModel: ObservableObject {
     /// 切换栏目时：若首次进入则加载首屏；若已有数据则仅在超时或存在暂存新内容时自动刷新，避免误触发分页加载。
     func activateChannel(_ value: Channel, applyImmediately: Bool = true) async {
         changeChannel(value)
+        if applyImmediately, hasPendingFeed(for: value) {
+            applyPendingFeed(for: value)
+        }
         if feeds[value] == nil || (feeds[value]?.isEmpty == true && feedError == nil) {
             await loadFeed()
         } else {

@@ -24,6 +24,7 @@ final class ReadingChrome: ObservableObject {
 struct ReaderView: View {
     @EnvironmentObject private var model: ReaderModel
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.colorScheme) private var systemColorScheme
     @Environment(\.scenePhase) private var scenePhase
     @State private var phonePath: [PhonePage] = []
     @State private var feedAtTop: [ReaderModel.Channel: Bool] = [.recommend: true, .hot: true]
@@ -64,9 +65,22 @@ struct ReaderView: View {
     private func canApplyFeedImmediately(for channel: ReaderModel.Channel) -> Bool {
         guard feedAtTop[channel, default: true] else { return false }
         if usesWideLayout {
-            return model.question == nil && readingOffset <= 10
+            let isDefaultFirstItem = model.selected == nil || model.selected?.key == model.feeds[channel]?.first?.key
+            return model.question == nil && isDefaultFirstItem && readingOffset <= 10 && !model.showsComments
         } else {
             return phonePath.isEmpty
+        }
+    }
+
+    private func performAutoRefresh() async {
+        let ch = model.channel
+        let applyNow = canApplyFeedImmediately(for: ch)
+        let updated = await model.autoRefreshFeedIfNeeded(for: ch, applyImmediately: applyNow)
+        if updated, applyNow, usesWideLayout,
+           canApplyFeedImmediately(for: ch),
+           let first = model.feeds[ch]?.first,
+           model.selected?.key != first.key {
+            model.open(first)
         }
     }
 
@@ -128,21 +142,13 @@ struct ReaderView: View {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(180)) } catch { return }
                 guard !Task.isCancelled else { return }
-                _ = await model.autoRefreshFeedIfNeeded(
-                    for: model.channel,
-                    applyImmediately: canApplyFeedImmediately(for: model.channel)
-                )
+                await performAutoRefresh()
             }
         }
         .onChange(of: scenePhase) { phase in
             switch phase {
             case .active:
-                Task {
-                    _ = await model.autoRefreshFeedIfNeeded(
-                        for: model.channel,
-                        applyImmediately: canApplyFeedImmediately(for: model.channel)
-                    )
-                }
+                Task { await performAutoRefresh() }
             case .background:
                 BackgroundFeedRefresh.scheduleNext()
             default:
@@ -288,6 +294,7 @@ struct ReaderView: View {
                             .padding(.top, 6)
                             .padding(.trailing, 12)
                         }
+                        .environment(\.colorScheme, readingColorScheme)
                         .background(readingBackground.ignoresSafeArea())
                 }
                 // The directory rail sits above the reading page, so its shadow
@@ -406,6 +413,7 @@ struct ReaderView: View {
             }
             .frame(width: 290)
             .buttonStyle(.plain)
+            .environment(\.colorScheme, systemColorScheme)
             .presentationCompactAdaptation(.popover)
             .onDisappear {
                 switch accountDestination {
@@ -650,6 +658,14 @@ struct ReaderView: View {
             } } }
     }
 
+    private var readingColorScheme: ColorScheme {
+        switch readingTheme {
+        case "light", "paper": return .light
+        case "dark": return .dark
+        default: return systemColorScheme
+        }
+    }
+
     private var readingBackground: Color {
         switch readingTheme {
         case "paper": return Color(red: 0.961, green: 0.941, blue: 0.902)
@@ -749,7 +765,7 @@ struct ReaderView: View {
             .task(id: model.streamAnchor?.key) {
                 await AvatarCache.shared.prefetch(Array(model.streamItems.prefix(6)).compactMap(\.avatarURL))
             }
-            .background(readingBackground.ignoresSafeArea(edges: .bottom))
+            .background(readingBackground.ignoresSafeArea())
             .overlay(alignment: .topLeading) {
                 if usesWideLayout, model.bodyHTML != nil {
                     ReaderCompactTitle(chrome: chrome, title: item.title, floating: true)
@@ -800,11 +816,15 @@ struct ReaderView: View {
                     }
                 }
             }
+            .toolbarColorScheme(readingColorScheme, for: .navigationBar)
+            .environment(\.colorScheme, readingColorScheme)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: "text.book.closed").font(.system(size: 36)).foregroundStyle(.tertiary)
                 Text(model.question == nil ? "选择一篇内容开始阅读" : "选择一个回答开始阅读").foregroundStyle(.secondary)
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .environment(\.colorScheme, readingColorScheme)
         }
     }
 
@@ -1032,8 +1052,12 @@ struct ReaderView: View {
                 RegionBadge(ip: ip)
             }
             if comment.likes > 0 {
-                MetadataCount(symbol: "hand.thumbsup", count: comment.likes,
-                              accessibilityLabel: "\(displayCount(comment.likes)) 次赞同")
+                MetadataCount(
+                    symbol: comment.likes >= 50 ? "hand.thumbsup.fill" : "hand.thumbsup",
+                    count: comment.likes,
+                    color: comment.likes >= 50 ? ReaderPalette.upvote.opacity(0.88) : .secondary,
+                    accessibilityLabel: "\(displayCount(comment.likes)) 次赞同"
+                )
             }
             if comment.replyCount > 0 {
                 replyCountBadge(comment)
@@ -1189,13 +1213,14 @@ private struct ReaderStatusCard: View {
     var onLogin: (() -> Void)? = nil
 
     var body: some View {
+        let statusTone = isLoginRequired ? ReaderPalette.accent : ReaderPalette.hotTop2
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: isLoginRequired ? "person.crop.circle" : "wifi.exclamationmark")
                     .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(ReaderPalette.accent)
+                    .foregroundStyle(statusTone)
                     .frame(width: 30, height: 30)
-                    .background(ReaderPalette.accent.opacity(0.10), in: Circle())
+                    .background(statusTone.opacity(0.12), in: Circle())
                 VStack(alignment: .leading, spacing: 3) {
                     Text(isLoginRequired ? "需要登录知乎" : "暂时无法加载")
                         .font(.subheadline.weight(.semibold))
@@ -1359,6 +1384,7 @@ private struct ReaderActionOverlay: View {
     let collectedKeys: Set<String>
     var onProfile: (ReadingItem) -> Void
     var onCollect: (ReadingItem) -> Void
+    @State private var moreButtonFrame: CGRect = .zero
 
     private var item: ReadingItem? {
         // Prefer the newest copy of the focused answer so vote counts and vote
@@ -1407,11 +1433,11 @@ private struct ReaderActionOverlay: View {
         }
         .accessibilityLabel("查看评论")
         let canCollect = item.kind == .answer || item.kind == .article
+        let isCollected = canCollect && collectedKeys.contains(item.key)
         let shareURL = zhihuWebURL(for: item)
         if canCollect || shareURL != nil {
             Menu {
                 if canCollect {
-                    let isCollected = collectedKeys.contains(item.key)
                     Button {
                         onCollect(item)
                     } label: {
@@ -1420,20 +1446,36 @@ private struct ReaderActionOverlay: View {
                 }
                 if let shareURL {
                     Button {
+                        ReaderSharePresenter.shared.anchorSourceRect = moreButtonFrame
                         ReaderSharePresenter.shared.present(item: item, url: shareURL)
                     } label: {
                         Label("分享", systemImage: "square.and.arrow.up")
                     }
                 }
             } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 17, weight: .medium))
-                    .frame(width: layout == .trailing ? 56 : 52, height: 52)
-                    .foregroundStyle(ReaderPalette.accent)
-                    .contentShape(Rectangle())
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(ReaderPalette.controlInk)
+                    if isCollected {
+                        Circle()
+                            .fill(ReaderPalette.gold)
+                            .frame(width: 5.5, height: 5.5)
+                            .offset(x: 4, y: -3)
+                    }
+                }
+                .frame(width: layout == .trailing ? 56 : 52, height: 52)
+                .contentShape(Rectangle())
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear
+                            .onAppear { moreButtonFrame = proxy.frame(in: .global) }
+                            .onChange(of: proxy.frame(in: .global)) { moreButtonFrame = $0 }
+                    }
+                )
             }
-            .tint(ReaderPalette.accent)
-            .accessibilityLabel("更多操作")
+            .tint(ReaderPalette.controlInk)
+            .accessibilityLabel(isCollected ? "更多操作（已收藏）" : "更多操作")
         }
     }
 
@@ -1444,14 +1486,14 @@ private struct ReaderActionOverlay: View {
                 Image(systemName: icon).font(.system(size: 17, weight: .medium))
                 Text(displayCount(count)).font(.system(size: 10, weight: .medium)).monospacedDigit()
             }.frame(width: 56, height: 52)
-                .foregroundStyle(ReaderPalette.accent)
+                .foregroundStyle(ReaderPalette.controlInk)
         } else {
             HStack(spacing: 4) {
                 Image(systemName: icon).font(.system(size: 17, weight: .medium))
                 Text(displayCount(count)).font(.system(size: 12, weight: .medium)).monospacedDigit()
             }.fixedSize(horizontal: true, vertical: false)
                 .frame(maxWidth: .infinity, minHeight: 52)
-                .foregroundStyle(ReaderPalette.accent)
+                .foregroundStyle(ReaderPalette.controlInk)
         }
     }
 }
@@ -1463,6 +1505,7 @@ private struct ReaderActionOverlay: View {
 @MainActor
 private final class ReaderSharePresenter {
     static let shared = ReaderSharePresenter()
+    var anchorSourceRect: CGRect = .zero
     private var activeSources: [Any] = []
     private var didWarmUp = false
     private var warmUpController: UIActivityViewController?
@@ -1496,6 +1539,7 @@ private final class ReaderSharePresenter {
     }
 
     func present(item: ReadingItem, url: URL) {
+        let sourceRect = anchorSourceRect
         let title = zhihuShareTitle(for: item)
         let imageURL = item.imageURL ?? item.avatarURL
         let rawIcon = Self.cachedShareIcon(url: imageURL)
@@ -1523,13 +1567,18 @@ private final class ReaderSharePresenter {
         if UIDevice.current.userInterfaceIdiom == .pad,
            let popover = controller.popoverPresentationController {
             popover.sourceView = host.view
-            popover.sourceRect = CGRect(
-                x: host.view.bounds.midX,
-                y: host.view.bounds.midY,
-                width: 0,
-                height: 0
-            )
-            popover.permittedArrowDirections = []
+            if !sourceRect.isEmpty, sourceRect.width > 0, sourceRect.height > 0 {
+                popover.sourceRect = host.view.convert(sourceRect, from: nil)
+                popover.permittedArrowDirections = [.right, .up, .down]
+            } else {
+                popover.sourceRect = CGRect(
+                    x: host.view.bounds.midX,
+                    y: host.view.bounds.midY,
+                    width: 0,
+                    height: 0
+                )
+                popover.permittedArrowDirections = []
+            }
         }
         host.present(controller, animated: true)
     }
@@ -1796,10 +1845,10 @@ private struct VoteActionButton: View {
         ZStack {
             if isOn {
                 Circle()
-                    .fill(ReaderPalette.accent.opacity(0.16))
+                    .fill(ReaderPalette.upvote.opacity(0.16))
                     .frame(width: 30, height: 30)
                 Circle()
-                    .strokeBorder(ReaderPalette.accent.opacity(0.26), lineWidth: 0.75)
+                    .strokeBorder(ReaderPalette.upvote.opacity(0.30), lineWidth: 0.75)
                     .frame(width: 30, height: 30)
             }
             if showsBurst {
@@ -1807,7 +1856,7 @@ private struct VoteActionButton: View {
             }
             Image(systemName: isOn ? "hand.thumbsup.fill" : "hand.thumbsup")
                 .font(.system(size: 17, weight: isOn ? .semibold : .medium))
-                .foregroundStyle(ReaderPalette.accent)
+                .foregroundStyle(isOn ? ReaderPalette.upvote : ReaderPalette.controlInk)
                 .symbolEffect(.bounce, options: .speed(1.15), value: reduceMotion ? -1 : burst)
                 .contentTransition(.symbolEffect(.replace))
                 .animation(.easeInOut(duration: 0.18), value: isOn)
@@ -1819,7 +1868,7 @@ private struct VoteActionButton: View {
         Text(displayCount(count))
             .monospacedDigit()
             .fontWeight(isOn ? .semibold : .medium)
-            .foregroundStyle(ReaderPalette.accent)
+            .foregroundStyle(isOn ? ReaderPalette.upvote : ReaderPalette.controlInk)
             .contentTransition(.numericText(value: Double(count ?? 0)))
             .animation(.snappy(duration: 0.28), value: count)
             .animation(.easeInOut(duration: 0.18), value: isOn)
@@ -1841,16 +1890,17 @@ private struct LikeBurst: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(ReaderPalette.accent.opacity(0.5), lineWidth: 1)
+                .stroke(ReaderPalette.upvote.opacity(0.55), lineWidth: 1)
                 .frame(width: 18, height: 18)
                 .scaleEffect(expanded ? 2.05 : 0.55)
                 .opacity(expanded ? 0 : 0.85)
             ForEach(0..<7, id: \.self) { index in
                 let angle = Double(index) / 7 * .pi * 2 - .pi / 2
+                let dotColor = index.isMultiple(of: 2) ? ReaderPalette.upvote : ReaderPalette.gold
                 Circle()
-                    .fill(ReaderPalette.accent.opacity(index.isMultiple(of: 2) ? 0.9 : 0.55))
-                    .frame(width: index.isMultiple(of: 2) ? 3.5 : 2.2,
-                           height: index.isMultiple(of: 2) ? 3.5 : 2.2)
+                    .fill(dotColor.opacity(index.isMultiple(of: 2) ? 0.92 : 0.80))
+                    .frame(width: index.isMultiple(of: 2) ? 3.5 : 2.4,
+                           height: index.isMultiple(of: 2) ? 3.5 : 2.4)
                     .offset(x: expanded ? cos(angle) * 16 : 0,
                             y: expanded ? sin(angle) * 16 : 0)
                     .scaleEffect(expanded ? 0.2 : 1)
@@ -1858,7 +1908,7 @@ private struct LikeBurst: View {
             }
             Image(systemName: "sparkle")
                 .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(ReaderPalette.accent)
+                .foregroundStyle(ReaderPalette.gold)
                 .offset(x: 11, y: -13)
                 .scaleEffect(expanded ? 0.2 : 1)
                 .opacity(expanded ? 0 : 1)
@@ -1926,15 +1976,71 @@ private struct LoadingSkeleton: View {
 
 private extension View {
     func readerGlassCapsule() -> some View {
-        glassEffect(.regular.interactive(), in: Capsule())
+        self
+            .background(ReaderPalette.glassBacking, in: Capsule())
+            .glassEffect(.regular.tint(ReaderPalette.glassTint).interactive(), in: Capsule())
     }
 }
 
 private enum ReaderPalette {
     static let accent = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.68, green: 0.77, blue: 0.72, alpha: 1)
-            : UIColor(red: 0.30, green: 0.41, blue: 0.36, alpha: 1)
+            ? UIColor(red: 0.72, green: 0.82, blue: 0.76, alpha: 1)
+            : UIColor(red: 0.27, green: 0.38, blue: 0.33, alpha: 1)
+    })
+    /// 浮动胶囊内未激活按钮的温润墨色：深浅模式下都具备充足对比度，又与点亮后的暖色状态拉开层次。
+    static let controlInk = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.90, green: 0.92, blue: 0.90, alpha: 1)
+            : UIColor(red: 0.21, green: 0.25, blue: 0.23, alpha: 1)
+    })
+    /// 已赞同状态与点赞粒子的朱砂暖珊瑚色，与青玉主色形成冷暖呼应。
+    static let upvote = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.95, green: 0.45, blue: 0.38, alpha: 1)
+            : UIColor(red: 0.81, green: 0.28, blue: 0.22, alpha: 1)
+    })
+    /// 收藏与星火点缀的琥珀金色。
+    static let gold = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.95, green: 0.73, blue: 0.31, alpha: 1)
+            : UIColor(red: 0.79, green: 0.53, blue: 0.12, alpha: 1)
+    })
+    /// 热榜前三名阶梯暖色（朱砂红 / 柿叶橙 / 琥珀金）。
+    static let hotTop1 = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.96, green: 0.44, blue: 0.36, alpha: 1)
+            : UIColor(red: 0.80, green: 0.25, blue: 0.20, alpha: 1)
+    })
+    static let hotTop2 = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.96, green: 0.57, blue: 0.32, alpha: 1)
+            : UIColor(red: 0.84, green: 0.43, blue: 0.17, alpha: 1)
+    })
+    static let hotTop3 = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.93, green: 0.71, blue: 0.30, alpha: 1)
+            : UIColor(red: 0.76, green: 0.53, blue: 0.14, alpha: 1)
+    })
+    static func hotRankColor(_ rank: Int) -> Color {
+        switch rank {
+        case 1: return hotTop1
+        case 2: return hotTop2
+        case 3: return hotTop3
+        default: return .secondary
+        }
+    }
+    /// 浮动操作栏的底衬与液态玻璃着色：深色模式下即使正文滑过纯白截图，或浅色模式下滑过深色配图，
+    /// 胶囊都能保持稳定底色，确保点赞、评论与更多按钮始终清晰可辨。
+    static let glassBacking = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.10, green: 0.12, blue: 0.11, alpha: 0.72)
+            : UIColor(red: 0.97, green: 0.97, blue: 0.95, alpha: 0.72)
+    })
+    static let glassTint = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.09, green: 0.11, blue: 0.10, alpha: 0.65)
+            : UIColor(red: 0.98, green: 0.98, blue: 0.96, alpha: 0.60)
     })
     static let directory = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
@@ -2033,7 +2139,7 @@ private struct AuthorProfileView: View {
             } }
         }
         .tint(ReaderPalette.accent)
-        .presentationDetents([.height(270)])
+        .presentationDetents([.height(UIDevice.current.userInterfaceIdiom == .pad ? 310 : 285)])
         .presentationDragIndicator(.visible)
     }
 }
@@ -2070,7 +2176,7 @@ private struct CollectionPickerView: View {
                                 Text(collection.title).foregroundStyle(.primary)
                                 Spacer()
                                 if savingID == collection.id { Text("正在保存").font(.caption).foregroundStyle(.secondary) }
-                                else if collection.isFavorited { Image(systemName: "checkmark").foregroundStyle(ReaderPalette.accent) }
+                                else if collection.isFavorited { Image(systemName: "star.fill").foregroundStyle(ReaderPalette.gold) }
                             }.contentShape(Rectangle())
                         }.buttonStyle(.plain).disabled(savingID != nil)
                     }
@@ -2193,11 +2299,12 @@ private struct RegionBadge: View {
 private struct MetadataCount: View {
     let symbol: String
     let count: Int
+    var color: Color = .secondary
     let accessibilityLabel: String
     var body: some View {
         compactCount(symbol, count: count)
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(color)
             .fixedSize(horizontal: true, vertical: false)
             .accessibilityLabel(accessibilityLabel)
     }
@@ -2211,7 +2318,7 @@ private struct ItemRow: View {
     var isRead: Bool = false
     @ScaledMetric(relativeTo: .headline) private var titleSize: CGFloat = 16
     @ScaledMetric(relativeTo: .subheadline) private var excerptSize: CGFloat = 14
-    @ScaledMetric(relativeTo: .body) private var rankSize: CGFloat = 15
+    @ScaledMetric(relativeTo: .caption) private var rankSize: CGFloat = 12
 
     /// Counts and the author's region sit on the author line, right-aligned,
     /// matching the reading header. The thumbnail shares the whole text block.
@@ -2220,19 +2327,13 @@ private struct ItemRow: View {
     }
 
     var body: some View {
-        // 缩略图与整块文字（标题/作者/摘要）同高区域并排，而不是只把标题撑到
-        // 图片高度；短标题不会在左下方留下空洞，长标题也能占满可用宽度。
+        // 缩略图与整块文字（标题/作者/摘要）同高区域并排，热榜序号置于标题上方，
+        // 既不占用左侧整列宝贵宽度，也让长标题与摘要能完整铺满列宽。
         HStack(alignment: .top, spacing: 10) {
-            if let hotRank {
-                Text(String(format: "%02d", hotRank))
-                    .font(.system(size: rankSize, weight: hotRank <= 3 ? .bold : .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(hotRank <= 3 ? ReaderPalette.accent : Color.secondary)
-                    .frame(minWidth: 24, alignment: .leading)
-                    .padding(.top, 2)
-                    .accessibilityLabel("热榜第 \(hotRank) 名")
-            }
             VStack(alignment: .leading, spacing: 8) {
+                if let hotRank {
+                    hotRankHeader(hotRank)
+                }
                 if showsTitle {
                     Text(item.title)
                         .font(.system(size: titleSize, weight: .semibold))
@@ -2255,7 +2356,7 @@ private struct ItemRow: View {
                             metadataRow
                         }
                     }
-                } else if isHot, showsInlineCounts {
+                } else if isHot, hotRank == nil, showsInlineCounts {
                     HStack {
                         Spacer(minLength: 0)
                         metadataRow
@@ -2280,6 +2381,41 @@ private struct ItemRow: View {
         .padding(.vertical, 14)
         .padding(.horizontal, 10)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5).padding(.horizontal, 10) }
+    }
+
+    @ViewBuilder
+    private func hotRankHeader(_ hotRank: Int) -> some View {
+        let isTop3 = hotRank <= 3
+        let rankColor = ReaderPalette.hotRankColor(hotRank)
+        HStack(spacing: 8) {
+            Text(String(format: "%02d", hotRank))
+                .font(.system(size: rankSize, weight: isTop3 ? .bold : .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(isTop3 ? rankColor : Color.secondary)
+                .padding(.horizontal, 6.5)
+                .padding(.vertical, 2)
+                .background(
+                    (isTop3 ? rankColor.opacity(0.14) : Color.primary.opacity(0.06)),
+                    in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+                )
+                .accessibilityLabel("热榜第 \(hotRank) 名")
+            if let heat = item.heatText, !heat.isEmpty {
+                HStack(spacing: 3) {
+                    if isTop3 {
+                        Image(systemName: "flame.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    Text(heat)
+                        .font(.caption.weight(isTop3 ? .medium : .regular))
+                        .monospacedDigit()
+                }
+                .foregroundStyle(isTop3 ? rankColor.opacity(0.88) : Color.secondary)
+            }
+            Spacer(minLength: 0)
+            if showsInlineCounts {
+                metadataRow
+            }
+        }
     }
 
     /// 列表作者行、评论作者行共用：地区 + 赞同 + 评论，统一 12pt 间隔。
@@ -2893,7 +3029,7 @@ private struct HTMLReader: UIViewRepresentable {
         let sections = sectionList.joined()
         let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
-        :root { --wize-link: light-dark(#527863, #a7c4b1); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; animation: wize-reveal .01s linear .7s forwards; } @keyframes wize-reveal { to { opacity: 1; } } body { box-sizing: border-box; font: \(appliedFontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(1.28em, 3.2vw, 1.5em); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; -webkit-touch-callout: none; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
+        :root { --wize-link: light-dark(#527863, #a7c4b1); --wize-quote: light-dark(#c28a26, #e6b04b); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; animation: wize-reveal .01s linear .7s forwards; } @keyframes wize-reveal { to { opacity: 1; } } body { box-sizing: border-box; font: \(appliedFontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(1.28em, 3.2vw, 1.5em); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; -webkit-touch-callout: none; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
         .byline { opacity: 1; margin-bottom: 20px; transition: border-color .18s ease; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer.current .byline { border-left-color: var(--wize-link); } .counts { margin:0 0 0 auto; flex-shrink:0; gap:12px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts .ip { max-width:9em; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; } @media (prefers-reduced-motion: reduce) { .byline { transition: none; } }
         .wize-video { position:relative; display:block; margin:1.1em 0; border-radius:8px; overflow:hidden; background:#111; }
         .wize-video-poster { display:block; width:100%; height:auto; margin:0; border-radius:0; }
@@ -2910,7 +3046,7 @@ private struct HTMLReader: UIViewRepresentable {
         .wize-video[data-loading="1"] .wize-video-play svg { animation: wize-video-pulse 1s ease-in-out infinite; }
         @keyframes wize-video-pulse { 50% { transform:scale(.86); opacity:.55; } }
         .wize-video-error { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:16px; color:#fff; font:500 13px -apple-system,sans-serif; text-align:center; background:rgba(0,0,0,.6); }
-        main blockquote { margin: 1.2em 0; padding: .15em 0 .15em 1.05em; border-left: 2.5px solid color-mix(in srgb, var(--wize-link) 55%, transparent); color: inherit; opacity: .84; }
+        main blockquote { margin: 1.2em 0; padding: .15em 0 .15em 1.05em; border-left: 2.5px solid color-mix(in srgb, var(--wize-quote) 65%, transparent); color: inherit; opacity: .86; }
         main img.emojione, main img.ztext-emoji { display: inline-block; width: 1.25em; height: 1.25em; vertical-align: -0.18em; margin: 0 .06em; border-radius: 0; }
         main hr { border: 0; height: 0; border-top: 1.5px dotted color-mix(in srgb, currentColor 36%, transparent); margin: 2em 0; }
         main p:last-child { margin-bottom: 0; }
@@ -3896,9 +4032,11 @@ private struct LoginView: View {
                             nativeLoginFormContent
                         }
                     }
+                    .frame(maxWidth: 460)
                     .padding(.horizontal, 20)
                     .padding(.top, 18)
                     .padding(.bottom, 32)
+                    .frame(maxWidth: .infinity)
                 }
                 .scrollDismissesKeyboard(.interactively)
             }

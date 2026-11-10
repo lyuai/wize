@@ -34,12 +34,21 @@ final class ReadingFixtureSource: ReadingSource {
                 answer("sample-image", "晚风", image, "一幅画面，有时会让人想多停留一会儿。", 78, 3)]
     }
     func feed(hot: Bool, next: URL?) async throws -> Page<ReadingItem> {
+        var firstHot = question
+        firstHot.heatText = "1286 万热度"
+        firstHot.imageURL = URL(string: "https://picx.zhimg.com/v2-f08ce62b9adca0db656dc08963d71541_720w.jpg?source=ccfced1a")
         let longerQuestion = ReadingItem(id: "sample-question-long", kind: .question,
             title: "排版样本｜当一条热榜标题很长，在手机上换行时应该如何保持舒展和清晰？",
-            excerpt: "不同长度的文字应当自然排列，让标题与摘要都保留充足的阅读空间。", author: "不应显示的作者", questionID: nil)
+            excerpt: "不同长度的文字应当自然排列，让标题与摘要都保留充足的阅读空间。", author: "不应显示的作者", questionID: nil,
+            heatText: "642 万热度")
         let shortQuestion = ReadingItem(id: "sample-question-short", kind: .question,
-            title: "排版样本｜你最近读到了什么？", excerpt: "关于阅读的一点闲谈。", author: "", questionID: nil)
-        return Page(items: hot ? [question, longerQuestion, shortQuestion] : [samples[0], question], next: nil)
+            title: "排版样本｜你最近读到了什么？", excerpt: "关于阅读的一点闲谈。", author: "", questionID: nil,
+            heatText: "318 万热度")
+        let fourthQuestion = ReadingItem(id: "sample-question-fourth", kind: .question,
+            title: "排版样本｜如果把热榜序号放在标题上方，阅读视线会如何流动？",
+            excerpt: "不再占用左侧整列宽度后，标题与摘要可以自然对齐到左边缘。", author: "", questionID: nil,
+            heatText: "129 万热度")
+        return Page(items: hot ? [firstHot, longerQuestion, shortQuestion, fourthQuestion] : [samples[0], question], next: nil)
     }
     func currentUser() async throws -> (name: String, avatar: URL?, headline: String?, token: String?) { ("阅读者", nil, "在阅读里发现更多", "reader-fixture") }
     func answers(questionID: String, sort: String, offset: Int) async throws -> Page<ReadingItem> {

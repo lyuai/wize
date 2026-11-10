@@ -16,7 +16,6 @@ final class ImagePreviewPresenter {
         previousKeyWindow = scene.keyWindow
 
         let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
         window.windowLevel = .normal + 1
         window.backgroundColor = .clear
         let root = AnimatedImageViewer(
