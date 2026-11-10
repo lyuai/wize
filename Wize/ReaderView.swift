@@ -3,6 +3,7 @@ import WebKit
 import SafariServices
 import LinkPresentation
 import Social
+import ImageIO
 
 /// The answer at the reading focus. It is deliberately separate from
 /// `ReaderModel.selected`: scrolling across answer boundaries should refresh the
@@ -19,6 +20,14 @@ final class ReadingChrome: ObservableObject {
     @Published var showsControls = true
     /// Single-line question title, shown only after the large title has left the page.
     @Published var showsCompactTitle = false
+}
+
+/// Reading scroll offset stored in a plain reference box rather than `@State` value
+/// properties so scrolling an article never invalidates `ReaderView.body`.
+@MainActor
+final class ReadingProgressStore {
+    var offset: CGFloat = 0
+    var anchor: String = ""
 }
 
 struct ReaderView: View {
@@ -43,8 +52,7 @@ struct ReaderView: View {
     @State private var imageNotice: String?
     @State private var collectedKeys: Set<String> = []
     @State private var readKeys: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "reading.readKeys") ?? [])
-    @State private var readingOffset: CGFloat = 0
-    @State private var readingOffsetAnchor = ""
+    @State private var readingProgress = ReadingProgressStore()
     // A reference type kept in @State on purpose: `@StateObject` would make this
     // screen observe every reading-focus change and bring the per-switch rebuild
     // back. Only the floating actions observe the store.
@@ -66,7 +74,7 @@ struct ReaderView: View {
         guard feedAtTop[channel, default: true] else { return false }
         if usesWideLayout {
             let isDefaultFirstItem = model.selected == nil || model.selected?.key == model.feeds[channel]?.first?.key
-            return model.question == nil && isDefaultFirstItem && readingOffset <= 10 && !model.showsComments
+            return model.question == nil && isDefaultFirstItem && readingProgress.offset <= 10 && !model.showsComments
         } else {
             return phonePath.isEmpty
         }
@@ -183,8 +191,8 @@ struct ReaderView: View {
         }
         .onChange(of: model.streamAnchor?.key) { _ in
             chrome.showsCompactTitle = false
-            readingOffset = 0
-            readingOffsetAnchor = ""
+            readingProgress.offset = 0
+            readingProgress.anchor = ""
         }
         .onChange(of: model.question?.key) { _ in
             markRead(model.question)
@@ -208,15 +216,21 @@ struct ReaderView: View {
         }
         .overlay(alignment: .bottom) {
             if let imageNotice {
-                Text(imageNotice)
-                    .font(.footnote)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(.black.opacity(0.72), in: Capsule())
-                    .padding(.bottom, 28)
-                    .transition(.opacity)
-                    .allowsHitTesting(false)
+                HStack(spacing: 6) {
+                    Image(systemName: imageNotice.contains("已") ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(imageNotice)
+                        .font(.footnote.weight(.medium))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 15)
+                .padding(.vertical, 9)
+                .background(.black.opacity(0.76), in: Capsule())
+                .overlay(Capsule().strokeBorder(.white.opacity(0.14), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.22), radius: 10, y: 4)
+                .padding(.bottom, 30)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .allowsHitTesting(false)
             }
         }
     }
@@ -488,12 +502,20 @@ struct ReaderView: View {
         .tabViewStyle(.page(indexDisplayMode: .never))
         .safeAreaInset(edge: .top, spacing: 0) {
             HStack(spacing: 14) {
-                channelPicker.frame(width: 176)
+                channelPicker
+                    .frame(width: 176)
+                    .padding(3)
+                    .readerGlassCapsule()
                 Spacer(minLength: 0)
                 accountMenu.frame(width: 44, height: 44).contentShape(Rectangle())
             }
-            .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 10)
-            .background(ReaderPalette.directory)
+            .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 8)
+            .background(ReaderPalette.directory.opacity(0.94))
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.06))
+                    .frame(height: 0.5)
+            }
         }
         .background(ReaderPalette.directory.ignoresSafeArea())
         .navigationTitle("")
@@ -592,12 +614,14 @@ struct ReaderView: View {
                                 .font(.system(size: 11, weight: .bold))
                             Text(count > 0 ? "有 \(count) 条新内容" : "有新内容")
                                 .font(.footnote.weight(.medium))
+                                .monospacedDigit()
                         }
                         .foregroundStyle(.white)
                         .padding(.horizontal, 14)
-                        .padding(.vertical, 7)
+                        .padding(.vertical, 7.5)
                         .background(ReaderPalette.accent, in: Capsule())
-                        .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
+                        .overlay(Capsule().strokeBorder(.white.opacity(0.20), lineWidth: 0.5))
+                        .shadow(color: .black.opacity(0.20), radius: 10, y: 4)
                     }
                     .buttonStyle(.plain)
                     .padding(.top, 10)
@@ -612,11 +636,26 @@ struct ReaderView: View {
     private var answerList: some View {
         List {
             if let question = model.question {
-                Text(question.title).font(.headline.weight(.semibold)).padding(.vertical, 8).listRowSeparator(.hidden)
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(question.title)
+                        .font(.system(size: 18, weight: .semibold, design: .serif))
+                        .lineSpacing(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Picker("回答排序", selection: $model.answerSort) {
+                        Text("热度").tag("default"); Text("时间").tag("updated")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                }
+                .padding(.top, 6)
+                .padding(.bottom, 8)
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+            } else {
+                Picker("回答排序", selection: $model.answerSort) {
+                    Text("热度").tag("default"); Text("时间").tag("updated")
+                }.pickerStyle(.segmented).listRowSeparator(.hidden).listRowBackground(Color.clear)
             }
-            Picker("回答排序", selection: $model.answerSort) {
-                Text("热度").tag("default"); Text("时间").tag("updated")
-            }.pickerStyle(.segmented).listRowSeparator(.hidden)
             ForEach(Array(model.answers.enumerated()), id: \.element.key) { index, item in
                 Button {
                     markRead(item)
@@ -728,10 +767,10 @@ struct ReaderView: View {
                         },
                         onSaveImage: { url in Task { await saveImage(url) } },
                         onCompactTitle: { chrome.showsCompactTitle = $0 },
-                        restoreOffset: readingOffsetAnchor == (model.streamAnchor?.id ?? item.id) ? readingOffset : 0,
+                        restoreOffset: readingProgress.anchor == (model.streamAnchor?.id ?? item.id) ? readingProgress.offset : 0,
                         onReadingOffset: { offset in
-                            readingOffset = offset
-                            readingOffsetAnchor = model.streamAnchor?.id ?? item.id
+                            readingProgress.offset = offset
+                            readingProgress.anchor = model.streamAnchor?.id ?? item.id
                         }
                     )
                     .id(model.streamAnchor?.key ?? item.key)
@@ -819,9 +858,14 @@ struct ReaderView: View {
             .toolbarColorScheme(readingColorScheme, for: .navigationBar)
             .environment(\.colorScheme, readingColorScheme)
         } else {
-            VStack(spacing: 12) {
-                Image(systemName: "text.book.closed").font(.system(size: 36)).foregroundStyle(.tertiary)
-                Text(model.question == nil ? "选择一篇内容开始阅读" : "选择一个回答开始阅读").foregroundStyle(.secondary)
+            VStack(spacing: 14) {
+                Image(systemName: "text.book.closed")
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(ReaderPalette.accent.opacity(0.48))
+                Text(model.question == nil ? "选择一篇内容开始阅读" : "选择一个回答开始阅读")
+                    .font(.system(size: 16, weight: .medium, design: .serif))
+                    .tracking(0.4)
+                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .environment(\.colorScheme, readingColorScheme)
@@ -948,14 +992,20 @@ struct ReaderView: View {
                 .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
                 .task {
                     let slice = Array(rows.dropFirst(index).prefix(6))
-                    CommentEmojiLoader.shared.preload(slice.flatMap { CommentEmoji.urls(in: $0.comment.html) })
+                    var emojiURLs: [URL] = []
                     for item in slice {
-                        for fragment in commentHTMLFragments(item.comment.html) {
-                            if case .image(let imageURL) = fragment {
+                        for block in item.comment.renderBlocks {
+                            switch block {
+                            case .text(let segments, _):
+                                for segment in segments {
+                                    if case .emoji(_, let url) = segment { emojiURLs.append(url) }
+                                }
+                            case .image(let imageURL):
                                 Task { _ = await RemoteImageLoader.shared.image(for: imageURL) }
                             }
                         }
                     }
+                    if !emojiURLs.isEmpty { CommentEmojiLoader.shared.preload(emojiURLs) }
                     await AvatarCache.shared.prefetch(slice.compactMap { $0.comment.avatarURL })
                 }
                 .task {
@@ -1133,13 +1183,10 @@ struct ReaderView: View {
                         Spacer(minLength: 4)
                         commentMetadata(comment)
                     }.frame(minHeight: 24)
-                    ForEach(Array(commentHTMLFragments(comment.html).enumerated()), id: \.offset) { _, fragment in
-                        switch fragment {
-                        case .text(let html):
-                            let segments = commentInlineSegments(html)
-                            if !segments.isEmpty {
-                                CommentInlineText(segments: segments, plainLabel: htmlText(html))
-                            }
+                    ForEach(Array(comment.renderBlocks.enumerated()), id: \.offset) { _, block in
+                        switch block {
+                        case .text(let segments, let plainLabel):
+                            CommentInlineText(segments: segments, plainLabel: plainLabel)
                         case .image(let url):
                             CommentImageView(url: url)
                         }
@@ -1175,12 +1222,19 @@ struct ReaderView: View {
         ZStack(alignment: .leading) {
             Color.clear
             if selected {
-                ReaderPalette.selection
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(ReaderPalette.selection)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(ReaderPalette.accent.opacity(0.22), lineWidth: 0.5)
+                    )
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
                 Capsule()
                     .fill(ReaderPalette.accent)
                     .frame(width: 3)
                     .padding(.vertical, 14)
-                    .padding(.leading, 7)
+                    .padding(.leading, 9)
             }
         }
     }
@@ -1275,8 +1329,14 @@ private enum ReaderWindowMetrics {
 private struct DirectoryRowButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .background(configuration.isPressed ? Color.primary.opacity(0.055) : Color.clear)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(configuration.isPressed ? Color.primary.opacity(0.05) : Color.clear)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+            )
+            .scaleEffect(configuration.isPressed ? 0.992 : 1)
+            .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
     }
 }
 
@@ -1926,16 +1986,24 @@ private struct LoadingSkeleton: View {
     let kind: Kind
     let label: String
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var dimmed = false
+    @State private var phase: CGFloat = -0.8
+
+    private var barFill: Color { Color.primary.opacity(0.085) }
 
     private func line(_ trailing: CGFloat = 0, height: CGFloat = 10) -> some View {
         HStack(spacing: 0) {
-            RoundedRectangle(cornerRadius: height / 2).fill(Color.primary.opacity(0.10)).frame(height: height)
+            RoundedRectangle(cornerRadius: height / 2, style: .continuous)
+                .fill(barFill)
+                .frame(height: height)
             if trailing > 0 { Spacer(minLength: trailing).frame(width: trailing) }
         }
     }
 
-    private var avatar: some View { Circle().fill(Color.primary.opacity(0.10)).frame(width: 24, height: 24) }
+    private var avatar: some View {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(barFill)
+            .frame(width: 24, height: 24)
+    }
 
     var body: some View {
         Group {
@@ -1945,31 +2013,89 @@ private struct LoadingSkeleton: View {
                     if kind == .feed { line(45, height: 14); line(110, height: 14) }
                     HStack(spacing: 8) { avatar; line(130, height: 9) }
                     line(20); line(80)
-                }.padding(.vertical, 14)
+                }
+                .padding(.vertical, 14)
+                .padding(.horizontal, 10)
             case .comment:
                 HStack(alignment: .top, spacing: 8) {
                     avatar
                     VStack(alignment: .leading, spacing: 9) { line(150); line(28); line(100) }
                 }.padding(.vertical, 8)
             case .body:
-                VStack(alignment: .leading, spacing: 13) {
-                    line(40, height: 18); line(110, height: 18)
-                    HStack(spacing: 9) { avatar; line(150) }.padding(.vertical, 10)
+                VStack(alignment: .leading, spacing: 14) {
+                    line(36, height: 20); line(120, height: 20)
+                    HStack(spacing: 10) {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous).fill(barFill).frame(width: 32, height: 32)
+                        line(150, height: 11)
+                    }.padding(.vertical, 10)
                     ForEach(0..<3, id: \.self) { _ in
                         VStack(spacing: 12) { line(); line(10); line(65) }.padding(.bottom, 16)
                     }
-                }.frame(maxWidth: 680).padding(.horizontal, 24).padding(.top, 28)
+                }.frame(maxWidth: 680).padding(.horizontal, 24).padding(.top, 32)
             case .collection:
                 line(100, height: 13).padding(.vertical, 12)
             }
         }
-        .opacity(dimmed && !reduceMotion ? 0.55 : 1)
+        .overlay {
+            if !reduceMotion {
+                GeometryReader { proxy in
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .white.opacity(0.22), location: 0.5),
+                            .init(color: .clear, location: 1)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: max(proxy.size.width * 0.65, 120))
+                    .offset(x: phase * proxy.size.width)
+                }
+                .mask {
+                    skeletonMask
+                }
+            }
+        }
         .onAppear {
             guard !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) { dimmed = true }
+            withAnimation(.easeInOut(duration: 1.45).repeatForever(autoreverses: false)) {
+                phase = 1.45
+            }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
+    }
+
+    @ViewBuilder
+    private var skeletonMask: some View {
+        switch kind {
+        case .feed, .answer:
+            VStack(alignment: .leading, spacing: 11) {
+                if kind == .feed { line(45, height: 14); line(110, height: 14) }
+                HStack(spacing: 8) { avatar; line(130, height: 9) }
+                line(20); line(80)
+            }
+            .padding(.vertical, 14)
+            .padding(.horizontal, 10)
+        case .comment:
+            HStack(alignment: .top, spacing: 8) {
+                avatar
+                VStack(alignment: .leading, spacing: 9) { line(150); line(28); line(100) }
+            }.padding(.vertical, 8)
+        case .body:
+            VStack(alignment: .leading, spacing: 14) {
+                line(36, height: 20); line(120, height: 20)
+                HStack(spacing: 10) {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous).fill(barFill).frame(width: 32, height: 32)
+                    line(150, height: 11)
+                }.padding(.vertical, 10)
+                ForEach(0..<3, id: \.self) { _ in
+                    VStack(spacing: 12) { line(); line(10); line(65) }.padding(.bottom, 16)
+                }
+            }.frame(maxWidth: 680).padding(.horizontal, 24).padding(.top, 32)
+        case .collection:
+            line(100, height: 13).padding(.vertical, 12)
+        }
     }
 }
 
@@ -2006,21 +2132,21 @@ private enum ReaderPalette {
             ? UIColor(red: 0.95, green: 0.73, blue: 0.31, alpha: 1)
             : UIColor(red: 0.79, green: 0.53, blue: 0.12, alpha: 1)
     })
-    /// 热榜前三名阶梯暖色（朱砂红 / 柿叶橙 / 琥珀金）。
+    /// 热榜冠亚季军矿物色（绛朱 / 赭石 / 泥金）：温雅内敛，避免高饱和亮色刺眼。
     static let hotTop1 = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.96, green: 0.44, blue: 0.36, alpha: 1)
-            : UIColor(red: 0.80, green: 0.25, blue: 0.20, alpha: 1)
+            ? UIColor(red: 0.90, green: 0.49, blue: 0.44, alpha: 1)
+            : UIColor(red: 0.72, green: 0.24, blue: 0.21, alpha: 1)
     })
     static let hotTop2 = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.96, green: 0.57, blue: 0.32, alpha: 1)
-            : UIColor(red: 0.84, green: 0.43, blue: 0.17, alpha: 1)
+            ? UIColor(red: 0.90, green: 0.62, blue: 0.39, alpha: 1)
+            : UIColor(red: 0.74, green: 0.43, blue: 0.20, alpha: 1)
     })
     static let hotTop3 = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.93, green: 0.71, blue: 0.30, alpha: 1)
-            : UIColor(red: 0.76, green: 0.53, blue: 0.14, alpha: 1)
+            ? UIColor(red: 0.85, green: 0.73, blue: 0.43, alpha: 1)
+            : UIColor(red: 0.65, green: 0.52, blue: 0.20, alpha: 1)
     })
     static func hotRankColor(_ rank: Int) -> Color {
         switch rank {
@@ -2318,7 +2444,8 @@ private struct ItemRow: View {
     var isRead: Bool = false
     @ScaledMetric(relativeTo: .headline) private var titleSize: CGFloat = 16
     @ScaledMetric(relativeTo: .subheadline) private var excerptSize: CGFloat = 14
-    @ScaledMetric(relativeTo: .caption) private var rankSize: CGFloat = 12
+    @ScaledMetric(relativeTo: .subheadline) private var topRankSize: CGFloat = 16
+    @ScaledMetric(relativeTo: .caption) private var rankSize: CGFloat = 12.5
 
     /// Counts and the author's region sit on the author line, right-aligned,
     /// matching the reading header. The thumbnail shares the whole text block.
@@ -2326,23 +2453,28 @@ private struct ItemRow: View {
         item.kind == .answer && (item.upCount != nil || item.commentCount != nil)
     }
 
+    private var isTopThree: Bool {
+        guard let hotRank else { return false }
+        return hotRank <= 3
+    }
+
     var body: some View {
-        // 缩略图与整块文字（标题/作者/摘要）同高区域并排，热榜序号置于标题上方，
-        // 既不占用左侧整列宝贵宽度，也让长标题与摘要能完整铺满列宽。
-        HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 8) {
+        // 缩略图与整块文字（标题/作者/摘要）同高区域并排，热榜序号置于标题上方；
+        // 冠亚季军赋予更充裕的留白、字号与摘要行数，与第四名起的紧凑目录形成疏密对比。
+        HStack(alignment: .top, spacing: isTopThree ? 12 : 10) {
+            VStack(alignment: .leading, spacing: isTopThree ? 10 : 7.5) {
                 if let hotRank {
                     hotRankHeader(hotRank)
                 }
                 if showsTitle {
                     Text(item.title)
-                        .font(.system(size: titleSize, weight: .semibold))
+                        .font(.system(size: isTopThree ? titleSize + 1.5 : titleSize, weight: .semibold))
                         .foregroundStyle(isRead ? Color.primary.opacity(0.72) : Color.primary)
-                        .lineSpacing(4)
+                        .lineSpacing(isTopThree ? 5 : 3.5)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                if !isHot, (!item.author.isEmpty || showsInlineCounts) {
+                if !isHot, (!item.author.isEmpty || showsInlineCounts || item.kind == .article) {
                     HStack(spacing: 7) {
                         if !item.author.isEmpty {
                             AvatarView(url: item.avatarURL, size: showsTitle ? 22 : 28)
@@ -2351,7 +2483,16 @@ private struct ItemRow: View {
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                         }
-                        if showsInlineCounts {
+                        if showsTitle && item.kind == .article {
+                            Text("专栏")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(ReaderPalette.accent)
+                                .padding(.horizontal, 5.5)
+                                .padding(.vertical, 1.5)
+                                .background(ReaderPalette.accent.opacity(0.12), in: Capsule())
+                                .fixedSize()
+                        }
+                        if showsInlineCounts || item.kind == .article {
                             Spacer(minLength: 8)
                             metadataRow
                         }
@@ -2362,12 +2503,12 @@ private struct ItemRow: View {
                         metadataRow
                     }
                 }
-                if !item.excerpt.isEmpty {
-                    Text(htmlText(item.excerpt))
+                if !item.plainExcerpt.isEmpty {
+                    Text(item.plainExcerpt)
                         .font(.system(size: excerptSize))
                         .foregroundStyle(isRead ? Color.secondary.opacity(0.72) : Color.secondary)
-                        .lineSpacing(3)
-                        .lineLimit(2)
+                        .lineSpacing(isTopThree ? 4.2 : 3.2)
+                        .lineLimit(isTopThree ? 3 : 2)
                 }
                 if !showsInlineCounts, item.kind == .answer, item.upCount != nil || item.commentCount != nil {
                     metadataRow
@@ -2375,47 +2516,56 @@ private struct ItemRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if showsTitle, let url = item.imageURL {
-                FeedThumbnailView(url: url, height: item.excerpt.isEmpty ? 56 : 82)
+                FeedThumbnailView(
+                    url: url,
+                    width: isTopThree ? 84 : 72,
+                    height: item.plainExcerpt.isEmpty ? (isTopThree ? 64 : 56) : (isTopThree ? 94 : 80)
+                )
             }
         }
-        .padding(.vertical, 14)
+        .padding(.vertical, isTopThree ? 20 : (isHot ? 13 : 14))
         .padding(.horizontal, 10)
-        .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5).padding(.horizontal, 10) }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.primary.opacity(isTopThree ? 0.10 : 0.075))
+                .frame(height: 0.5)
+                .padding(.horizontal, 10)
+        }
     }
 
     @ViewBuilder
     private func hotRankHeader(_ hotRank: Int) -> some View {
         let isTop3 = hotRank <= 3
         let rankColor = ReaderPalette.hotRankColor(hotRank)
-        HStack(spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: isTop3 ? 9 : 6) {
             Text(String(format: "%02d", hotRank))
-                .font(.system(size: rankSize, weight: isTop3 ? .bold : .semibold, design: .rounded))
+                .font(.system(size: isTop3 ? topRankSize : rankSize, weight: isTop3 ? .bold : .semibold, design: .serif))
                 .monospacedDigit()
+                .tracking(0.6)
                 .foregroundStyle(isTop3 ? rankColor : Color.secondary)
-                .padding(.horizontal, 6.5)
-                .padding(.vertical, 2)
-                .background(
-                    (isTop3 ? rankColor.opacity(0.14) : Color.primary.opacity(0.06)),
-                    in: RoundedRectangle(cornerRadius: 5, style: .continuous)
-                )
                 .accessibilityLabel("热榜第 \(hotRank) 名")
             if let heat = item.heatText, !heat.isEmpty {
-                HStack(spacing: 3) {
-                    if isTop3 {
-                        Image(systemName: "flame.fill")
-                            .font(.system(size: 10, weight: .semibold))
-                    }
-                    Text(heat)
-                        .font(.caption.weight(isTop3 ? .medium : .regular))
-                        .monospacedDigit()
+                if isTop3 {
+                    Capsule()
+                        .fill(rankColor.opacity(0.38))
+                        .frame(width: 1.5, height: 10)
+                        .alignmentGuide(.firstTextBaseline) { d in d[.bottom] - 1 }
+                } else {
+                    Text("·")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
-                .foregroundStyle(isTop3 ? rankColor.opacity(0.88) : Color.secondary)
+                Text(heat)
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
             if showsInlineCounts {
                 metadataRow
             }
         }
+        .padding(.bottom, isTop3 ? 1 : 0)
     }
 
     /// 列表作者行、评论作者行共用：地区 + 赞同 + 评论，统一 12pt 间隔。
@@ -2576,7 +2726,7 @@ private final class AvatarCache {
     private let images = NSCache<NSURL, UIImage>()
     private var pending: [URL: Task<UIImage?, Never>] = [:]
 
-    private init() { images.countLimit = 200; images.totalCostLimit = 20 * 1024 * 1024 }
+    private init() { images.countLimit = 240; images.totalCostLimit = 24 * 1024 * 1024 }
 
     func cachedImage(for url: URL) -> UIImage? {
         images.object(forKey: url as NSURL)
@@ -2585,12 +2735,13 @@ private final class AvatarCache {
     func image(for url: URL) async -> UIImage? {
         if let image = images.object(forKey: url as NSURL) { return image }
         if let task = pending[url] { return await task.value }
-        let task = Task<UIImage?, Never> {
+        let task = Task.detached(priority: .utility) { () -> UIImage? in
             var request = URLRequest(url: url)
             request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
             guard let (data, response) = try? await URLSession.shared.data(for: request),
-                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
-            return UIImage(data: data)
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  !data.isEmpty else { return nil }
+            return Self.downsample(data: data, maxPixelSize: 320) ?? UIImage(data: data)
         }
         pending[url] = task
         let image = await task.value
@@ -2599,9 +2750,34 @@ private final class AvatarCache {
         return image
     }
 
+    private nonisolated static func downsample(data: Data, maxPixelSize: Int) -> UIImage? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else { return nil }
+        let downsampleOptions = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ] as CFDictionary
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, downsampleOptions) else { return nil }
+        return UIImage(cgImage: cgImage)
+    }
+
     func prefetch(_ urls: [URL]) async {
+        let missing = Set(urls).filter { images.object(forKey: $0 as NSURL) == nil }
+        guard !missing.isEmpty else { return }
         await withTaskGroup(of: Void.self) { group in
-            for url in Set(urls) { group.addTask { _ = await self.image(for: url) } }
+            var iterator = missing.makeIterator()
+            for _ in 0..<min(6, missing.count) {
+                if let url = iterator.next() {
+                    group.addTask { _ = await self.image(for: url) }
+                }
+            }
+            while await group.next() != nil {
+                if !Task.isCancelled, let url = iterator.next() {
+                    group.addTask { _ = await self.image(for: url) }
+                }
+            }
         }
     }
 }
@@ -2611,14 +2787,22 @@ private struct AvatarView: View {
     let size: CGFloat
     @State private var image: UIImage?
     var body: some View {
-        Group {
+        ZStack {
             if let image = image ?? url.flatMap({ AvatarCache.shared.cachedImage(for: $0) }) {
-                Image(uiImage: image).resizable().scaledToFill()
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .transition(.opacity)
             } else {
-                Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.secondary.opacity(0.5))
+                Color.primary.opacity(0.06)
+                Image(systemName: "person.fill")
+                    .font(.system(size: size * 0.44, weight: .medium))
+                    .foregroundStyle(.secondary.opacity(0.45))
             }
         }
-        .frame(width: size, height: size).clipShape(Circle())
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5))
         .accessibilityHidden(true)
         .task(id: url) {
             guard let url else { image = nil; return }
@@ -2628,19 +2812,24 @@ private struct AvatarView: View {
             }
             image = nil
             let loaded = await AvatarCache.shared.image(for: url)
-            if !Task.isCancelled { image = loaded }
+            if !Task.isCancelled, let loaded {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    image = loaded
+                }
+            }
         }
     }
 }
 
 private struct FeedThumbnailView: View {
     let url: URL
+    var width: CGFloat = 72
     let height: CGFloat
     @State private var image: UIImage?
 
     var body: some View {
         ZStack {
-            Color.primary.opacity(0.06)
+            Color.primary.opacity(0.055)
             if let resolved = image ?? AvatarCache.shared.cachedImage(for: url) {
                 Image(uiImage: resolved)
                     .resizable()
@@ -2648,13 +2837,14 @@ private struct FeedThumbnailView: View {
                     .transition(.opacity)
             }
         }
-        .frame(width: 72, height: height)
+        .frame(width: width, height: height)
         .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                .strokeBorder(Color.primary.opacity(0.09), lineWidth: 0.5)
         )
+        .shadow(color: .black.opacity(0.05), radius: 3, y: 1.5)
         .accessibilityHidden(true)
         .task(id: url) {
             if let cached = AvatarCache.shared.cachedImage(for: url) {
@@ -2672,14 +2862,7 @@ private struct FeedThumbnailView: View {
 }
 
 private func htmlText(_ html: String) -> String {
-    // NSAttributedString's HTML importer can spin the main run loop while
-    // SwiftUI is rendering a List, causing an AttributeGraph reentrancy abort.
-    // List previews only need plain text; full answers use the web reader.
-    var text = html.replacingOccurrences(of: "(?i)<br\\s*/?>|</(?:p|div|li)\\s*>", with: "\n", options: .regularExpression)
-    text = text.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
-    let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'"]
-    for (entity, value) in entities { text = text.replacingOccurrences(of: entity, with: value) }
-    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    stripHTMLToPlainText(html, trim: true)
 }
 
 private struct CommentInlineText: View {
@@ -2961,8 +3144,8 @@ private struct HTMLReader: UIViewRepresentable {
         }
         let cardCSS = paperCards ? """
         body { padding-left: 16px; padding-right: 16px; }
-        .answer { background: \(paperColor); border: 1px solid rgba(128,128,128,.12); border-radius: 12px; padding: 26px 72px 28px 22px; box-shadow: 0 5px 18px rgba(0,0,0,.08); }
-        .answer + .answer { border-top: 1px dotted rgba(128,128,128,.28); margin-top: 18px; padding-top: 26px; }
+        .answer { background: \(paperColor); border: 1px solid color-mix(in srgb, currentColor 9%, transparent); border-radius: 14px; padding: 28px 72px 30px 26px; box-shadow: 0 6px 22px rgba(0,0,0,.065), 0 1px 3px rgba(0,0,0,.04); }
+        .answer + .answer { border-top: 1px solid color-mix(in srgb, currentColor 9%, transparent); margin-top: 18px; padding-top: 28px; }
         """ : ""
         let phoneGapColor: String
         switch theme {
@@ -2973,10 +3156,10 @@ private struct HTMLReader: UIViewRepresentable {
         }
         let phoneAnswerCSS = paperCards || isPreview ? "" : """
         body { margin: 0 auto; padding: 0 0 100px; background: \(colors.0); }
-        header { background: \(colors.0); padding: 36px clamp(20px, 5vw, 28px) 0; }
+        header { background: \(colors.0); padding: 34px clamp(20px, 5vw, 28px) 0; }
         header h1 { margin-bottom: 0; }
-        .answer { background: \(colors.0); padding: 26px clamp(20px, 5vw, 28px) 32px; box-shadow: 0 3px 6px -4px rgba(0,0,0,.22); }
-        .answer + .answer { border: 0; border-top: 12px solid \(phoneGapColor); margin-top: 0; padding-top: 26px; background-clip: padding-box; }
+        .answer { background: \(colors.0); padding: 24px clamp(20px, 5vw, 28px) 32px; box-shadow: 0 3px 6px -4px rgba(0,0,0,.18); }
+        .answer + .answer { border: 0; border-top: 10px solid \(phoneGapColor); margin-top: 0; padding-top: 26px; background-clip: padding-box; }
         .byline { margin-bottom: 20px; }
         .author-name { font-size: 15px; font-weight: 600; }
         """
@@ -3029,9 +3212,9 @@ private struct HTMLReader: UIViewRepresentable {
         let sections = sectionList.joined()
         let headingFontFamily = selectedFont.isBuiltIn ? "'Songti SC', 'STSong', Georgia, serif" : fontFamily
         let style = """
-        :root { --wize-link: light-dark(#527863, #a7c4b1); --wize-quote: light-dark(#c28a26, #e6b04b); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); } body[data-wize-pending] { opacity: 0; animation: wize-reveal .01s linear .7s forwards; } @keyframes wize-reveal { to { opacity: 1; } } body { box-sizing: border-box; font: \(appliedFontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; } h1 { font-family: \(headingFontFamily); font-size: clamp(1.28em, 3.2vw, 1.5em); font-weight: 600; line-height: 1.45; letter-spacing: .02em; margin: 0 0 30px; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2px solid transparent; border-radius: 3px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.7)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; -webkit-touch-callout: none; } main img { border-radius: 5px; } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
-        .byline { opacity: 1; margin-bottom: 20px; transition: border-color .18s ease; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer.current .byline { border-left-color: var(--wize-link); } .counts { margin:0 0 0 auto; flex-shrink:0; gap:12px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts .ip { max-width:9em; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; } @media (prefers-reduced-motion: reduce) { .byline { transition: none; } }
-        .wize-video { position:relative; display:block; margin:1.1em 0; border-radius:8px; overflow:hidden; background:#111; }
+        :root { --wize-link: light-dark(#527863, #a7c4b1); --wize-quote: light-dark(#c28a26, #e6b04b); overflow-x: hidden; color-scheme: \(colors.2); background: \(colors.0); color: \(colors.1); -webkit-font-smoothing: antialiased; text-autospace: ideograph-alpha ideograph-numeric; } body[data-wize-pending] { opacity: 0; animation: wize-reveal .01s linear .5s forwards; } @keyframes wize-reveal { to { opacity: 1; } } body { box-sizing: border-box; font: \(appliedFontSize)px \(fontFamily); line-height: \(lineHeight); max-width: \(readingWidth)px; margin: 36px auto \(paperCards ? 0 : 36)px; padding: 0 clamp(20px, 5vw, 28px) \(paperCards ? 0 : 12)px; overflow-wrap: anywhere; transition: opacity .14s ease-out; } h1 { font-family: \(headingFontFamily); font-size: clamp(1.3em, 3.2vw, 1.54em); font-weight: 600; line-height: 1.44; letter-spacing: .018em; margin: 0 0 28px; } main h2 { font-family: \(headingFontFamily); font-size: 1.2em; font-weight: 600; line-height: 1.45; margin: 1.55em 0 .6em; letter-spacing: .01em; } main h3 { font-size: 1.08em; font-weight: 600; line-height: 1.48; margin: 1.35em 0 .5em; } .byline { display:flex; align-items:center; gap:10px; opacity:.78; font: 500 14px -apple-system, sans-serif; margin: 0 -8px 26px; padding: 6px 8px; border-left: 2.5px solid transparent; border-radius: 4px; } .avatar { width:32px; height:32px; border-radius:50%; object-fit:cover; box-shadow: inset 0 0 0 .5px rgba(128,128,128,.18); } .counts { display:flex; gap:22px; font: 12px -apple-system, sans-serif; opacity:.58; margin-top:24px; font-variant-numeric: tabular-nums; } .counts b { font-weight:500; } .counts .ip { max-width:9em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer + .answer { border-top: 1px dotted rgba(128,128,128,.32); margin-top: 32px; padding-top: 28px; } p { margin: 0 0 \(paragraphSpacing * 0.72)em; } main p:empty, main p:has(> br:only-child) { display:none; } img, video { max-width: 100%; height: auto; -webkit-touch-callout: none; } main img { border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.05); } .avatar { height:32px; } a { color: var(--wize-link); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 34%, transparent); text-decoration-thickness: .06em; text-underline-offset: .18em; text-decoration-skip-ink: auto; font-weight: 500; -webkit-tap-highlight-color: transparent; } a:visited { color: var(--wize-link); } a:active { opacity: .58; } main a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
+        .byline { opacity: 1; margin-bottom: 20px; transition: border-color .18s ease, background-color .18s ease; } .author-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .answer.current .byline { border-left-color: var(--wize-link); } .counts { margin:0 0 0 auto; flex-shrink:0; gap:12px; opacity:.68; } .counts span { display:inline-flex; align-items:center; gap:6px; } .counts .ip { max-width:9em; } .counts svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.5; stroke-linejoin:round; stroke-linecap:round; } @media (prefers-reduced-motion: reduce) { .byline, body { transition: none; } }
+        .wize-video { position:relative; display:block; margin:1.15em 0; border-radius:10px; overflow:hidden; background:#111; box-shadow: 0 2px 10px rgba(0,0,0,.08); }
         .wize-video-poster { display:block; width:100%; height:auto; margin:0; border-radius:0; }
         .wize-video:not(:has(.wize-video-poster)) { aspect-ratio:16/9; background:linear-gradient(135deg,#2d3833,#111); }
         .wize-video-play { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:linear-gradient(180deg,rgba(0,0,0,.02),rgba(0,0,0,.28)); }
@@ -3046,19 +3229,19 @@ private struct HTMLReader: UIViewRepresentable {
         .wize-video[data-loading="1"] .wize-video-play svg { animation: wize-video-pulse 1s ease-in-out infinite; }
         @keyframes wize-video-pulse { 50% { transform:scale(.86); opacity:.55; } }
         .wize-video-error { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:16px; color:#fff; font:500 13px -apple-system,sans-serif; text-align:center; background:rgba(0,0,0,.6); }
-        main blockquote { margin: 1.2em 0; padding: .15em 0 .15em 1.05em; border-left: 2.5px solid color-mix(in srgb, var(--wize-quote) 65%, transparent); color: inherit; opacity: .86; }
-        main img.emojione, main img.ztext-emoji { display: inline-block; width: 1.25em; height: 1.25em; vertical-align: -0.18em; margin: 0 .06em; border-radius: 0; }
-        main hr { border: 0; height: 0; border-top: 1.5px dotted color-mix(in srgb, currentColor 36%, transparent); margin: 2em 0; }
+        main blockquote { margin: 1.25em 0; padding: .55em .95em .55em 1.05em; border-left: 3px solid color-mix(in srgb, var(--wize-quote) 70%, transparent); border-radius: 0 8px 8px 0; background: color-mix(in srgb, var(--wize-quote) 5%, transparent); color: inherit; opacity: .90; }
+        main img.emojione, main img.ztext-emoji { display: inline-block; width: 1.25em; height: 1.25em; vertical-align: -0.18em; margin: 0 .06em; border-radius: 0; box-shadow: none; }
+        main hr { border: 0; height: 0; border-top: 1.5px dotted color-mix(in srgb, currentColor 30%, transparent); margin: 2em 0; }
         main p:last-child { margin-bottom: 0; }
-        main figure { margin: .8em 0; }
-        main figcaption { margin-top: .4em; font-size: .8em; line-height: 1.5; text-align: center; opacity: .68; }
-        main ul, main ol { padding-left: 1.5em; }
-        main li + li { margin-top: .2em; }
+        main figure { margin: 1.05em 0; }
+        main figcaption { margin-top: .5em; font-size: .82em; line-height: 1.5; text-align: center; opacity: .66; }
+        main ul, main ol { padding-left: 1.5em; margin: .8em 0 1em; }
+        main li + li { margin-top: .28em; }
         main code { font: .88em ui-monospace, 'SF Mono', Menlo, monospace; padding: .16em .38em; border-radius: 5px; background: color-mix(in srgb, currentColor 6.5%, transparent); }
-        main pre { margin: 1.15em 0; padding: 14px 16px; border-radius: 9px; background: color-mix(in srgb, currentColor 5.5%, transparent); border: 1px solid color-mix(in srgb, currentColor 10%, transparent); font: .86em ui-monospace, 'SF Mono', Menlo, monospace; line-height: 1.6; overflow-x: auto; overflow-wrap: normal; }
+        main pre { margin: 1.2em 0; padding: 14px 16px; border-radius: 10px; background: color-mix(in srgb, currentColor 5.5%, transparent); border: 1px solid color-mix(in srgb, currentColor 10%, transparent); font: .86em ui-monospace, 'SF Mono', Menlo, monospace; line-height: 1.62; overflow-x: auto; overflow-wrap: normal; }
         main pre code { font-size: inherit; padding: 0; border-radius: 0; background: transparent; }
-        main table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 1.15em 0; font-size: .92em; line-height: 1.55; }
-        main th, main td { padding: 8px 12px; border: 1px solid color-mix(in srgb, currentColor 14%, transparent); text-align: left; vertical-align: top; }
+        main table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 1.2em 0; font-size: .92em; line-height: 1.58; border-radius: 8px; }
+        main th, main td { padding: 9px 13px; border: 1px solid color-mix(in srgb, currentColor 13%, transparent); text-align: left; vertical-align: top; }
         main th { background: color-mix(in srgb, currentColor 5.5%, transparent); font-weight: 600; }
         \(cardCSS)
         \(phoneAnswerCSS)
@@ -4662,6 +4845,7 @@ private final class ZhihuLoginSession: NSObject, ObservableObject, WKNavigationD
                 await store.deleteCookie(cookie)
             }
         }
+        ZhihuSource.invalidateCookieCache()
         authCookie = nil
         loggedInName = nil
         loggedInAvatar = nil
@@ -4897,6 +5081,7 @@ private final class ZhihuLoginSession: NSObject, ObservableObject, WKNavigationD
     }
 
     func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        ZhihuSource.invalidateCookieCache()
         Task {
             let newValue = Self.authCookieValue(await cookieStore.allCookies())
             guard observingCookies, newValue != authCookie else { return }

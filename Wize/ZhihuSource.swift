@@ -20,6 +20,47 @@ struct ReadingItem: Identifiable, Hashable {
     var commentCount: Int? = nil
     var heatText: String? = nil
     var vote: AnswerVote? = nil
+    let plainExcerpt: String
+
+    init(
+        id: String,
+        kind: Kind,
+        title: String,
+        excerpt: String,
+        author: String,
+        questionID: String?,
+        avatarURL: URL? = nil,
+        authorHeadline: String? = nil,
+        authorToken: String? = nil,
+        ipInfo: String? = nil,
+        imageURL: URL? = nil,
+        contentHTML: String? = nil,
+        upCount: Int? = nil,
+        downCount: Int? = nil,
+        commentCount: Int? = nil,
+        heatText: String? = nil,
+        vote: AnswerVote? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.excerpt = excerpt
+        self.author = author
+        self.questionID = questionID
+        self.avatarURL = avatarURL
+        self.authorHeadline = authorHeadline
+        self.authorToken = authorToken
+        self.ipInfo = ipInfo
+        self.imageURL = imageURL
+        self.contentHTML = contentHTML
+        self.upCount = upCount
+        self.downCount = downCount
+        self.commentCount = commentCount
+        self.heatText = heatText
+        self.vote = vote
+        self.plainExcerpt = excerpt.isEmpty ? "" : stripHTMLToPlainText(excerpt, trim: true)
+    }
+
     var key: String { "\(kind.rawValue):\(id)" }
 }
 
@@ -55,16 +96,75 @@ func zhihuShareTitle(for item: ReadingItem) -> String {
     }
 }
 
+private enum ZhihuRegex {
+    static let ipRegionPrefix = try! NSRegularExpression(pattern: #"(?i)(?:ip[\s\u00A0]*属地|属地|发布于|编辑于)[\s\u00A0:：·\-]*"#)
+    static let imgTag = try! NSRegularExpression(pattern: #"(?i)<img\b[^>]*>"#)
+    static let dataActualSrcAttr = try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-actualsrc\s*=\s*["']([^"']+)["']"#)
+    static let dataOriginalAttr = try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-original\s*=\s*["']([^"']+)["']"#)
+    static let srcAttr = try! NSRegularExpression(pattern: #"(?i)(?:^|\s)src\s*=\s*["']([^"']+)["']"#)
+    static let emojiBracket = try! NSRegularExpression(pattern: #"\[([^\[\]\n]{1,12})\]"#)
+    static let blockBreak = try! NSRegularExpression(pattern: #"(?i)<br\s*/?>|</(?:p|div|li)\s*>"#)
+    static let anyTag = try! NSRegularExpression(pattern: #"<[^>]*>"#)
+    static let anchorCapture = try! NSRegularExpression(pattern: #"(?is)<a\b([^>]*)>(.*?)</a\s*>"#)
+    static let anchorWhole = try! NSRegularExpression(pattern: #"(?is)<a\b[^>]*>(.*?)</a\s*>"#)
+    static let commentMedia = try! NSRegularExpression(pattern: #"(?is)<img\b[^>]*>|<a\b[^>]*>.*?</a\s*>"#)
+    static let hrefAttr = try! NSRegularExpression(pattern: #"(?i)\bhref\s*=\s*["']([^"']+)["']"#)
+    static let lensVideoPath = try! NSRegularExpression(pattern: #"/videos?/(\d+)"#)
+    static let zvideoPath = try! NSRegularExpression(pattern: #"/zvideos?/(\d+)"#)
+    static let bracketAlt = try! NSRegularExpression(pattern: #"alt\s*=\s*["']?\[[^\]]+\]"#)
+    static let stripSrcAttr = try! NSRegularExpression(pattern: #"(?i)(?:^|\s)src\s*=\s*["'][^"']*["']"#)
+    static let stripLoadingAttr = try! NSRegularExpression(pattern: #"(?i)(?:^|\s)loading\s*=\s*["'][^"']*["']"#)
+    static let stripAltAttr = try! NSRegularExpression(pattern: #"(?i)(?:^|\s)alt\s*=\s*(?:["'][^"']*["']|[^\s>]+)"#)
+    static let stripTitleAttr = try! NSRegularExpression(pattern: #"(?i)(?:^|\s)title\s*=\s*(?:["'][^"']*["']|[^\s>]+)"#)
+    static let leadingWhitespace = try! NSRegularExpression(pattern: #"^\s+"#)
+    static let trailingWhitespace = try! NSRegularExpression(pattern: #"\s+$"#)
+
+    private static let tagAttrMap: [String: NSRegularExpression] = [
+        "href": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)href\s*=\s*["']([^"']+)["']"#),
+        "width": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)width\s*=\s*["']([^"']+)["']"#),
+        "height": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)height\s*=\s*["']([^"']+)["']"#),
+        "data-rawwidth": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-rawwidth\s*=\s*["']([^"']+)["']"#),
+        "data-rawheight": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-rawheight\s*=\s*["']([^"']+)["']"#),
+        "data-poster": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-poster\s*=\s*["']([^"']+)["']"#),
+        "data-name": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-name\s*=\s*["']([^"']+)["']"#),
+        "data-video-title": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-video-title\s*=\s*["']([^"']+)["']"#),
+        "data-lens-id": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-lens-id\s*=\s*["']([^"']+)["']"#),
+        "data-zvideo-id": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-zvideo-id\s*=\s*["']([^"']+)["']"#),
+        "data-video-id": try! NSRegularExpression(pattern: #"(?i)(?:^|\s)data-video-id\s*=\s*["']([^"']+)["']"#)
+    ]
+
+    static func attribute(_ name: String) -> NSRegularExpression? {
+        if let cached = tagAttrMap[name.lowercased()] { return cached }
+        return try? NSRegularExpression(pattern: #"(?i)(?:^|\s)"# + name + #"\s*=\s*["']([^"']+)["']"#)
+    }
+}
+
+func stripHTMLToPlainText(_ html: String, trim: Bool) -> String {
+    guard !html.isEmpty else { return "" }
+    var text = html
+    if text.contains("<") {
+        let range1 = NSRange(text.startIndex..., in: text)
+        text = ZhihuRegex.blockBreak.stringByReplacingMatches(in: text, range: range1, withTemplate: "\n")
+        let range2 = NSRange(text.startIndex..., in: text)
+        text = ZhihuRegex.anyTag.stringByReplacingMatches(in: text, range: range2, withTemplate: "")
+    }
+    if text.contains("&") {
+        let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'"]
+        for (entity, value) in entities where text.contains(entity) {
+            text = text.replacingOccurrences(of: entity, with: value)
+        }
+    }
+    return trim ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
+}
+
 /// 清洗知乎不同接口返回的属地文案（如「IP 属地浙江」「IP属地：上海」或空值「IP 属地」），只保留纯地区名。
 func normalizedIPRegion(_ raw: String?) -> String? {
     guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
         return nil
     }
-    value = value.replacingOccurrences(
-        of: #"(?i)(?:ip[\s\u00A0]*属地|属地|发布于|编辑于)[\s\u00A0:：·\-]*"#,
-        with: "",
-        options: .regularExpression
-    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    let range = NSRange(value.startIndex..., in: value)
+    value = ZhihuRegex.ipRegionPrefix.stringByReplacingMatches(in: value, range: range, withTemplate: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
     if value.isEmpty || value == "未知" || value == "暂无" {
         return nil
     }
@@ -92,6 +192,11 @@ struct VideoPlayback {
     let poster: URL?
 }
 
+enum CommentRenderBlock: Equatable {
+    case text(segments: [CommentInlineSegment], plainLabel: String)
+    case image(URL)
+}
+
 struct ReadingComment: Identifiable {
     let id: String
     let author: String
@@ -104,6 +209,43 @@ struct ReadingComment: Identifiable {
     var replyCount: Int = 0
     var parentID: String? = nil
     var isAuthor: Bool = false
+    let renderBlocks: [CommentRenderBlock]
+
+    init(
+        id: String,
+        author: String,
+        html: String,
+        likes: Int,
+        avatarURL: URL? = nil,
+        ipInfo: String? = nil,
+        replyTo: String? = nil,
+        depth: Int = 0,
+        replyCount: Int = 0,
+        parentID: String? = nil,
+        isAuthor: Bool = false
+    ) {
+        self.id = id
+        self.author = author
+        self.html = html
+        self.likes = likes
+        self.avatarURL = avatarURL
+        self.ipInfo = ipInfo
+        self.replyTo = replyTo
+        self.depth = depth
+        self.replyCount = replyCount
+        self.parentID = parentID
+        self.isAuthor = isAuthor
+        self.renderBlocks = commentHTMLFragments(html).compactMap { fragment in
+            switch fragment {
+            case .text(let chunk):
+                let segments = commentInlineSegments(chunk)
+                guard !segments.isEmpty else { return nil }
+                return .text(segments: segments, plainLabel: stripHTMLToPlainText(chunk, trim: true))
+            case .image(let url):
+                return .image(url)
+            }
+        }
+    }
 }
 
 struct Page<T> {
@@ -166,11 +308,37 @@ final class ZhihuSource: ReadingSource {
         configuration.waitsForConnectivity = false
         return URLSession(configuration: configuration)
     }()
+    private static var cachedCookies: [HTTPCookie]?
+    private static var cachedCookiesAt: Date = .distantPast
+    private static var cookieFetchTask: Task<[HTTPCookie], Never>?
+
+    static func invalidateCookieCache() {
+        cachedCookies = nil
+        cachedCookiesAt = .distantPast
+    }
+
+    private func loadCookies() async -> [HTTPCookie] {
+        if let cached = Self.cachedCookies, Date().timeIntervalSince(Self.cachedCookiesAt) < 1.5 {
+            return cached
+        }
+        if let inFlight = Self.cookieFetchTask {
+            return await inFlight.value
+        }
+        let task = Task { @MainActor in
+            let all = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
+            Self.cachedCookies = all
+            Self.cachedCookiesAt = Date()
+            Self.cookieFetchTask = nil
+            return all
+        }
+        Self.cookieFetchTask = task
+        return await task.value
+    }
 
     private func request(_ url: URL, method: String = "GET", body: [String: String]? = nil, form: [String: String]? = nil, prefetch: Bool = false) async throws -> [String: Any] {
         guard url.scheme == "https", let host = url.host,
               host == "zhihu.com" || host.hasSuffix(".zhihu.com") else { throw SourceError.malformed }
-        let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
+        let cookies = await loadCookies()
         var request = URLRequest(url: url)
         request.setValue("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
         request.setValue("https://www.zhihu.com/", forHTTPHeaderField: "Referer")
@@ -197,16 +365,20 @@ final class ZhihuSource: ReadingSource {
         let headers = http.allHeaderFields.reduce(into: [String: String]()) { result, pair in
             if let name = pair.key as? String, let value = pair.value as? String { result[name] = value }
         }
-        for cookie in HTTPCookie.cookies(withResponseHeaderFields: headers, for: url) {
+        let responseCookies = HTTPCookie.cookies(withResponseHeaderFields: headers, for: url)
+        var didMutateCookies = false
+        for cookie in responseCookies {
             let domain = cookie.domain.hasPrefix(".") ? String(cookie.domain.dropFirst()) : cookie.domain
             guard domain == "zhihu.com" || domain.hasSuffix(".zhihu.com"),
                   host == domain || host.hasSuffix("." + domain) else { continue }
+            didMutateCookies = true
             if let expiry = cookie.expiresDate, expiry <= Date() {
                 await WKWebsiteDataStore.default().httpCookieStore.deleteCookie(cookie)
             } else {
                 await WKWebsiteDataStore.default().httpCookieStore.setCookie(cookie)
             }
         }
+        if didMutateCookies { Self.invalidateCookieCache() }
         guard (200..<300).contains(http.statusCode) else { throw SourceError.response(http.statusCode) }
         if data.isEmpty { return [:] }
         guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw SourceError.malformed }
@@ -556,15 +728,15 @@ private func mediaURL(_ value: Any?) -> URL? {
 
 // Zhihu often puts the original image (including GIFs) in a lazy-load attribute.
 func htmlImageSources(_ html: String) -> [String] {
-    let tags = try? NSRegularExpression(pattern: #"(?i)<img\b[^>]*>"#)
+    guard html.range(of: "<img", options: .caseInsensitive) != nil else { return [] }
     let range = NSRange(html.startIndex..., in: html)
-    return (tags?.matches(in: html, range: range) ?? []).compactMap { match in
+    let attrExpressions = [ZhihuRegex.dataActualSrcAttr, ZhihuRegex.dataOriginalAttr, ZhihuRegex.srcAttr]
+    return ZhihuRegex.imgTag.matches(in: html, range: range).compactMap { match in
         guard let tagRange = Range(match.range, in: html) else { return nil }
         let tag = String(html[tagRange])
-        for name in ["data-actualsrc", "data-original", "src"] {
-            let pattern = #"(?i)(?:^|\s)"# + name + #"\s*=\s*["']([^"']+)["']"#
-            guard let expression = try? NSRegularExpression(pattern: pattern),
-                  let found = expression.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
+        let nsTagRange = NSRange(tag.startIndex..., in: tag)
+        for expression in attrExpressions {
+            guard let found = expression.firstMatch(in: tag, range: nsTagRange),
                   let valueRange = Range(found.range(at: 1), in: tag) else { continue }
             var value = String(tag[valueRange]).replacingOccurrences(of: "&amp;", with: "&")
             if value.hasPrefix("//") { value = "https:" + value }
@@ -708,32 +880,37 @@ enum CommentEmoji {
     }
 
     /// 所有内置表情图地址，供启动时预载，避免评论区先显示文字再替换成图片。
-    static var allURLs: [URL] {
-        commentEmojiURLs.values.compactMap(URL.init(string:))
-    }
+    static let allURLs: [URL] = commentEmojiURLs.values.compactMap(URL.init(string:))
 
     /// 从评论 HTML/纯文本中提取用到的表情图地址。
     static func urls(in text: String) -> [URL] {
-        guard let expression = try? NSRegularExpression(pattern: #"\[([^\[\]\n]{1,12})\]"#) else { return [] }
-        return expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
+        guard text.contains("[") else { return [] }
+        return ZhihuRegex.emojiBracket.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
             guard let nameRange = Range(match.range(at: 1), in: text),
                   let value = commentEmojiURLs[String(text[nameRange])] else { return nil }
             return URL(string: value)
         }
     }
 
+    private static let reverseEmojiNames: [String: String] = {
+        var map: [String: String] = [:]
+        map.reserveCapacity(commentEmojiURLs.count)
+        for (name, urlString) in commentEmojiURLs { map[urlString] = name }
+        return map
+    }()
+
     static func fallbackURL(for url: URL) -> URL? {
-        guard let name = commentEmojiURLs.first(where: { $0.value == url.absoluteString })?.key,
+        guard let name = reverseEmojiNames[url.absoluteString],
               let fallback = commentEmojiFallbackURLs[name] else { return nil }
         return URL(string: fallback)
     }
 }
 
 func commentTextFragments(_ text: String) -> [CommentTextFragment] {
-    guard let expression = try? NSRegularExpression(pattern: #"\[([^\[\]\n]{1,12})\]"#) else { return [.text(text)] }
+    guard text.contains("[") else { return text.isEmpty ? [] : [.text(text)] }
     var result: [CommentTextFragment] = []
     var position = text.startIndex
-    for match in expression.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+    for match in ZhihuRegex.emojiBracket.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
         guard let range = Range(match.range, in: text), let nameRange = Range(match.range(at: 1), in: text),
               let value = commentEmojiURLs[String(text[nameRange])], let url = URL(string: value) else { continue }
         if position < range.lowerBound { result.append(.text(String(text[position..<range.lowerBound]))) }
@@ -763,18 +940,14 @@ func normalizedCommentLinkURL(_ rawHref: String) -> URL? {
 }
 
 private func plainCommentText(_ html: String, trim: Bool) -> String {
-    var text = html.replacingOccurrences(of: "(?i)<br\\s*/?>|</(?:p|div|li)\\s*>", with: "\n", options: .regularExpression)
-    text = text.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
-    let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'"]
-    for (entity, value) in entities { text = text.replacingOccurrences(of: entity, with: value) }
-    return trim ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
+    stripHTMLToPlainText(html, trim: trim)
 }
 
 /// 将评论 HTML 片段解析为文字、内置表情与可点击链接，供 `CommentInlineText` 原生混排。
 func commentInlineSegments(_ html: String) -> [CommentInlineSegment] {
     let trimmedHTML = html.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedHTML.isEmpty else { return [] }
-    guard let anchorRegex = try? NSRegularExpression(pattern: #"(?is)<a\b([^>]*)>(.*?)</a\s*>"#) else {
+    guard trimmedHTML.range(of: "<a", options: .caseInsensitive) != nil else {
         let plain = plainCommentText(trimmedHTML, trim: true)
         guard !plain.isEmpty else { return [] }
         return commentTextFragments(plain).map {
@@ -784,7 +957,7 @@ func commentInlineSegments(_ html: String) -> [CommentInlineSegment] {
             }
         }
     }
-    let matches = anchorRegex.matches(in: trimmedHTML, range: NSRange(trimmedHTML.startIndex..., in: trimmedHTML))
+    let matches = ZhihuRegex.anchorCapture.matches(in: trimmedHTML, range: NSRange(trimmedHTML.startIndex..., in: trimmedHTML))
     if matches.isEmpty {
         let plain = plainCommentText(trimmedHTML, trim: true)
         guard !plain.isEmpty else { return [] }
@@ -835,12 +1008,12 @@ func commentInlineSegments(_ html: String) -> [CommentInlineSegment] {
     }
     // Trim leading/trailing whitespace on the outer text segments
     if case .text(let first) = segments.first {
-        let trimmed = first.replacingOccurrences(of: #"^\s+"#, with: "", options: .regularExpression)
+        let trimmed = ZhihuRegex.leadingWhitespace.stringByReplacingMatches(in: first, range: NSRange(first.startIndex..., in: first), withTemplate: "")
         if trimmed.isEmpty { segments.removeFirst() }
         else { segments[0] = .text(trimmed) }
     }
     if case .text(let last) = segments.last {
-        let trimmed = last.replacingOccurrences(of: #"\s+$"#, with: "", options: .regularExpression)
+        let trimmed = ZhihuRegex.trailingWhitespace.stringByReplacingMatches(in: last, range: NSRange(last.startIndex..., in: last), withTemplate: "")
         if trimmed.isEmpty { segments.removeLast() }
         else { segments[segments.count - 1] = .text(trimmed) }
     }
@@ -849,8 +1022,9 @@ func commentInlineSegments(_ html: String) -> [CommentInlineSegment] {
 
 // Preserve the source order and repeated images instead of collecting every image at the end.
 func commentHTMLFragments(_ html: String) -> [CommentHTMLFragment] {
-    guard let expression = try? NSRegularExpression(pattern: #"(?is)<img\b[^>]*>|<a\b[^>]*>.*?</a\s*>"#) else { return [.text(html)] }
-    let matches = expression.matches(in: html, range: NSRange(html.startIndex..., in: html))
+    guard html.contains("<") else { return [.text(html)] }
+    let matches = ZhihuRegex.commentMedia.matches(in: html, range: NSRange(html.startIndex..., in: html))
+    guard !matches.isEmpty else { return [.text(html)] }
     var fragments: [CommentHTMLFragment] = []
     var position = html.startIndex
     for match in matches {
@@ -858,8 +1032,7 @@ func commentHTMLFragments(_ html: String) -> [CommentHTMLFragment] {
         let tag = String(html[range])
         var imageURL = htmlImageSources(tag).first.flatMap(URL.init(string:))
         if imageURL == nil, tag.lowercased().hasPrefix("<a"),
-           let href = try? NSRegularExpression(pattern: #"(?i)\bhref\s*=\s*["']([^"']+)["']"#),
-           let match = href.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
+           let match = ZhihuRegex.hrefAttr.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
            let valueRange = Range(match.range(at: 1), in: tag) {
             var value = String(tag[valueRange]).replacingOccurrences(of: "&amp;", with: "&")
             if value.hasPrefix("//") { value = "https:" + value }
@@ -879,17 +1052,16 @@ func commentHTMLFragments(_ html: String) -> [CommentHTMLFragment] {
 }
 
 private func htmlTagAttribute(_ name: String, in tag: String) -> String? {
-    let pattern = #"(?i)(?:^|\s)"# + name + #"\s*=\s*["']([^"']+)["']"#
-    guard let expression = try? NSRegularExpression(pattern: pattern),
+    guard let expression = ZhihuRegex.attribute(name),
           let found = expression.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
           let valueRange = Range(found.range(at: 1), in: tag) else { return nil }
     return String(tag[valueRange])
 }
 
 func expandedVideoHTML(_ html: String) -> String {
-    guard let anchor = try? NSRegularExpression(pattern: #"(?is)<a\b[^>]*>.*?</a\s*>"#) else { return html }
+    guard html.range(of: "<a", options: .caseInsensitive) != nil else { return html }
     var result = html
-    let matches = anchor.matches(in: result, range: NSRange(result.startIndex..., in: result))
+    let matches = ZhihuRegex.anchorWhole.matches(in: result, range: NSRange(result.startIndex..., in: result))
     for match in matches.reversed() {
         guard let range = Range(match.range, in: result) else { continue }
         let tag = String(result[range])
@@ -936,16 +1108,14 @@ func videoReference(fromHTMLTag tag: String) -> VideoReference? {
     if value.hasPrefix("//") { value = "https:" + value }
     guard let url = URL(string: value) else { return nil }
     let path = url.path.lowercased()
-    let patterns = [
-        ("lens", #"/videos?/(\d+)"#),
-        ("zvideo", #"/zvideos?/(\d+)"#)
-    ]
-    for (kind, pattern) in patterns {
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: path, range: NSRange(path.startIndex..., in: path)),
-              let idRange = Range(match.range(at: 1), in: path) else { continue }
-        let id = String(path[idRange])
-        return VideoReference(id: id, kind: kind == "zvideo" ? .zvideo : .lens)
+    let nsPath = NSRange(path.startIndex..., in: path)
+    if let match = ZhihuRegex.lensVideoPath.firstMatch(in: path, range: nsPath),
+       let idRange = Range(match.range(at: 1), in: path) {
+        return VideoReference(id: String(path[idRange]), kind: .lens)
+    }
+    if let match = ZhihuRegex.zvideoPath.firstMatch(in: path, range: nsPath),
+       let idRange = Range(match.range(at: 1), in: path) {
+        return VideoReference(id: String(path[idRange]), kind: .zvideo)
     }
     if url.host?.lowercased() == "lens.zhihu.com" {
         let components = path.split(separator: "/")
@@ -976,12 +1146,12 @@ private func htmlEscapeAttribute(_ value: String) -> String {
 }
 
 func expandedImageHTML(_ html: String) -> String {
+    guard html.range(of: "<img", options: .caseInsensitive) != nil else { return html }
     // Zhihu often wraps images in links to the full-size asset. The reader has
     // its own tap-to-preview gesture, so unwrap those links first to avoid the
     // web view also navigating while the preview opens.
     var result = unwrapImageLinks(html)
-    guard let regex = try? NSRegularExpression(pattern: #"(?i)<img\b[^>]*>"#) else { return result }
-    let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+    let matches = ZhihuRegex.imgTag.matches(in: result, range: NSRange(result.startIndex..., in: result))
     for match in matches.reversed() {
         guard let range = Range(match.range, in: result) else { continue }
         let tag = String(result[range])
@@ -989,15 +1159,16 @@ func expandedImageHTML(_ html: String) -> String {
         let escaped = url.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "\"", with: "&quot;")
         // 行内表情与贴纸必须立即加载、且不能带 alt/title：否则 WebKit 会先显示
         // alt 里的「[感谢]」文本再被图片替换，阅读时能看到明显的文字变图过程。
+        let nsTag = NSRange(tag.startIndex..., in: tag)
         let isEmoji = tag.range(of: "ztext-emoji", options: .caseInsensitive) != nil
             || tag.range(of: "emojione", options: .caseInsensitive) != nil
             || tag.range(of: "sticker", options: .caseInsensitive) != nil
-            || tag.range(of: #"alt\s*=\s*["']?\[[^\]]+\]"#, options: .regularExpression) != nil
-        var newTag = tag.replacingOccurrences(of: #"(?i)(?:^|\s)src\s*=\s*["'][^"']*["']"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"(?i)(?:^|\s)loading\s*=\s*["'][^"']*["']"#, with: "", options: .regularExpression)
+            || ZhihuRegex.bracketAlt.firstMatch(in: tag, range: nsTag) != nil
+        var newTag = ZhihuRegex.stripSrcAttr.stringByReplacingMatches(in: tag, range: NSRange(tag.startIndex..., in: tag), withTemplate: "")
+        newTag = ZhihuRegex.stripLoadingAttr.stringByReplacingMatches(in: newTag, range: NSRange(newTag.startIndex..., in: newTag), withTemplate: "")
         if isEmoji {
-            newTag = newTag.replacingOccurrences(of: #"(?i)(?:^|\s)alt\s*=\s*(?:["'][^"']*["']|[^\s>]+)"#, with: "", options: .regularExpression)
-                .replacingOccurrences(of: #"(?i)(?:^|\s)title\s*=\s*(?:["'][^"']*["']|[^\s>]+)"#, with: "", options: .regularExpression)
+            newTag = ZhihuRegex.stripAltAttr.stringByReplacingMatches(in: newTag, range: NSRange(newTag.startIndex..., in: newTag), withTemplate: "")
+            newTag = ZhihuRegex.stripTitleAttr.stringByReplacingMatches(in: newTag, range: NSRange(newTag.startIndex..., in: newTag), withTemplate: "")
         }
         var attributes = isEmoji
             ? "alt=\"\" loading=\"eager\" decoding=\"async\" src=\"\(escaped)\""
@@ -1013,8 +1184,8 @@ func expandedImageHTML(_ html: String) -> String {
 }
 
 private func unwrapImageLinks(_ html: String) -> String {
-    guard let regex = try? NSRegularExpression(pattern: #"(?is)<a\b[^>]*>(.*?)</a\s*>"#) else { return html }
-    let matches = regex.matches(in: html, range: NSRange(html.startIndex..., in: html))
+    guard html.range(of: "<a", options: .caseInsensitive) != nil else { return html }
+    let matches = ZhihuRegex.anchorWhole.matches(in: html, range: NSRange(html.startIndex..., in: html))
     var result = html
     for match in matches.reversed() {
         guard let whole = Range(match.range, in: result),

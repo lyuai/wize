@@ -319,20 +319,52 @@ final class ReaderModel: ObservableObject {
         await autoRefreshFeedIfNeeded(for: channel, force: true, applyImmediately: applyImmediately)
     }
 
+    private func fetchRegionsConcurrently(for targets: ArraySlice<ReadingItem>) async -> [String: String] {
+        guard !targets.isEmpty else { return [:] }
+        let items = Array(targets)
+        var discovered: [String: String] = [:]
+        discovered.reserveCapacity(items.count)
+        await withTaskGroup(of: (String, String?).self) { group in
+            var iterator = items.makeIterator()
+            for _ in 0..<min(5, items.count) {
+                if let item = iterator.next() {
+                    group.addTask { @MainActor [source = self.source] in
+                        let region = try? await source.answerRegion(answerID: item.id)
+                        return (item.key, region)
+                    }
+                }
+            }
+            while let (key, region) = await group.next() {
+                if let region, !region.isEmpty {
+                    discovered[key] = region
+                }
+                if !Task.isCancelled, let nextItem = iterator.next() {
+                    group.addTask { @MainActor [source = self.source] in
+                        let region = try? await source.answerRegion(answerID: nextItem.id)
+                        return (nextItem.key, region)
+                    }
+                }
+            }
+        }
+        return discovered
+    }
+
     private func enrichPendingFeedRegions(channel: Channel) async {
         guard channel == .recommend, let items = pendingFeeds[channel]?.items else { return }
         let targets = items.filter { $0.kind == .answer && ($0.ipInfo ?? "").isEmpty }.prefix(10)
-        for item in targets {
-            guard !Task.isCancelled, pendingFeeds[channel] != nil else { return }
-            guard let region = try? await source.answerRegion(answerID: item.id),
-                  !region.isEmpty else { continue }
-            guard var currentPending = pendingFeeds[channel] else { return }
-            if let index = currentPending.items.firstIndex(where: { $0.key == item.key }) {
-                var updated = currentPending.items
+        let discovered = await fetchRegionsConcurrently(for: targets)
+        guard !Task.isCancelled, !discovered.isEmpty, var currentPending = pendingFeeds[channel] else { return }
+        var changed = false
+        var updated = currentPending.items
+        for index in updated.indices {
+            if let region = discovered[updated[index].key], (updated[index].ipInfo ?? "").isEmpty {
                 updated[index].ipInfo = region
-                currentPending = Page(items: updated, next: currentPending.next)
-                pendingFeeds[channel] = currentPending
+                changed = true
             }
+        }
+        if changed {
+            currentPending = Page(items: updated, next: currentPending.next)
+            pendingFeeds[channel] = currentPending
         }
     }
 
@@ -343,15 +375,21 @@ final class ReaderModel: ObservableObject {
         let targets = (feeds[channel] ?? []).filter { item in
             item.kind == .answer && (item.ipInfo ?? "").isEmpty
         }.prefix(10)
+        guard !targets.isEmpty else { return }
         feedRegionTask = Task { [weak self] in
-            for item in targets {
-                guard !Task.isCancelled, let self else { return }
-                guard let region = try? await self.source.answerRegion(answerID: item.id),
-                      !region.isEmpty else { continue }
-                guard !Task.isCancelled, self.feedGeneration == generation else { return }
-                if let index = self.feeds[channel]?.firstIndex(where: { $0.key == item.key }) {
-                    self.feeds[channel]?[index].ipInfo = region
+            guard let self else { return }
+            let discovered = await self.fetchRegionsConcurrently(for: targets)
+            guard !Task.isCancelled, !discovered.isEmpty, self.feedGeneration == generation,
+                  var currentItems = self.feeds[channel] else { return }
+            var changed = false
+            for index in currentItems.indices {
+                if let region = discovered[currentItems[index].key], (currentItems[index].ipInfo ?? "").isEmpty {
+                    currentItems[index].ipInfo = region
+                    changed = true
                 }
+            }
+            if changed {
+                self.feeds[channel] = currentItems
             }
         }
     }
@@ -692,6 +730,7 @@ final class ReaderModel: ObservableObject {
     }
 
     func resetAfterLogin() {
+        ZhihuSource.invalidateCookieCache()
         clearDetailCache()
         Task {
             await loadAccount()

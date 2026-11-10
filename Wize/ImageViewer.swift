@@ -116,14 +116,19 @@ final class ImagePreviewModel: ObservableObject {
     }
 }
 
-/// 放大动画显示在屏幕中央；点周边、单击图片、向下轻扫或点 X 都会缩回关闭。
+/// 放大动画显示在屏幕中央；点周边、单击图片、向下跟手拖拽或点 X 都会缩回关闭。
 private struct AnimatedImageViewer: View {
     @ObservedObject var model: ImagePreviewModel
     let sourceFrame: CGRect?
     let onDismiss: () -> Void
 
-    @State private var scale: CGFloat = 0.94
-    @State private var dimmed = true
+    @State private var scale: CGFloat = 0.92
+    @State private var dimmed = false
+    @State private var dragOffset: CGSize = .zero
+
+    private var dragProgress: CGFloat {
+        min(abs(dragOffset.height) / 260, 1)
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -132,14 +137,24 @@ private struct AnimatedImageViewer: View {
             let available = CGSize(width: max(geometry.size.width - horizontalInset * 2, 80),
                                    height: max(geometry.size.height - verticalInset * 2, 80))
             ZStack {
-                Color.black.opacity(dimmed ? 0.62 : 0)
+                Color.black.opacity(dimmed ? max(0.76 * (1 - dragProgress * 0.68), 0) : 0)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture { dismiss() }
                     .gesture(
-                        DragGesture(minimumDistance: 24).onEnded { value in
-                            if value.translation.height > 60 { dismiss() }
-                        }
+                        DragGesture(minimumDistance: 16)
+                            .onChanged { value in
+                                dragOffset = value.translation
+                            }
+                            .onEnded { value in
+                                if abs(value.translation.height) > 72 || abs(value.predictedEndTranslation.height) > 160 {
+                                    dismiss()
+                                } else {
+                                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                        dragOffset = .zero
+                                    }
+                                }
+                            }
                     )
 
                 if let image = model.image {
@@ -148,10 +163,23 @@ private struct AnimatedImageViewer: View {
                         image: image,
                         fittedSize: fitted,
                         cornerRadius: horizontalInset > 0 ? 14 : 0,
-                        onSingleTap: { dismiss() }
+                        onSingleTap: { dismiss() },
+                        onVerticalDragChanged: { translation in
+                            dragOffset = translation
+                        },
+                        onVerticalDragEnded: { translation, velocity in
+                            if abs(translation.height) > 72 || abs(velocity.y) > 750 {
+                                dismiss()
+                            } else {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                    dragOffset = .zero
+                                }
+                            }
+                        }
                     )
                     .frame(width: geometry.size.width, height: geometry.size.height)
-                    .scaleEffect(scale)
+                    .offset(x: dragOffset.width * 0.25, y: dragOffset.height)
+                    .scaleEffect(scale * (1 - dragProgress * 0.12))
                 } else if model.failed {
                     VStack(spacing: 14) {
                         Image(systemName: "photo.badge.exclamationmark")
@@ -187,8 +215,9 @@ private struct AnimatedImageViewer: View {
                                             .foregroundStyle(.white)
                                     }
                                 }
-                                .frame(width: 34, height: 34)
-                                .background(Color.black.opacity(0.55), in: Circle())
+                                .frame(width: 36, height: 36)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5))
                             }
                             .disabled(model.saving)
                             .accessibilityLabel("存储到照片")
@@ -197,29 +226,36 @@ private struct AnimatedImageViewer: View {
                             Image(systemName: "xmark")
                                 .font(.system(size: 15, weight: .semibold))
                                 .foregroundStyle(.white)
-                                .frame(width: 34, height: 34)
-                                .background(Color.black.opacity(0.55), in: Circle())
+                                .frame(width: 36, height: 36)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5))
                         }
                         .accessibilityLabel("关闭图片")
                     }
                     .padding(.horizontal, 18)
                     .padding(.top, 18)
+                    .opacity(dimmed ? Double(1 - dragProgress) : 0)
                     Spacer()
                     if let notice = model.saveNotice {
                         Text(notice)
                             .font(.footnote.weight(.medium))
                             .foregroundStyle(.white)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(Color.black.opacity(0.75), in: Capsule())
+                            .padding(.horizontal, 15)
+                            .padding(.vertical, 8.5)
+                            .background(Color.black.opacity(0.76), in: Capsule())
+                            .overlay(Capsule().strokeBorder(.white.opacity(0.16), lineWidth: 0.5))
                             .padding(.bottom, 28)
-                            .transition(.opacity)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
                             .allowsHitTesting(false)
                     }
                 }
             }
+            .environment(\.colorScheme, .dark)
             .onAppear {
-                withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) { scale = 1 }
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
+                    scale = 1
+                    dimmed = true
+                }
             }
         }
     }
@@ -227,10 +263,10 @@ private struct AnimatedImageViewer: View {
     private func dismiss() {
         guard dimmed else { return }
         withAnimation(.easeInOut(duration: 0.2)) {
-            scale = 0.9
+            scale = 0.88
             dimmed = false
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { onDismiss() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.21) { onDismiss() }
     }
 
     private static func fittedSize(for imageSize: CGSize, in available: CGSize) -> CGSize {
@@ -247,6 +283,8 @@ private struct ZoomableImage: UIViewRepresentable {
     let fittedSize: CGSize
     var cornerRadius: CGFloat = 0
     var onSingleTap: () -> Void = {}
+    var onVerticalDragChanged: (CGSize) -> Void = { _ in }
+    var onVerticalDragEnded: (CGSize, CGPoint) -> Void = { _, _ in }
 
     func makeUIView(context: Context) -> CenteringZoomScrollView {
         let scrollView = CenteringZoomScrollView()
@@ -278,18 +316,22 @@ private struct ZoomableImage: UIViewRepresentable {
         singleTap.require(toFail: doubleTap)
         scrollView.addGestureRecognizer(singleTap)
 
-        let dismissSwipe = UISwipeGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleSwipeDown))
-        dismissSwipe.direction = .down
-        dismissSwipe.delegate = context.coordinator
-        scrollView.addGestureRecognizer(dismissSwipe)
+        let dismissPan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDismissPan(_:)))
+        dismissPan.delegate = context.coordinator
+        scrollView.addGestureRecognizer(dismissPan)
+        context.coordinator.dismissPan = dismissPan
 
         context.coordinator.onSingleTap = onSingleTap
+        context.coordinator.onVerticalDragChanged = onVerticalDragChanged
+        context.coordinator.onVerticalDragEnded = onVerticalDragEnded
         context.coordinator.scrollView = scrollView
         return scrollView
     }
 
     func updateUIView(_ scrollView: CenteringZoomScrollView, context: Context) {
         context.coordinator.onSingleTap = onSingleTap
+        context.coordinator.onVerticalDragChanged = onVerticalDragChanged
+        context.coordinator.onVerticalDragEnded = onVerticalDragEnded
         if let imageView = scrollView.viewWithTag(91) as? UIImageView {
             if imageView.image !== image {
                 imageView.image = image
@@ -347,7 +389,10 @@ private struct ZoomableImage: UIViewRepresentable {
 
     final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         weak var scrollView: CenteringZoomScrollView?
+        weak var dismissPan: UIPanGestureRecognizer?
         var onSingleTap: () -> Void = {}
+        var onVerticalDragChanged: (CGSize) -> Void = { _ in }
+        var onVerticalDragEnded: (CGSize, CGPoint) -> Void = { _, _ in }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
             scrollView.viewWithTag(91)
@@ -363,13 +408,32 @@ private struct ZoomableImage: UIViewRepresentable {
 
         @objc func handleSingleTap() { onSingleTap() }
 
-        @objc func handleSwipeDown() {
-            guard let scrollView, scrollView.zoomScale <= 1.01 else { return }
-            onSingleTap()
+        @objc func handleDismissPan(_ gesture: UIPanGestureRecognizer) {
+            let translation = gesture.translation(in: gesture.view)
+            let velocity = gesture.velocity(in: gesture.view)
+            switch gesture.state {
+            case .changed:
+                onVerticalDragChanged(CGSize(width: translation.x, height: translation.y))
+            case .ended, .cancelled:
+                onVerticalDragEnded(CGSize(width: translation.x, height: translation.y), velocity)
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            if gestureRecognizer === dismissPan {
+                guard let scrollView, scrollView.zoomScale <= 1.01,
+                      let pan = gestureRecognizer as? UIPanGestureRecognizer else { return false }
+                let velocity = pan.velocity(in: scrollView)
+                return abs(velocity.y) > abs(velocity.x) * 1.15
+            }
+            return true
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            true
+            if gestureRecognizer === dismissPan { return false }
+            return true
         }
 
         @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
