@@ -202,6 +202,7 @@ struct ReadingComment: Identifiable {
     let author: String
     let html: String
     let likes: Int
+    var isLiked: Bool = false
     var avatarURL: URL? = nil
     var ipInfo: String? = nil
     var replyTo: String? = nil
@@ -216,6 +217,7 @@ struct ReadingComment: Identifiable {
         author: String,
         html: String,
         likes: Int,
+        isLiked: Bool = false,
         avatarURL: URL? = nil,
         ipInfo: String? = nil,
         replyTo: String? = nil,
@@ -228,6 +230,7 @@ struct ReadingComment: Identifiable {
         self.author = author
         self.html = html
         self.likes = likes
+        self.isLiked = isLiked
         self.avatarURL = avatarURL
         self.ipInfo = ipInfo
         self.replyTo = replyTo
@@ -603,7 +606,13 @@ func parseReadingComments(_ entries: [[String: Any]], depth: Int = 0, parentAuth
         let name = author["name"] as? String ?? "知乎用户"
         let reply = member(entry["reply_to_author"] ?? entry["reply_to"])
         let explicitReplyTo = (reply["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        var comment = ReadingComment(id: id, author: name, html: entry["content"] as? String ?? "", likes: entry["vote_count"] as? Int ?? 0)
+        var comment = ReadingComment(
+            id: id,
+            author: name,
+            html: entry["content"] as? String ?? "",
+            likes: entry["vote_count"] as? Int ?? 0,
+            isLiked: (entry["liked"] as? Bool == true) || (entry["voting"] as? Bool == true)
+        )
         comment.avatarURL = mediaURL(author["avatar_url"])
         comment.replyTo = explicitReplyTo ?? parentAuthor
         let rawParent = entry["reply_to_comment_id"] ?? entry["reply_comment_id"] ?? entry["parent_comment_id"] ?? entry["in_reply_to_comment_id"]

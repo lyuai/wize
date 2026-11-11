@@ -1101,12 +1101,13 @@ struct ReaderView: View {
             if let ip = normalizedIPRegion(comment.ipInfo) {
                 RegionBadge(ip: ip)
             }
-            if comment.likes > 0 {
+            if comment.likes > 0 || comment.isLiked {
+                let likeCount = max(comment.likes, comment.isLiked ? 1 : 0)
                 MetadataCount(
-                    symbol: comment.likes >= 50 ? "hand.thumbsup.fill" : "hand.thumbsup",
-                    count: comment.likes,
-                    color: comment.likes >= 50 ? ReaderPalette.upvote.opacity(0.88) : .secondary,
-                    accessibilityLabel: "\(displayCount(comment.likes)) 次赞同"
+                    symbol: comment.isLiked ? "hand.thumbsup.fill" : "hand.thumbsup",
+                    count: likeCount,
+                    color: comment.isLiked ? ReaderPalette.upvote.opacity(0.88) : .secondary,
+                    accessibilityLabel: "\(displayCount(likeCount)) 次赞同"
                 )
             }
             if comment.replyCount > 0 {
@@ -1619,13 +1620,17 @@ private final class ReaderSharePresenter {
         controller.completionWithItemsHandler = { [weak self] _, _, _, _ in
             self?.activeSources = []
         }
-        if UIDevice.current.userInterfaceIdiom == .phone,
-           let pc = controller.presentationController,
-           pc.responds(to: Selector(("setLayoutMargins:"))) {
-            pc.setValue(UIEdgeInsets.zero, forKey: "layoutMargins")
-        }
-        if UIDevice.current.userInterfaceIdiom == .pad,
-           let popover = controller.popoverPresentationController {
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            if controller.responds(to: Selector(("setAllowsCustomPresentationStyle:"))) {
+                controller.setValue(true, forKey: "allowsCustomPresentationStyle")
+            }
+            controller.modalPresentationStyle = .pageSheet
+            if let sheet = controller.sheetPresentationController {
+                sheet.detents = [.medium(), .large()]
+                sheet.prefersEdgeAttachedInCompactHeight = true
+                sheet.widthFollowsPreferredContentSizeWhenEdgeAttached = false
+            }
+        } else if let popover = controller.popoverPresentationController {
             popover.sourceView = host.view
             if !sourceRect.isEmpty, sourceRect.width > 0, sourceRect.height > 0 {
                 popover.sourceRect = host.view.convert(sourceRect, from: nil)
@@ -1640,7 +1645,21 @@ private final class ReaderSharePresenter {
                 popover.permittedArrowDirections = []
             }
         }
-        host.present(controller, animated: true)
+        if let presented = host.presentedViewController {
+            if let coordinator = presented.transitionCoordinator {
+                coordinator.animate(alongsideTransition: nil) { _ in
+                    host.present(controller, animated: true)
+                }
+            } else if Self.isContextMenuController(presented) || presented.isBeingDismissed {
+                presented.dismiss(animated: true) {
+                    host.present(controller, animated: true)
+                }
+            } else {
+                host.present(controller, animated: true)
+            }
+        } else {
+            host.present(controller, animated: true)
+        }
     }
 
     private static func cachedShareIcon(url: URL?) -> UIImage? {
@@ -1699,10 +1718,17 @@ private final class ReaderSharePresenter {
         let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
         let window = scene?.windows.first(where: \.isKeyWindow) ?? scene?.windows.first { !$0.isHidden }
         var top = window?.rootViewController
-        while let presented = top?.presentedViewController, !presented.isBeingDismissed {
+        while let presented = top?.presentedViewController,
+              !presented.isBeingDismissed,
+              !Self.isContextMenuController(presented) {
             top = presented
         }
         return top
+    }
+
+    private static func isContextMenuController(_ controller: UIViewController) -> Bool {
+        let name = String(describing: type(of: controller))
+        return name.contains("ContextMenu") || name.contains("Reparenting")
     }
 }
 
@@ -3187,7 +3213,11 @@ private struct HTMLReader: UIViewRepresentable {
         // what the document is made of actually changed.
         let documentKey = documentFingerprint(parts: parts, presentationKey: presentationKey,
                                               fallbackHTML: html)
+        let countsKey = countsFingerprint(parts: parts)
         if !context.coordinator.lastHTML.isEmpty, documentKey == context.coordinator.lastDocumentKey {
+            if countsKey != context.coordinator.lastCountsKey {
+                context.coordinator.updateCounts(parts, key: countsKey, in: view)
+            }
             if context.coordinator.fontFaceKey != fontFaceKey {
                 context.coordinator.updateFontFace(fontFaceCSS, key: fontFaceKey, in: view)
             }
@@ -3250,28 +3280,33 @@ private struct HTMLReader: UIViewRepresentable {
         let document = """
         <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><style>\(style)</style><style id="wize-font-face"></style></head><body data-wize-anchor="\(htmlEscape(item.id))" data-wize-pending="1"><header><h1>\(title)</h1></header>\(sections)</body></html>
         """
+        let partIDs = parts.map(\.id)
         if context.coordinator.lastHTML != document {
             let coordinator = context.coordinator
-            if !coordinator.lastHTML.isEmpty, coordinator.sections == sectionList,
+            if !coordinator.lastHTML.isEmpty, coordinator.sectionIDs == partIDs,
                coordinator.documentTitle == title, coordinator.presentationKey != presentationKey {
                 coordinator.presentationKey = presentationKey
+                coordinator.sections = sectionList
                 coordinator.lastHTML = document
                 coordinator.lastDocumentKey = documentKey
+                coordinator.lastCountsKey = countsKey
                 coordinator.updateFontFace(fontFaceCSS, key: fontFaceKey, in: view)
                 coordinator.updateStyle(style, in: view, preservePosition: !isPreview)
                 return
             }
             if coordinator.presentationKey == presentationKey,
-               !coordinator.sections.isEmpty,
-               sectionList.count > coordinator.sections.count,
-               let start = (0...(sectionList.count - coordinator.sections.count)).first(where: {
-                   Array(sectionList[$0..<($0 + coordinator.sections.count)]) == coordinator.sections
+               !coordinator.sectionIDs.isEmpty,
+               partIDs.count > coordinator.sectionIDs.count,
+               let start = (0...(partIDs.count - coordinator.sectionIDs.count)).first(where: {
+                   Array(partIDs[$0..<($0 + coordinator.sectionIDs.count)]) == coordinator.sectionIDs
                }) {
                 let before = sectionList.prefix(start).joined()
-                let after = sectionList.dropFirst(start + coordinator.sections.count).joined()
+                let after = sectionList.dropFirst(start + coordinator.sectionIDs.count).joined()
                 coordinator.sections = sectionList
+                coordinator.sectionIDs = partIDs
                 coordinator.lastHTML = document
                 coordinator.lastDocumentKey = documentKey
+                coordinator.lastCountsKey = countsKey
                 coordinator.previousCount = parts.count
                 coordinator.previousFirstID = parts.first?.id
                 coordinator.enqueueSurrounding(before: before, after: after, in: view)
@@ -3280,13 +3315,16 @@ private struct HTMLReader: UIViewRepresentable {
             coordinator.presentationKey = presentationKey
             coordinator.documentTitle = title
             coordinator.sections = sectionList
+            coordinator.sectionIDs = partIDs
             coordinator.cancelPendingAppends()
             coordinator.userHasScrolled = false
+            coordinator.pinnedAnswerID = nil
             coordinator.noteCompactTitle(false)
             if context.coordinator.lastHTML.isEmpty, parts.first?.id != item.id,
                parts.contains(where: { $0.id == item.id }) {
                 context.coordinator.pendingAnchorID = item.id
                 context.coordinator.pendingOffset = 0
+                context.coordinator.pinnedAnswerID = item.id
             }
             if !context.coordinator.lastHTML.isEmpty {
                 let extent = max(view.scrollView.contentSize.height - view.scrollView.bounds.height, 1)
@@ -3294,6 +3332,7 @@ private struct HTMLReader: UIViewRepresentable {
                    parts.contains(where: { $0.id == item.id }) {
                     context.coordinator.pendingAnchorID = item.id
                     context.coordinator.pendingOffset = max(0, view.scrollView.contentOffset.y)
+                    context.coordinator.pinnedAnswerID = item.id
                 } else if context.coordinator.previousCount != parts.count {
                     context.coordinator.pendingOffset = max(0, view.scrollView.contentOffset.y)
                 } else {
@@ -3304,6 +3343,7 @@ private struct HTMLReader: UIViewRepresentable {
             context.coordinator.previousFirstID = parts.first?.id
             context.coordinator.lastHTML = document
             context.coordinator.lastDocumentKey = documentKey
+            context.coordinator.lastCountsKey = countsKey
             coordinator.fontFaceKey = fontFaceKey
             coordinator.loadingDocument = true
             coordinator.didRestoreOffset = false
@@ -3313,6 +3353,9 @@ private struct HTMLReader: UIViewRepresentable {
                 : document.replacingOccurrences(of: "<style id=\"wize-font-face\"></style>", with: "<style id=\"wize-font-face\">\(fontFaceCSS)</style>")
             view.loadHTMLString(initialHTML, baseURL: URL(string: "https://www.zhihu.com"))
         } else {
+            if countsKey != context.coordinator.lastCountsKey {
+                context.coordinator.updateCounts(parts, key: countsKey, in: view)
+            }
             if context.coordinator.fontFaceKey != fontFaceKey {
                 context.coordinator.updateFontFace(fontFaceCSS, key: fontFaceKey, in: view)
             }
@@ -3322,9 +3365,9 @@ private struct HTMLReader: UIViewRepresentable {
             }
         }
     }
-    /// A cheap fingerprint of the document's inputs. Stream items only ever append,
-    /// and an item's content is replaced only together with its counts, so the id,
-    /// the metadata and the content length identify a rendered section exactly.
+    /// A cheap fingerprint of the document's structure and content inputs. Counts are
+    /// tracked separately in `countsFingerprint` so voting updates the DOM in place
+    /// without reloading the web view.
     private func documentFingerprint(parts: [ReadingItem], presentationKey: String, fallbackHTML: String) -> Int {
         var hasher = Hasher()
         hasher.combine(presentationKey)
@@ -3335,10 +3378,18 @@ private struct HTMLReader: UIViewRepresentable {
             hasher.combine(part.id)
             hasher.combine(part.author)
             hasher.combine(part.avatarURL?.absoluteString)
+            hasher.combine(part.ipInfo)
+            hasher.combine(part.contentHTML?.utf8.count ?? -1)
+        }
+        return hasher.finalize()
+    }
+    private func countsFingerprint(parts: [ReadingItem]) -> Int {
+        var hasher = Hasher()
+        for part in parts {
+            hasher.combine(part.id)
             hasher.combine(part.upCount ?? -1)
             hasher.combine(part.downCount ?? -1)
             hasher.combine(part.commentCount ?? -1)
-            hasher.combine(part.contentHTML?.utf8.count ?? -1)
         }
         return hasher.finalize()
     }
@@ -3346,10 +3397,13 @@ private struct HTMLReader: UIViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate {
         var lastHTML = ""
         var lastDocumentKey: Int?
+        var lastCountsKey: Int?
         var previousCount = 0
         var lastScrollToken: UUID?
         var previousFirstID: String?
         var pendingAnchorID: String?
+        var pinnedAnswerID: String?
+        var pinnedScrollY: CGFloat = 0
         var restoringAnchor = false
         var pendingScrollFraction: CGFloat?
         var pendingOffset: CGFloat?
@@ -3361,11 +3415,14 @@ private struct HTMLReader: UIViewRepresentable {
         var presentationKey = ""
         var documentTitle = ""
         var sections: [String] = []
+        var sectionIDs: [String] = []
         var loadingDocument = false
         var userHasScrolled = false
         var fontFaceKey = ""
         private var pendingFontFaceCSS: String?
         private var pendingStyle: String?
+        private struct CountEntry: Encodable { let id: String; let up: String; let comments: String }
+        private var pendingCounts: [CountEntry]?
         private var preserveStylePosition = true
         private var applyingStyle = false
         private struct Insertion: Encodable { let before: String; let after: String }
@@ -3656,25 +3713,49 @@ private struct HTMLReader: UIViewRepresentable {
         }
 
         /// 未播放的视频卡片点按后开始播放；已经在播的视频点按只暂停或继续，不唤起系统控制层。
+        /// 在回答流中点按任意回答（非链接区域）也会将其切换为当前焦点回答，方便对页面底部较短回答点赞或看评论。
         @objc func handleVideoTap(_ gesture: UITapGestureRecognizer) {
             guard let webView else { return }
             let point = gesture.location(in: webView)
             let script = """
             (() => {
                 const el = document.elementFromPoint(\(point.x), \(point.y));
-                const card = el && el.closest ? el.closest('[data-wize-video]') : null;
-                if (!card || card.getAttribute('data-loading') === '1') return null;
-                if (card.querySelector('video')) {
-                    return { action: 'toggle', id: card.getAttribute('data-wize-video') || '' };
+                if (!el) return null;
+                const card = el.closest ? el.closest('[data-wize-video]') : null;
+                if (card) {
+                    if (card.getAttribute('data-loading') === '1') return null;
+                    const section = card.closest ? card.closest('section[data-wize-answer]') : null;
+                    const answerId = section ? (section.getAttribute('data-wize-answer') || '') : '';
+                    if (card.querySelector('video')) {
+                        return { action: 'toggle', id: card.getAttribute('data-wize-video') || '', answerId };
+                    }
+                    const rect = card.getBoundingClientRect();
+                    return { action: 'start', id: card.getAttribute('data-wize-video') || '', kind: card.getAttribute('data-wize-video-kind') || 'lens', poster: card.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top, answerId };
                 }
-                const rect = card.getBoundingClientRect();
-                return { action: 'start', id: card.getAttribute('data-wize-video') || '', kind: card.getAttribute('data-wize-video-kind') || 'lens', poster: card.getAttribute('data-wize-poster') || '', width: rect.width, height: rect.height, x: rect.left, y: rect.top };
+                if (el.closest && el.closest('a[href]')) return null;
+                const section = el.closest ? el.closest('section[data-wize-answer]') : null;
+                if (!section) return null;
+                const answers = Array.from(document.querySelectorAll('section[data-wize-answer]'));
+                answers.forEach(s => s.classList.toggle('current', s === section));
+                return { action: 'focus', answerId: section.getAttribute('data-wize-answer') || '' };
             })()
             """
             webView.evaluateJavaScript(script) { [weak self] result, _ in
-                guard let self, let info = result as? [String: Any],
+                guard let self, let info = result as? [String: Any] else { return }
+                if self.streamEnabled, let answerId = info["answerId"] as? String, !answerId.isEmpty {
+                    self.pinnedAnswerID = answerId
+                    self.pinnedScrollY = webView.scrollView.contentOffset.y
+                    self.userHasScrolled = true
+                    self.onVisibleAnswer(answerId)
+                    if !self.chromeVisible {
+                        self.chromeRevealWorkItem?.cancel()
+                        self.chromeVisible = true
+                        self.onChromeVisibility(true)
+                    }
+                }
+                guard let action = info["action"] as? String, action != "focus",
                       let id = info["id"] as? String, !id.isEmpty else { return }
-                if info["action"] as? String == "toggle" {
+                if action == "toggle" {
                     self.toggleInlineVideo(id: id, in: webView)
                     return
                 }
@@ -3692,6 +3773,36 @@ private struct HTMLReader: UIViewRepresentable {
             pendingStyle = nil
             applyingStyle = false
             pendingFontFaceCSS = nil
+            pendingCounts = nil
+        }
+        func updateCounts(_ parts: [ReadingItem], key: Int, in webView: WKWebView) {
+            lastCountsKey = key
+            pendingCounts = parts.map {
+                CountEntry(id: $0.id, up: displayCount($0.upCount), comments: displayCount($0.commentCount))
+            }
+            flushCounts(in: webView)
+        }
+        private func flushCounts(in webView: WKWebView) {
+            guard !loadingDocument, let entries = pendingCounts,
+                  let data = try? JSONEncoder().encode(entries),
+                  let encoded = String(data: data, encoding: .utf8) else { return }
+            pendingCounts = nil
+            let script = """
+            (() => {
+                const entries = \(encoded);
+                const map = new Map(entries.map(e => [e.id, e]));
+                document.querySelectorAll('section[data-wize-answer]').forEach(section => {
+                    const entry = map.get(section.getAttribute('data-wize-answer') || '');
+                    if (!entry) return;
+                    const up = section.querySelector('b[data-count="up"]');
+                    if (up) up.textContent = entry.up;
+                    const comments = section.querySelector('b[data-count="comments"]');
+                    if (comments) comments.textContent = entry.comments;
+                });
+                return true;
+            })()
+            """
+            webView.evaluateJavaScript(script)
         }
         func updateFontFace(_ css: String, key: String, in webView: WKWebView) {
             fontFaceKey = key
@@ -3746,6 +3857,7 @@ private struct HTMLReader: UIViewRepresentable {
                 if result as? Bool == true {
                     self.pendingAppends.removeFirst()
                     self.flushAppends(in: webView)
+                    self.inspect(webView)
                 }
             }
         }
@@ -3800,6 +3912,7 @@ private struct HTMLReader: UIViewRepresentable {
             flushFontFace(in: webView)
             flushStyle(in: webView)
             flushAppends(in: webView)
+            flushCounts(in: webView)
             let extent = max(webView.scrollView.contentSize.height - webView.scrollView.bounds.height, 0)
             if let id = pendingAnchorID, let offset = pendingOffset,
                let encoded = try? String(data: JSONEncoder().encode(id), encoding: .utf8) {
@@ -3810,6 +3923,7 @@ private struct HTMLReader: UIViewRepresentable {
                     guard let self, let webView else { return }
                     self.restoringAnchor = false
                     self.restoreReadingOffset(in: webView)
+                    self.pinnedScrollY = webView.scrollView.contentOffset.y
                     self.inspect(webView)
                     self.updateCompactTitle(in: webView, force: true)
                 }
@@ -3821,8 +3935,9 @@ private struct HTMLReader: UIViewRepresentable {
                 pendingScrollFraction = nil
                 webView.scrollView.setContentOffset(CGPoint(x: 0, y: min(fraction, 1) * extent), animated: false)
             }
-            inspect(webView)
             restoreReadingOffset(in: webView)
+            pinnedScrollY = webView.scrollView.contentOffset.y
+            inspect(webView)
             updateCompactTitle(in: webView, force: true)
         }
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
@@ -3841,6 +3956,9 @@ private struct HTMLReader: UIViewRepresentable {
             let remaining = scrollView.contentSize.height - scrollView.bounds.height - scrollView.contentOffset.y
             if userHasScrolled {
                 let y = scrollView.contentOffset.y
+                if pinnedAnswerID != nil, abs(y - pinnedScrollY) > 12 {
+                    pinnedAnswerID = nil
+                }
                 let delta = y - lastScrollOffsetY
                 lastScrollOffsetY = y
                 if y <= 16 || remaining <= 24 {
@@ -3881,7 +3999,13 @@ private struct HTMLReader: UIViewRepresentable {
                 lastNearEnd = Date()
                 onNearEnd()
             }
-            if userHasScrolled, Date().timeIntervalSince(lastInspection) > 0.2 { inspect(webView) }
+            if userHasScrolled {
+                let elapsed = Date().timeIntervalSince(lastInspection)
+                let atBoundary = scrollView.contentOffset.y <= 8 || remaining <= 8
+                if elapsed > 0.12 || (atBoundary && elapsed > 0.04) {
+                    inspect(webView)
+                }
+            }
         }
         func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
             if !decelerate {
@@ -3951,6 +4075,7 @@ private struct HTMLReader: UIViewRepresentable {
             restoreReadingOffset(in: webView)
             guard streamEnabled, !loadingDocument else { return }
             flushAppends(in: webView)
+            flushCounts(in: webView)
             // Content size also changes while lazy images decode; do not round-trip to
             // the web process for every one of those changes.
             guard Date().timeIntervalSince(lastInspection) > 0.12 else { return }
@@ -3958,18 +4083,101 @@ private struct HTMLReader: UIViewRepresentable {
         }
         func scrollToAnswer(_ id: String, in webView: WKWebView) {
             userHasScrolled = false
+            pinnedAnswerID = id
             guard let encoded = try? String(data: JSONEncoder().encode(id), encoding: .utf8) else { return }
-            let script = "(() => { const id = \(encoded); const el = Array.from(document.querySelectorAll('section[data-wize-answer]')).find(e => e.getAttribute('data-wize-answer') === id); if (el) el.scrollIntoView({block:'start'}); })()"
-            webView.evaluateJavaScript(script)
+            let script = """
+            (() => {
+                const id = \(encoded);
+                const answers = Array.from(document.querySelectorAll('section[data-wize-answer]'));
+                const el = answers.find(e => e.getAttribute('data-wize-answer') === id);
+                if (el) {
+                    el.scrollIntoView({block:'start'});
+                    answers.forEach(s => s.classList.toggle('current', s === el));
+                }
+            })()
+            """
+            webView.evaluateJavaScript(script) { [weak self, weak webView] _, _ in
+                guard let self, let webView else { return }
+                self.pinnedScrollY = webView.scrollView.contentOffset.y
+                self.onVisibleAnswer(id)
+            }
         }
         private func inspect(_ webView: WKWebView) {
             guard streamEnabled, !loadingDocument, pendingAnchorID == nil, !restoringAnchor else { return }
             lastInspection = Date()
-            // Tie edge actions to the answer at the reading focus, not a sliver at the top.
-            let script = "(() => { const answers = Array.from(document.querySelectorAll('section[data-wize-answer]')); const focus = Math.min(innerHeight * .35, innerHeight - 1); const answer = answers.find(e => e.getBoundingClientRect().bottom > focus) || answers.find(e => e.getBoundingClientRect().bottom > 0); const index = answers.indexOf(answer); if (index >= 0) answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager')); answers.forEach(section => section.classList.toggle('current', section === answer)); return { id: answer?.getAttribute('data-wize-answer') || null }; })()"
+            let scrollView = webView.scrollView
+            if pinnedAnswerID != nil, abs(scrollView.contentOffset.y - pinnedScrollY) > 12 {
+                pinnedAnswerID = nil
+            }
+            let uiMaxScroll = max(0, Double(scrollView.contentSize.height - scrollView.bounds.height))
+            let uiRemaining = Double(scrollView.contentSize.height - scrollView.bounds.height - scrollView.contentOffset.y)
+            let pinnedJSON: String
+            if let pinned = pinnedAnswerID,
+               let data = try? JSONEncoder().encode(pinned),
+               let str = String(data: data, encoding: .utf8) {
+                pinnedJSON = str
+            } else {
+                pinnedJSON = "null"
+            }
+            // Tie edge actions to the answer at the reading focus, and smoothly sweep the
+            // focus line into the last answer as scrolling reaches the bottom of the page.
+            let script = """
+            (() => {
+                const answers = Array.from(document.querySelectorAll('section[data-wize-answer]'));
+                if (!answers.length) return { id: null };
+                const pinnedId = \(pinnedJSON);
+                let answer = null;
+                if (pinnedId) {
+                    const candidate = answers.find(e => e.getAttribute('data-wize-answer') === pinnedId);
+                    if (candidate) {
+                        const r = candidate.getBoundingClientRect();
+                        if (r.bottom > 24 && r.top < innerHeight - 24) answer = candidate;
+                    }
+                }
+                if (!answer) {
+                    const baseFocus = Math.min(innerHeight * 0.35, innerHeight - 1);
+                    const docHeight = Math.max(
+                        document.documentElement ? document.documentElement.scrollHeight : 0,
+                        document.body ? document.body.scrollHeight : 0
+                    );
+                    const maxScroll = Math.max(0, docHeight - innerHeight, \(uiMaxScroll));
+                    const jsRemaining = Math.max(0, maxScroll - window.scrollY);
+                    const rawRemaining = Math.min(jsRemaining, \(uiRemaining));
+                    const rem = Math.max(0, rawRemaining);
+                    const last = answers[answers.length - 1];
+                    const lastRect = last.getBoundingClientRect();
+                    const lastTopAtBottom = lastRect.top - rem;
+                    const lastBottomAtBottom = lastRect.bottom - rem;
+                    const targetFocus = lastTopAtBottom + Math.min(48, lastRect.height * 0.5);
+                    const bottomFocus = lastBottomAtBottom <= baseFocus
+                        ? Math.max(0, targetFocus)
+                        : Math.min(innerHeight - 1, Math.max(baseFocus, targetFocus));
+                    let t = 0;
+                    if (maxScroll > 4) {
+                        const tailZone = Math.min(Math.max(bottomFocus - baseFocus, innerHeight * 0.35), maxScroll);
+                        const effectiveRem = Math.max(0, rawRemaining - 4);
+                        t = tailZone > 0 ? (1 - Math.max(0, Math.min(1, effectiveRem / tailZone))) : 1;
+                    } else if (rawRemaining < -8) {
+                        t = Math.min(1, (-rawRemaining - 8) / 48);
+                    }
+                    const focus = baseFocus + t * (bottomFocus - baseFocus);
+                    answer = answers.find(e => e.getBoundingClientRect().bottom > focus)
+                        || answers[answers.length - 1];
+                }
+                const index = answers.indexOf(answer);
+                if (index >= 0) {
+                    answers.slice(index, index + 2).forEach(section => section.querySelectorAll('img[loading=lazy]').forEach(img => img.loading = 'eager'));
+                }
+                answers.forEach(section => section.classList.toggle('current', section === answer));
+                return { id: answer?.getAttribute('data-wize-answer') || null };
+            })()
+            """
             webView.evaluateJavaScript(script) { [weak self] result, _ in
                 guard let self, let result = result as? [String: Any] else { return }
-                if self.userHasScrolled, let id = result["id"] as? String { self.onVisibleAnswer(id) }
+                if (self.userHasScrolled || self.didRestoreOffset || self.pinnedAnswerID != nil),
+                   let id = result["id"] as? String {
+                    self.onVisibleAnswer(id)
+                }
             }
         }
     }

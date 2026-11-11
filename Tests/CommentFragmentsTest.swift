@@ -75,6 +75,8 @@ struct CommentFragmentsTest {
             precondition(visibleCommentLines.contains("startsAtAvatar ? topPadding + 26 : 0"), "Parent comment thread line should start right beneath the replied-to avatar")
             precondition(visibleCommentLines.contains("LoadingSkeleton(kind: .comment"), "Initial comment loading should display comment skeletons")
             precondition(visibleCommentLines.contains("CommentAuthorBadge()"), "Comments by the answer author should display an author badge")
+            precondition(visibleCommentLines.contains("comment.isLiked ? \"hand.thumbsup.fill\" : \"hand.thumbsup\""), "Comment thumbs-up should only be filled/red when liked by the current user")
+            precondition(!visibleCommentLines.contains("comment.likes >= 50"), "High-like comments should not be falsely marked as liked by the current user")
             precondition(!readerViewSource.contains("mappin.and.ellipse"), "RegionBadge should use clean inverted teardrop icon instead of pushpin SF Symbol")
             precondition(readerViewSource.contains("TeardropPinShape()"), "RegionBadge should render TeardropPinShape")
         }
@@ -83,10 +85,20 @@ struct CommentFragmentsTest {
             "id": 9,
             "author": ["name": "甲", "role": "author"],
             "content": "来自浙江的评论",
+            "vote_count": 120,
+            "liked": false,
             "comment_tag": [["type": "ip_info", "text": "IP 属地浙江"], ["type": "author", "text": "作者"]]
+        ], [
+            "id": 10,
+            "author": ["name": "乙"],
+            "content": "已赞评论",
+            "vote_count": 3,
+            "liked": true
         ]])
         precondition(withIP.first?.ipInfo == "浙江", "Comment IP location should strip 'IP 属地' prefix and keep only region name")
         precondition(withIP.first?.isAuthor == true, "Comment author role should be parsed from author/comment_tag")
+        precondition(withIP.first?.isLiked == false, "Unliked high-vote comments must not be marked as liked")
+        precondition(withIP.last?.isLiked == true, "Comments with liked=true should be marked as liked")
         precondition(normalizedIPRegion("IP 属地浙江") == "浙江", "normalizedIPRegion should strip 'IP 属地'")
         precondition(normalizedIPRegion("IP属地：广东") == "广东", "normalizedIPRegion should strip 'IP属地：'")
         precondition(normalizedIPRegion("发布于 IP 属地上海") == "上海", "normalizedIPRegion should strip compound prefixes")
